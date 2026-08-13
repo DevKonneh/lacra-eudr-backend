@@ -135,7 +135,17 @@ export class WhispService {
                 }],
                 analysisOptions: {
                     unitType: "ha",
-                    async: false
+                    // Always request async processing rather than relying on the connection
+                    // staying open for a synchronous response. Verified via live testing on
+                    // 2026-08-13: a large/complex polygon submitted with async:false simply hung
+                    // until our 30s axios timeout fired (a client-side read timeout, NOT a Whisp
+                    // error) - meaning a legitimately large real farm polygon could be
+                    // misclassified as a failed assessment purely because the HTTP request
+                    // timed out, even though Earth Engine might have finished given more time.
+                    // With async:true the submit call returns almost immediately (~0.5s) with a
+                    // queued/processing token, and we control the wait via our own pollStatus()
+                    // loop (now up to ~90s) instead of a single all-or-nothing HTTP timeout.
+                    async: true
                 }
             };
 
@@ -145,13 +155,24 @@ export class WhispService {
             });
 
             let envelope = response.data;
+            let jobToken: string | undefined = envelope?.data?.token || envelope?.context?.token;
 
-            // Async fallback: some large/complex geometries return a queued/processing job.
+            // Async fallback: some large/complex geometries (or a busy queue via
+            // analysisOptions.async / analysis_too_many_concurrent backpressure) return a
+            // queued/processing job instead of completing synchronously.
             // Poll the status endpoint until the analysis completes (or we give up).
+            // NOTE: the job token is nested under `data.token` (with a companion `data.statusUrl`),
+            // NOT under `context.token` - verified against a live analysis_queued response from
+            // the real Whisp API on 2026-08-13. The previous `envelope?.context?.token` lookup
+            // always evaluated to undefined, silently skipping pollStatus() entirely whenever a
+            // queued/processing response was returned. The completed envelope returned by
+            // /status/{token} does NOT itself repeat the token, so we must capture it here
+            // (from the initial submit response) and carry it forward for the result mapping.
             if (envelope?.code === 'analysis_queued' || envelope?.code === 'analysis_processing') {
-                const token = envelope?.context?.token;
-                if (token) {
-                    envelope = await this.pollStatus(token);
+                if (jobToken) {
+                    envelope = await this.pollStatus(jobToken);
+                } else {
+                    console.error("Whisp API returned a queued/processing response with no token to poll:", JSON.stringify(envelope).slice(0, 500));
                 }
             }
 
@@ -167,7 +188,7 @@ export class WhispService {
                 return null;
             }
 
-            return this.mapWhispProperties(properties, envelope?.context?.token);
+            return this.mapWhispProperties(properties, jobToken);
 
         } catch (error: any) {
             const details = error.response?.data ? JSON.stringify(error.response.data) : error.message;
@@ -176,8 +197,16 @@ export class WhispService {
         }
     }
 
-    /** Poll GET /status/{token} until the job leaves the queued/processing state. */
-    private async pollStatus(token: string, maxAttempts = 8, delayMs = 3000): Promise<any> {
+    /**
+     * Poll GET /status/{token} until the job leaves the queued/processing state.
+     * Default window increased to ~90s (30 attempts x 3000ms) based on live testing against
+     * the real Whisp API on 2026-08-13: a large/complex 300-vertex test polygon spent 8+
+     * seconds in analysis_processing before terminating (with a memory-limit error in that
+     * particular case), while normal farm-sized polygons complete within a few seconds. The
+     * previous 24s window (8 x 3000ms) was too short to safely cover legitimately large/complex
+     * real farm polygons that don't hit resource limits and simply take longer to process.
+     */
+    private async pollStatus(token: string, maxAttempts = 30, delayMs = 3000): Promise<any> {
         for (let attempt = 0; attempt < maxAttempts; attempt++) {
             await new Promise(resolve => setTimeout(resolve, delayMs));
             try {
