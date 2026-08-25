@@ -29,6 +29,12 @@ export class Farmer {
     nationalId!: string;
 
     @Column({ nullable: true })
+    idType!: string; // Driver License / National ID card / Passport / Voting ID / Other
+
+    @Column({ nullable: true })
+    idTypeOther!: string; // Free-text label when idType === "Other"
+
+    @Column({ nullable: true })
     gender!: string; // Male/Female/Other
 
     @Column({ nullable: true })

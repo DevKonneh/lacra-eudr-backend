@@ -180,6 +180,8 @@ export class AuthController {
                 phone, // maps to phoneNumber
                 nationality,
                 nationalId,
+                idType,
+                idTypeOther,
                 otherId,
                 // Location
                 county,
@@ -257,6 +259,8 @@ export class AuthController {
                 farmer.dob = dob ? new Date(dob) : new Date(); // Handle valid date parsing
                 farmer.nationality = nationality;
                 farmer.nationalId = nationalId;
+                farmer.idType = idType;
+                farmer.idTypeOther = idTypeOther;
                 farmer.otherId = otherId;
                 farmer.district = district;
                 farmer.community = community;

@@ -72,7 +72,7 @@ export class FarmerController {
 
             const {
                 firstName, lastName, email, phoneNumber, password,
-                gender, dob, nationality, nationalId, otherId, address, community, district, region,
+                gender, dob, nationality, nationalId, idType, idTypeOther, otherId, address, community, district, region,
                 cooperativeName, cooperativeId, enumeratorName, enumeratorId, consent,
                 directions, latitude, longitude
             } = body;
@@ -130,6 +130,8 @@ export class FarmerController {
                 farmer.dob = dob ? new Date(dob) : undefined as any;
                 farmer.nationality = nationality;
                 farmer.nationalId = nationalId;
+                farmer.idType = idType;
+                farmer.idTypeOther = idTypeOther;
                 farmer.otherId = otherId;
                 farmer.address = address;
                 farmer.community = community;
@@ -214,7 +216,7 @@ export class FarmerController {
         const { id } = req.params;
         const {
             firstName, lastName, email, phoneNumber,
-            gender, dob, nationality, nationalId, otherId,
+            gender, dob, nationality, nationalId, idType, idTypeOther, otherId,
             address, community, district, region,
             cooperativeName, cooperativeId,
             enumeratorName, enumeratorId,
@@ -238,6 +240,8 @@ export class FarmerController {
             farmer.dob = dob ? new Date(dob) : farmer.dob;
             farmer.nationality = nationality ?? farmer.nationality;
             farmer.nationalId = nationalId ?? farmer.nationalId;
+            farmer.idType = idType ?? farmer.idType;
+            farmer.idTypeOther = idTypeOther ?? farmer.idTypeOther;
             farmer.otherId = otherId ?? farmer.otherId;
 
             // Address / Location
@@ -320,6 +324,8 @@ export class FarmerController {
                 email: farmer.email,
                 phoneNumber: farmer.phoneNumber,
                 nationalId: farmer.nationalId,
+                idType: farmer.idType,
+                idTypeOther: farmer.idTypeOther,
                 gender: farmer.gender,
                 dob: farmer.dob,
                 nationality: farmer.nationality,
@@ -388,6 +394,8 @@ export class FarmerController {
             farmer.phoneNumber = farmerData.phoneNumber;
             farmer.email = farmerData.email;
             farmer.nationalId = farmerData.nationalId;
+            farmer.idType = farmerData.idType;
+            farmer.idTypeOther = farmerData.idTypeOther;
             farmer.gender = farmerData.gender;
             farmer.address = farmerData.address;
             farmer.community = farmerData.community;

@@ -13,15 +13,33 @@ import farmerRoutes from "./routes/farmer.routes";
 const app = express();
 const PORT = process.env.PORT || 8100;
 
+// Allow the known local/dev origins plus any extra origins supplied via the
+// CORS_EXTRA_ORIGINS env var (comma-separated), so the deployed frontend
+// domain can be added without another code change/redeploy of this file.
+const defaultOrigins = [
+    "https://eudr.netdivs.us",
+    "http://localhost:8100",
+    "http://localhost:8180",
+    "http://localhost:5173",
+    "http://localhost:5060",
+];
+const extraOrigins = (process.env.CORS_EXTRA_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter((o) => o.length > 0);
+const allowedOrigins = [...defaultOrigins, ...extraOrigins];
+
 app.use(cors({
-    origin: [
-        "https://eudr.netdivs.us",
-        "http://localhost:8100",
-        "http://localhost:8180",
-        "http://localhost:5173",
-        "http://localhost:5060",
-        "https://5062-i9tadgf8ntmirkrse9hvt-de59bda9.sandbox.novita.ai"
-    ],
+    origin: (origin, callback) => {
+        // Allow requests with no origin (mobile apps, curl, server-to-server)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        // Allow any *.onrender.com subdomain (frontend/backend both hosted on Render)
+        if (/\.onrender\.com$/.test(new URL(origin).hostname)) {
+            return callback(null, true);
+        }
+        return callback(new Error(`Not allowed by CORS: ${origin}`));
+    },
     credentials: true
 }));
 app.use(helmet({

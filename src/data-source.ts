@@ -19,6 +19,11 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
+// Render's managed Postgres requires SSL for connections. Set DB_SSL=true
+// in the environment (e.g. on Render) to enable it; leave unset for local
+// sandbox/dev Postgres which does not use SSL.
+const useSsl = process.env.DB_SSL === "true";
+
 export const AppDataSource = new DataSource({
     type: "postgres",
     host: process.env.DB_HOST || "localhost",
@@ -26,6 +31,7 @@ export const AppDataSource = new DataSource({
     username: process.env.DB_USER || "postgres",
     password: process.env.DB_PASSWORD || "postgis",
     database: process.env.DB_NAME || "eudr_db",
+    ssl: useSsl ? { rejectUnauthorized: false } : false,
     synchronize: true,
     logging: false,
     entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification],
