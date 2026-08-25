@@ -50,10 +50,6 @@ app.use(express.json());
 // Serve uploaded files (farmer/farm photos, IDs, signatures) as static assets
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
-AppDataSource.initialize().then(async () => {
-    console.log("Database connected successfully.");
-}).catch(error => console.log(error));
-
 app.get('/', (req, res) => {
     res.send('LACRA Platform API is running');
 });
@@ -103,6 +99,22 @@ app.use("/api/users", userRoutes);
 import { errorHandler } from "./middleware/error.middleware";
 app.use(errorHandler);
 
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+// IMPORTANT: Only start accepting HTTP requests AFTER the database connection
+// (and TypeORM entity metadata) is fully initialized. Previously the server
+// called app.listen() unconditionally, regardless of whether the DB connection
+// succeeded, which meant that if the DB connection failed for any reason
+// (wrong host/credentials/SSL settings), the server would keep running forever
+// in a broken state, silently returning "No metadata for ... was found" errors
+// on every single request instead of failing loudly.
+AppDataSource.initialize()
+    .then(() => {
+        console.log("Database connected successfully.");
+        app.listen(PORT, () => {
+            console.log(`Server is running on port ${PORT}`);
+        });
+    })
+    .catch((error) => {
+        console.error("FATAL: Database connection failed. Server will not start.");
+        console.error(error);
+        process.exit(1);
+    });
