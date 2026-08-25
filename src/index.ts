@@ -115,6 +115,13 @@ AppDataSource.initialize()
     })
     .catch((error) => {
         console.error("FATAL: Database connection failed. Server will not start.");
+        // Print the exact DB_HOST value with visible markers, in case it
+        // contains hidden whitespace/newlines from a copy-paste mistake in
+        // a dashboard UI (e.g. "host.com\n" fails DNS lookup but looks fine
+        // visually). This is logged with JSON.stringify so any hidden
+        // characters show up as escape sequences (like \n) instead of being
+        // invisible in the log output.
+        console.error("DB_HOST env value was:", JSON.stringify(process.env.DB_HOST));
         console.error(error);
         process.exit(1);
     });
