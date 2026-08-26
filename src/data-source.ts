@@ -15,6 +15,7 @@ import { Permit } from "./entities/Permit";
 import { Transfer } from "./entities/Transfer";
 import { SatelliteAlert } from "./entities/SatelliteAlert";
 import { Notification } from "./entities/Notification";
+import { OfflineSubmission } from "./entities/OfflineSubmission";
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -44,7 +45,7 @@ export const AppDataSource = new DataSource({
     ssl: useSsl ? { rejectUnauthorized: false } : false,
     synchronize: true,
     logging: false,
-    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification],
+    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission],
     subscribers: [],
     migrations: [],
 });

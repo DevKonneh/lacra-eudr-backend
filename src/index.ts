@@ -74,6 +74,7 @@ import permitRoutes from "./routes/permit.routes";
 import inspectionRoutes from "./routes/inspection.routes";
 import qualityRoutes from "./routes/quality.routes";
 import enforcementRoutes from "./routes/enforcement.routes";
+import offlineSubmissionRoutes from "./routes/offlineSubmission.routes";
 
 app.use("/api/public", publicRoutes);
 app.use("/api/business", businessRoutes);
@@ -95,6 +96,7 @@ app.use("/api/reports", reportsRoutes);
 app.use("/api/satellite", satelliteRoutes);
 app.use("/api/roles", roleRoutes);
 app.use("/api/users", userRoutes);
+app.use("/api/offline-submissions", offlineSubmissionRoutes);
 
 import { errorHandler } from "./middleware/error.middleware";
 app.use(errorHandler);
