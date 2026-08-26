@@ -15,7 +15,29 @@ export class FarmerController {
 
     async getAll(req: Request, res: Response) {
         try {
-            const farmers = await this.farmerRepository.find({ relations: ["farms"] });
+            const requester = (req as any).user;
+
+            // Access rule:
+            // - ADMIN sees every farmer, no restrictions.
+            // - INSPECTOR sees only (a) farmers they personally registered
+            //   (registeredByUserId matches their own user id), plus
+            //   (b) "legacy" farmers created before this field existed
+            //   (registeredByUserId IS NULL), so no previously-visible data
+            //   disappears for anyone. New registrations going forward are
+            //   properly attributed and scoped per inspector.
+            // - BUYER/EXPORTER unaffected for now (out of scope of this fix).
+            let farmers: Farmer[];
+            if (requester?.role === UserRole.INSPECTOR) {
+                farmers = await this.farmerRepository
+                    .createQueryBuilder("farmer")
+                    .leftJoinAndSelect("farmer.farms", "farms")
+                    .where("farmer.registeredByUserId = :userId", { userId: requester.id })
+                    .orWhere("farmer.registeredByUserId IS NULL")
+                    .getMany();
+            } else {
+                farmers = await this.farmerRepository.find({ relations: ["farms"] });
+            }
+
             return successResponse(res, farmers);
         } catch (error: any) {
             console.error(error);
@@ -76,6 +98,12 @@ export class FarmerController {
                 cooperativeName, cooperativeId, enumeratorName, enumeratorId, consent,
                 directions, latitude, longitude
             } = body;
+
+            // Real, reliable identity of whoever is authenticated and making
+            // this request (from the verified JWT, not a free-text form
+            // field) — used for per-inspector data scoping in getAll().
+            const requester = (req as any).user;
+            const registeredByUserId: string | undefined = requester?.id;
 
             // Basic validation
             if (!firstName || !lastName || !phoneNumber) {
@@ -139,6 +167,7 @@ export class FarmerController {
                 farmer.cooperativeId = cooperativeId;
                 farmer.enumeratorName = enumeratorName;
                 farmer.enumeratorId = enumeratorId;
+                farmer.registeredByUserId = registeredByUserId as any;
                 farmer.consent = consent === 'true' || consent === true;
                 farmer.directions = directions;
                 farmer.latitude = latitude;
@@ -409,6 +438,7 @@ export class FarmerController {
             farmer.cooperativeId = farmerData.cooperativeId;
             farmer.enumeratorId = farmerData.enumeratorId;
             farmer.enumeratorName = farmerData.enumeratorName;
+            farmer.registeredByUserId = (req as any).user?.id;
 
             if (farmerData.email) {
                 const user = new User();

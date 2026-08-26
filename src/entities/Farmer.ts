@@ -79,6 +79,15 @@ export class Farmer {
     @Column({ nullable: true })
     enumeratorId!: string;
 
+    // Reliable link to the actual Inspector/Admin account that created this
+    // record (unlike enumeratorName/enumeratorId above, which are free-text
+    // form fields typed by whoever filled the registration and cannot be
+    // trusted for access control). Nullable so existing farmer records
+    // created before this field existed remain valid ("legacy" records,
+    // treated as visible to every inspector — see FarmerController.getAll).
+    @Column({ nullable: true })
+    registeredByUserId!: string;
+
     @Column({ nullable: true })
     signature!: string; // Path or base64
 
