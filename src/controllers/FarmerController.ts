@@ -405,6 +405,10 @@ export class FarmerController {
             farmer.district = farmerData.district;
             farmer.region = farmerData.region;
             farmer.consent = farmerData.consent === true || farmerData.consent === "true";
+            farmer.cooperativeName = farmerData.cooperativeName;
+            farmer.cooperativeId = farmerData.cooperativeId;
+            farmer.enumeratorId = farmerData.enumeratorId;
+            farmer.enumeratorName = farmerData.enumeratorName;
 
             if (farmerData.email) {
                 const user = new User();
@@ -432,6 +436,14 @@ export class FarmerController {
                 farm.cropType = f.cropType;
                 farm.location = typeof f.location === "string" ? JSON.parse(f.location) : f.location;
                 if (f.totalAreaHa) farm.totalAreaHa = parseFloat(f.totalAreaHa);
+                if (f.numberOfTrees) farm.numberOfTrees = parseInt(f.numberOfTrees);
+                if (f.yearsInCultivation) farm.yearsInCultivation = parseInt(f.yearsInCultivation);
+                farm.harvestSeason = f.harvestSeason;
+                farm.averageYield = f.averageYield;
+                farm.buyers = f.buyers;
+                farm.useChemicals = f.useChemicals === true || f.useChemicals === "true";
+                farm.extensionServices = f.extensionServices === true || f.extensionServices === "true";
+                farm.farmAddress = f.farmAddress;
                 farm.farmer = savedFarmer;
                 await this.farmRepository.save(farm);
             }
