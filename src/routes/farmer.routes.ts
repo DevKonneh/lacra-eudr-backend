@@ -13,7 +13,7 @@ import { upload } from "../middleware/upload.middleware";
 
 router.post("/", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), upload.any(), (req, res) => controller.create(req, res));
 router.post("/offline-sync", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.offlineSync(req, res));
-router.put("/:id", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), (req, res) => controller.update(req, res));
+router.put("/:id", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), upload.any(), (req, res) => controller.update(req, res));
 router.patch("/:id/status", authMiddleware([UserRole.ADMIN]), (req, res) => controller.setActiveStatus(req, res));
 
 export default router;

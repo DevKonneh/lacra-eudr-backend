@@ -3,6 +3,7 @@ import { AppDataSource } from "../data-source";
 import { Farm } from "../entities/Farm";
 import { UserRole } from "../entities/User";
 import { successResponse, errorResponse } from "../utils/response";
+import { toPublicFileUrls } from "../utils/fileUrl";
 
 export class FarmController {
     private farmRepository = AppDataSource.getRepository(Farm);
@@ -140,6 +141,32 @@ export class FarmController {
         } catch (error: any) {
             console.error("Error creating farm:", error);
             return errorResponse(res, "Error creating farm", [error.message], 500);
+        }
+    }
+
+    // Attach one or more photos to an existing farm (multipart, field name "farmPhotos").
+    // Appends to any photos already stored on the farm rather than replacing them,
+    // so this can be called multiple times (e.g. inspector adding more photos later).
+    async addPhotos(req: Request, res: Response) {
+        try {
+            const { id } = req.params;
+            const farm = await this.farmRepository.findOne({ where: { id } });
+            if (!farm) return errorResponse(res, "Farm not found", [], 404);
+
+            const files = (req as any).files as Express.Multer.File[] | undefined;
+            const photoFiles = files?.filter(f => f.fieldname === 'farmPhotos' || f.fieldname === 'farmPhotos[]');
+            if (!photoFiles || photoFiles.length === 0) {
+                return errorResponse(res, "No photo files provided (expected field name 'farmPhotos')", [], 400);
+            }
+
+            const newUrls = toPublicFileUrls(photoFiles.map(f => f.path));
+            farm.farmPhotos = [...(farm.farmPhotos || []), ...newUrls];
+            await this.farmRepository.save(farm);
+
+            return successResponse(res, farm, "Farm photos added successfully");
+        } catch (error: any) {
+            console.error("Error adding farm photos:", error);
+            return errorResponse(res, "Error adding farm photos", [error.message], 500);
         }
     }
 

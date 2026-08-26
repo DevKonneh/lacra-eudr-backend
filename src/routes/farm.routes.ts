@@ -2,6 +2,7 @@ import { Router } from "express";
 import { FarmController } from "../controllers/FarmController";
 import { authMiddleware } from "../middleware/auth.middleware";
 import { UserRole } from "../entities/User";
+import { upload } from "../middleware/upload.middleware";
 
 const router = Router();
 const controller = new FarmController();
@@ -11,5 +12,6 @@ router.get("/", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FAR
 router.get("/:id", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER, UserRole.BUYER]), (req, res) => controller.getOne(req, res));
 router.post("/", authMiddleware([UserRole.FARMER, UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.create(req, res));
 router.post("/offline-sync", authMiddleware([UserRole.FARMER, UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.offlineSync(req, res));
+router.put("/:id/photos", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), upload.any(), (req, res) => controller.addPhotos(req, res));
 
 export default router;
