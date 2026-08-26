@@ -8,7 +8,7 @@ import jwt from "jsonwebtoken";
 import { JWT_SECRET } from "../middleware/auth.middleware";
 import { EmailService } from "../services/EmailService";
 import { successResponse, errorResponse } from "../utils/response";
-import { toPublicFileUrl, toPublicFileUrls } from "../utils/fileUrl";
+import { uploadFileToCloudinary, uploadFilesToCloudinary } from "../utils/cloudUpload";
 
 export class AuthController {
     private userRepository = AppDataSource.getRepository(User);
@@ -215,12 +215,12 @@ export class AuthController {
             // (FarmController.addBoundaryEvidence) instead of duplicating it inside
             // this already-complex transactional flow.
 
-            // Handle files
+            // Handle files — uploaded to Cloudinary (not local disk) so they
+            // survive Render restarts/redeploys. getFile() finds the Multer
+            // in-memory file object by fieldname; actual upload happens
+            // below via uploadFileToCloudinary/uploadFilesToCloudinary.
             const files = (req as any).files as Express.Multer.File[];
-            const getFilePath = (fieldname: string) => {
-                const file = files?.find(f => f.fieldname === fieldname);
-                return file ? file.path : undefined;
-            };
+            const getFile = (fieldname: string) => files?.find(f => f.fieldname === fieldname);
 
             const queryRunner = AppDataSource.createQueryRunner();
             await queryRunner.connect();
@@ -283,11 +283,17 @@ export class AuthController {
                 farmer.longitude = lng;
                 farmer.consent = consent === 'true' || consent === true;
 
-                // Map Files
-                farmer.profilePhoto = toPublicFileUrl(getFilePath('farmerPhoto')) as string;
-                farmer.idPhoto = toPublicFileUrl(getFilePath('idPhoto') || getFilePath('nationalId')) as string;
-                farmer.farmSelfie = toPublicFileUrl(getFilePath('farmSelfie')) as string;
-                farmer.signature = toPublicFileUrl(getFilePath('signature')) as string;
+                // Map Files — upload each to Cloudinary and store the
+                // permanent secure_url (undefined if that field wasn't sent).
+                const farmerPhotoFile = getFile('farmerPhoto');
+                const idPhotoFile = getFile('idPhoto') || getFile('nationalId');
+                const farmSelfieFile = getFile('farmSelfie');
+                const signatureFile = getFile('signature');
+
+                if (farmerPhotoFile) farmer.profilePhoto = await uploadFileToCloudinary(farmerPhotoFile);
+                if (idPhotoFile) farmer.idPhoto = await uploadFileToCloudinary(idPhotoFile);
+                if (farmSelfieFile) farmer.farmSelfie = await uploadFileToCloudinary(farmSelfieFile);
+                if (signatureFile) farmer.signature = await uploadFileToCloudinary(signatureFile);
 
                 farmer.user = user;
 
@@ -321,7 +327,7 @@ export class AuthController {
                         if (i === 0) {
                             const farmPhotos = files?.filter(file => file.fieldname === 'farmPhotos[]' || file.fieldname === 'farmPhotos');
                             if (farmPhotos && farmPhotos.length > 0) {
-                                farm.farmPhotos = toPublicFileUrls(farmPhotos.map(fp => fp.path));
+                                farm.farmPhotos = await uploadFilesToCloudinary(farmPhotos);
                             }
                         }
                         farm.farmer = farmer;
@@ -356,7 +362,7 @@ export class AuthController {
                     // Map farm photos to this single farm
                     const farmPhotos = files?.filter(file => file.fieldname === 'farmPhotos[]' || file.fieldname === 'farmPhotos');
                     if (farmPhotos && farmPhotos.length > 0) {
-                        farm.farmPhotos = toPublicFileUrls(farmPhotos.map(fp => fp.path));
+                        farm.farmPhotos = await uploadFilesToCloudinary(farmPhotos);
                     }
 
                     farm.farmer = farmer;

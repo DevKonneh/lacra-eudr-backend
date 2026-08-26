@@ -6,7 +6,7 @@ import { User, UserRole } from "../entities/User";
 import QRCode from 'qrcode';
 import bcrypt from 'bcryptjs';
 import { successResponse, errorResponse } from "../utils/response";
-import { toPublicFileUrl, toPublicFileUrls } from "../utils/fileUrl";
+import { uploadFileToCloudinary, uploadFilesToCloudinary } from "../utils/cloudUpload";
 
 export class FarmerController {
     private farmerRepository = AppDataSource.getRepository(Farmer);
@@ -82,12 +82,10 @@ export class FarmerController {
                 return res.status(400).json({ message: "Missing required fields" });
             }
 
-            // Handle files
+            // Handle files — uploaded to Cloudinary (not local disk) so they
+            // survive Render restarts/redeploys.
             const files = (req as any).files as Express.Multer.File[];
-            const getFilePath = (fieldname: string) => {
-                const file = files?.find(f => f.fieldname === fieldname);
-                return file ? file.path : undefined;
-            };
+            const getFile = (fieldname: string) => files?.find(f => f.fieldname === fieldname);
 
             const queryRunner = AppDataSource.createQueryRunner();
             await queryRunner.connect();
@@ -146,10 +144,15 @@ export class FarmerController {
                 farmer.latitude = latitude;
                 farmer.longitude = longitude;
 
-                farmer.profilePhoto = toPublicFileUrl(getFilePath('farmerPhoto')) as string;
-                farmer.idPhoto = toPublicFileUrl(getFilePath('idPhoto') || getFilePath('nationalId')) as string;
-                farmer.signature = toPublicFileUrl(getFilePath('signature')) as string;
-                farmer.farmSelfie = toPublicFileUrl(getFilePath('farmSelfie')) as string;
+                const farmerPhotoFile = getFile('farmerPhoto');
+                const idPhotoFile = getFile('idPhoto') || getFile('nationalId');
+                const signatureFile = getFile('signature');
+                const farmSelfieFile = getFile('farmSelfie');
+
+                if (farmerPhotoFile) farmer.profilePhoto = await uploadFileToCloudinary(farmerPhotoFile);
+                if (idPhotoFile) farmer.idPhoto = await uploadFileToCloudinary(idPhotoFile);
+                if (signatureFile) farmer.signature = await uploadFileToCloudinary(signatureFile);
+                if (farmSelfieFile) farmer.farmSelfie = await uploadFileToCloudinary(farmSelfieFile);
 
                 if (user) {
                     farmer.user = user;
@@ -174,17 +177,17 @@ export class FarmerController {
                         farm.extensionServices = f.extensionServices === 'true' || f.extensionServices === true;
                         farm.farmAddress = f.farmAddress;
 
-                        // Associate farmPhotos with the FIRST farm (as per requirement/limitations of FormData mapping simplicity)
-                        if (index === 0) {
-                            // Multer puts all files in req.files array. We fitler by fieldname 'farmPhotos'
-                            const farmPhotos = files?.filter(f => f.fieldname === 'farmPhotos[]' || f.fieldname === 'farmPhotos');
-                            if (farmPhotos && farmPhotos.length > 0) {
-                                farm.farmPhotos = toPublicFileUrls(farmPhotos.map(f => f.path));
-                            }
-                        }
-
                         return farm;
                     });
+                    // Associate farmPhotos with the FIRST farm (as per requirement/limitations
+                    // of FormData mapping simplicity). Uploaded to Cloudinary. Done outside the
+                    // .map() above since it's async and .map() callbacks there are sync.
+                    if (farmer.farms.length > 0) {
+                        const farmPhotos = files?.filter(f => f.fieldname === 'farmPhotos[]' || f.fieldname === 'farmPhotos');
+                        if (farmPhotos && farmPhotos.length > 0) {
+                            farmer.farms[0].farmPhotos = await uploadFilesToCloudinary(farmPhotos);
+                        }
+                    }
                 }
 
                 const savedFarmer = await queryRunner.manager.save(Farmer, farmer);
@@ -263,18 +266,18 @@ export class FarmerController {
             if (identityStatus) farmer.identityStatus = identityStatus;
             if (consent !== undefined) farmer.consent = consent === true || consent === 'true';
 
-            // Optional photo re-uploads (multipart)
+            // Optional photo re-uploads (multipart) — uploaded to Cloudinary.
             const files = (req as any).files as Express.Multer.File[] | undefined;
             if (files && files.length > 0) {
-                const getFilePath = (fieldname: string) => files.find(f => f.fieldname === fieldname)?.path;
-                const newProfilePhoto = toPublicFileUrl(getFilePath('farmerPhoto'));
-                const newIdPhoto = toPublicFileUrl(getFilePath('idPhoto') || getFilePath('nationalId'));
-                const newSignature = toPublicFileUrl(getFilePath('signature'));
-                const newFarmSelfie = toPublicFileUrl(getFilePath('farmSelfie'));
-                if (newProfilePhoto) farmer.profilePhoto = newProfilePhoto;
-                if (newIdPhoto) farmer.idPhoto = newIdPhoto;
-                if (newSignature) farmer.signature = newSignature;
-                if (newFarmSelfie) farmer.farmSelfie = newFarmSelfie;
+                const getFile = (fieldname: string) => files.find(f => f.fieldname === fieldname);
+                const farmerPhotoFile = getFile('farmerPhoto');
+                const idPhotoFile = getFile('idPhoto') || getFile('nationalId');
+                const signatureFile = getFile('signature');
+                const farmSelfieFile = getFile('farmSelfie');
+                if (farmerPhotoFile) farmer.profilePhoto = await uploadFileToCloudinary(farmerPhotoFile);
+                if (idPhotoFile) farmer.idPhoto = await uploadFileToCloudinary(idPhotoFile);
+                if (signatureFile) farmer.signature = await uploadFileToCloudinary(signatureFile);
+                if (farmSelfieFile) farmer.farmSelfie = await uploadFileToCloudinary(farmSelfieFile);
             }
 
             await this.farmerRepository.save(farmer);

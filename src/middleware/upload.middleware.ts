@@ -1,21 +1,16 @@
 import multer from "multer";
-import path from "path";
-import fs from "fs";
 
-const uploadDir = path.join(__dirname, "../../uploads");
+// Files are uploaded to Cloudinary (see utils/cloudUpload.ts) rather than
+// Render's local disk, since Render's filesystem is ephemeral and wipes
+// uploaded files on every restart/redeploy. Using memoryStorage keeps each
+// file's raw bytes in `file.buffer` (instead of writing to `file.path` on
+// disk), which controllers then stream up to Cloudinary.
+//
+// A per-file size cap prevents a single huge upload from ballooning memory
+// usage, since files now live in RAM (however briefly) instead of disk.
+const storage = multer.memoryStorage();
 
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-        cb(null, file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname));
-    },
+export const upload = multer({
+    storage,
+    limits: { fileSize: 15 * 1024 * 1024 }, // 15MB per file
 });
-
-export const upload = multer({ storage: storage });

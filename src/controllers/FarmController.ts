@@ -3,7 +3,7 @@ import { AppDataSource } from "../data-source";
 import { Farm } from "../entities/Farm";
 import { UserRole } from "../entities/User";
 import { successResponse, errorResponse } from "../utils/response";
-import { toPublicFileUrls } from "../utils/fileUrl";
+import { uploadFilesToCloudinary, uploadFileToCloudinary } from "../utils/cloudUpload";
 
 export class FarmController {
     private farmRepository = AppDataSource.getRepository(Farm);
@@ -159,7 +159,7 @@ export class FarmController {
                 return errorResponse(res, "No photo files provided (expected field name 'farmPhotos')", [], 400);
             }
 
-            const newUrls = toPublicFileUrls(photoFiles.map(f => f.path));
+            const newUrls = await uploadFilesToCloudinary(photoFiles);
             farm.farmPhotos = [...(farm.farmPhotos || []), ...newUrls];
             await this.farmRepository.save(farm);
 
@@ -204,21 +204,27 @@ export class FarmController {
 
             const files = (req as any).files as Express.Multer.File[] | undefined;
 
-            const evidence = parsedPoints.map((p: any) => {
+            // Validate every point has a matching photo BEFORE uploading anything
+            // to Cloudinary, so we fail fast without wasting uploads.
+            const filesByPoint = parsedPoints.map((p: any) => {
                 const seq = p.sequence;
                 const file = files?.find(f => f.fieldname === `boundaryPhoto_${seq}`);
                 if (!file) {
                     throw new Error(`Missing photo for boundary point ${seq} (expected field 'boundaryPhoto_${seq}')`);
                 }
-                return {
-                    sequence: seq,
+                return { point: p, file };
+            });
+
+            const evidence = await Promise.all(
+                filesByPoint.map(async ({ point: p, file }) => ({
+                    sequence: p.sequence,
                     lat: parseFloat(p.lat),
                     lng: parseFloat(p.lng),
                     accuracy: p.accuracy !== undefined ? parseFloat(p.accuracy) : undefined,
                     timestamp: p.timestamp,
-                    photoUrl: toPublicFileUrls([file.path])[0],
-                };
-            });
+                    photoUrl: await uploadFileToCloudinary(file),
+                }))
+            );
 
             farm.boundaryEvidence = evidence;
 

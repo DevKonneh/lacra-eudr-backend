@@ -16,6 +16,7 @@
   "dependencies": {
     "axios": "^1.13.2",
     "bcryptjs": "^3.0.3",
+    "cloudinary": "^2.10.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
@@ -26,6 +27,7 @@
     "pg": "^8.16.3",
     "qrcode": "^1.5.4",
     "reflect-metadata": "^0.2.2",
+    "streamifier": "^0.1.1",
     "typeorm": "^0.3.28"
   },
   "devDependencies": {
@@ -38,6 +40,7 @@
     "@types/nodemailer": "^7.0.5",
     "@types/pg": "^8.16.0",
     "@types/qrcode": "^1.5.6",
+    "@types/streamifier": "^0.1.2",
     "nodemon": "^3.1.11",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
