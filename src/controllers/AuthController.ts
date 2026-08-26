@@ -3,6 +3,7 @@ import { AppDataSource } from "../data-source";
 import { User, UserRole, UserStatus } from "../entities/User";
 import { Farmer } from "../entities/Farmer";
 import { Farm } from "../entities/Farm";
+import { FarmDocument, DocumentStatus, DocumentType } from "../entities/FarmDocument";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { JWT_SECRET } from "../middleware/auth.middleware";
@@ -397,6 +398,54 @@ export class AuthController {
 
                     const savedFarm = await queryRunner.manager.save(Farm, farm);
                     createdFarmIds.push(savedFarm.id);
+                }
+
+                // EUDR compliance documents (National ID, Land Deed, Lease
+                // Agreement, Customary/Community Authorization, Cooperative
+                // Membership Document, etc.) - uploaded via the mobile app's
+                // Compliance Documents step. Files are sent under the field
+                // name "complianceDocuments" (one entry per document), with
+                // a parallel JSON array "complianceDocTypes" (same order)
+                // naming each file's DocumentType. Attached to the first/
+                // primary farm created above, matching how farmPhotos and
+                // boundary evidence are scoped to createdFarmIds[0].
+                const complianceDocFiles = files?.filter(
+                    (f) => f.fieldname === 'complianceDocuments'
+                );
+                if (
+                    complianceDocFiles &&
+                    complianceDocFiles.length > 0 &&
+                    createdFarmIds[0]
+                ) {
+                    let docTypes: string[] = [];
+                    try {
+                        docTypes = body.complianceDocTypes
+                            ? JSON.parse(body.complianceDocTypes)
+                            : [];
+                    } catch (e) {
+                        console.error('Invalid complianceDocTypes JSON', e);
+                    }
+                    const primaryFarm = await queryRunner.manager.findOne(Farm, {
+                        where: { id: createdFarmIds[0] },
+                    });
+                    if (primaryFarm) {
+                        for (let i = 0; i < complianceDocFiles.length; i++) {
+                            const documentUrl = await uploadFileToCloudinary(
+                                complianceDocFiles[i]
+                            );
+                            const type =
+                                (docTypes[i] as DocumentType) ||
+                                DocumentType.OTHER;
+                            const doc = queryRunner.manager.create(FarmDocument, {
+                                farm: primaryFarm,
+                                farmId: primaryFarm.id,
+                                type,
+                                documentUrl,
+                                status: DocumentStatus.PENDING,
+                            });
+                            await queryRunner.manager.save(FarmDocument, doc);
+                        }
+                    }
                 }
 
                 await queryRunner.commitTransaction();

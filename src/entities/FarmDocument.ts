@@ -2,10 +2,19 @@ import { Entity, PrimaryGeneratedColumn, Column, ManyToOne, CreateDateColumn } f
 import { Farm } from "./Farm";
 
 export enum DocumentType {
+    // Legacy values - kept so existing records/admin-panel code paths
+    // continue to work unchanged.
     LAND_TITLE = "Land Title",
     CONSENT = "Consent",
     REGISTRATION = "Registration",
-    OTHER = "Other"
+    OTHER = "Other",
+    // EUDR due-diligence document types collected by the mobile app
+    // (FarmerAttachmentsStep "Compliance Documents" section).
+    NATIONAL_ID = "National ID / Identification Document",
+    LAND_DEED = "Land Deed / Land Ownership Document",
+    LEASE_AGREEMENT = "Lease / Land-Use Agreement",
+    CUSTOMARY_AUTHORIZATION = "Customary or Community Land Authorization",
+    COOPERATIVE_MEMBERSHIP = "Cooperative/Association Membership Document"
 }
 
 export enum DocumentStatus {
