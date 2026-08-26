@@ -183,6 +183,11 @@ export class AuthController {
                 idType,
                 idTypeOther,
                 otherId,
+                // Cooperative / Enumerator (EUDR traceability - who registered this
+                // farmer, and any producer-group affiliation)
+                cooperativeName,
+                cooperativeId,
+                enumeratorId,
                 // Location
                 county,
                 district,
@@ -199,6 +204,16 @@ export class AuthController {
                 farmSizeManual,
                 farmUnitManual,
                 farmNotes,
+                // EUDR due-diligence farm attributes (parity with admin panel's
+                // RegisterFarmer.tsx "farms" array fields)
+                numberOfTrees,
+                yearsInCultivation,
+                harvestSeason,
+                averageYield,
+                buyers,
+                useChemicals,
+                extensionServices,
+                farmAddress,
                 // Mapping
                 boundaryJson,
                 areaHa,
@@ -278,6 +293,9 @@ export class AuthController {
                 farmer.region = county;
 
                 farmer.enumeratorName = inspectorName;
+                farmer.enumeratorId = enumeratorId;
+                farmer.cooperativeName = cooperativeName;
+                farmer.cooperativeId = cooperativeId;
                 farmer.directions = directions;
                 farmer.latitude = lat;
                 farmer.longitude = lng;
@@ -345,6 +363,16 @@ export class AuthController {
                     farm.farmNotes = farmNotes;
                     farm.manualSizeInput = farmSizeManual;
                     farm.manualSizeUnit = farmUnitManual;
+                    // EUDR due-diligence attributes (parity with admin panel's
+                    // multi-farm array path above)
+                    if (numberOfTrees) farm.numberOfTrees = parseInt(numberOfTrees);
+                    if (yearsInCultivation) farm.yearsInCultivation = parseInt(yearsInCultivation);
+                    farm.harvestSeason = harvestSeason;
+                    farm.averageYield = averageYield;
+                    farm.buyers = buyers;
+                    farm.useChemicals = useChemicals === 'true' || useChemicals === true;
+                    farm.extensionServices = extensionServices === 'true' || extensionServices === true;
+                    farm.farmAddress = farmAddress;
 
                     if (boundaryJson) {
                         try {
