@@ -10,6 +10,9 @@ router.post("/login", (req, res) => authController.login(req, res));
 
 router.post("/forget-password", (req, res) => authController.forgotPassword(req, res));
 router.post("/reset-password", (req, res) => authController.resetPassword(req, res));
+// In-app password change for a logged-in user (requires their CURRENT
+// password, unlike forget/reset-password which is for locked-out users).
+router.post("/change-password", authMiddleware(), (req, res) => authController.changePassword(req, res));
 import { upload } from "../middleware/upload.middleware";
 
 // IMPORTANT: this route must stay reachable by fully unauthenticated

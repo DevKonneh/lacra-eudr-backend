@@ -119,6 +119,43 @@ export class AuthController {
         }
     }
 
+    /// Change password for the currently authenticated user (requires
+    /// knowing the current password first — different from
+    /// forgotPassword/resetPassword, which is for users who are LOCKED OUT
+    /// and reset via an emailed verification code instead). Used by the
+    /// mobile app's in-app Profile screen so inspectors can update their
+    /// own password without going through email.
+    async changePassword(req: Request, res: Response) {
+        try {
+            const userId = (req as any).user?.id;
+            if (!userId) return errorResponse(res, "Unauthorized", [], 401);
+
+            const { currentPassword, newPassword } = req.body;
+            if (!currentPassword || !newPassword) {
+                return errorResponse(res, "Current and new password are required", [], 400);
+            }
+            if (String(newPassword).length < 6) {
+                return errorResponse(res, "New password must be at least 6 characters", [], 400);
+            }
+
+            const user = await this.userRepository.findOneBy({ id: userId });
+            if (!user) return errorResponse(res, "User not found", [], 404);
+
+            const isMatch = await bcrypt.compare(currentPassword, user.password);
+            if (!isMatch) {
+                return errorResponse(res, "Current password is incorrect", [], 401);
+            }
+
+            user.password = await bcrypt.hash(newPassword, 10);
+            await this.userRepository.save(user);
+
+            return successResponse(res, null, "Password updated successfully");
+        } catch (error: any) {
+            console.error("Change Password Error", error);
+            return errorResponse(res, "Error updating password", [error.message], 500);
+        }
+    }
+
     async resetPassword(req: Request, res: Response) {
         try {
             const { email, verificationCode, newPassword } = req.body;
