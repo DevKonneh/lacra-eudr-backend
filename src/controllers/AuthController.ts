@@ -207,6 +207,13 @@ export class AuthController {
                 consent,
                 email // still needed for User account
             } = body;
+            // Note: EUDR 4+ point boundary evidence (per-point geotagged photos) is
+            // NOT handled inline here. It is attached via a follow-up call to
+            // PUT /farms/:id/boundary-evidence once this registration call returns
+            // the created farm's id (see `createdFarmIds` in the success response
+            // below). This keeps the point/photo-matching logic in one place
+            // (FarmController.addBoundaryEvidence) instead of duplicating it inside
+            // this already-complex transactional flow.
 
             // Handle files
             const files = (req as any).files as Express.Multer.File[];
@@ -286,6 +293,10 @@ export class AuthController {
 
                 await queryRunner.manager.save(Farmer, farmer);
 
+                // Track created farm ids so the caller can follow up with
+                // PUT /farms/:id/boundary-evidence (per-point geotagged photos)
+                const createdFarmIds: string[] = [];
+
                 // Create Farm if details provided
                 if (farmsData && Array.isArray(farmsData) && farmsData.length > 0) {
                     // If farmsData passed via JSON string (advanced frontend)
@@ -314,7 +325,8 @@ export class AuthController {
                             }
                         }
                         farm.farmer = farmer;
-                        await queryRunner.manager.save(Farm, farm);
+                        const savedFarm = await queryRunner.manager.save(Farm, farm);
+                        createdFarmIds.push(savedFarm.id);
                     }
                 } else if (farmName) {
                     // Fallback to flat fields if farms array not used
@@ -349,11 +361,21 @@ export class AuthController {
 
                     farm.farmer = farmer;
 
-                    await queryRunner.manager.save(Farm, farm);
+                    const savedFarm = await queryRunner.manager.save(Farm, farm);
+                    createdFarmIds.push(savedFarm.id);
                 }
 
                 await queryRunner.commitTransaction();
-                return successResponse(res, null, "Registration successful. Pending approval.", 201);
+                // Return the created farmer/farm ids so the mobile app can, when using
+                // the new EUDR 4+ point boundary capture mode, follow up with
+                // PUT /farms/:id/boundary-evidence to attach the per-point geotagged
+                // photos (farmId here refers to the first/primary farm created).
+                return successResponse(
+                    res,
+                    { farmerId: farmer.id, farmId: createdFarmIds[0] || null, farmIds: createdFarmIds },
+                    "Registration successful. Pending approval.",
+                    201
+                );
             } catch (error: any) {
                 await queryRunner.rollbackTransaction();
                 console.error("Farmer Register Error", error);

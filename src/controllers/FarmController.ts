@@ -170,6 +170,74 @@ export class FarmController {
         }
     }
 
+    // Attach EUDR-standard boundary evidence (per-GPS-point geotagged photos) to
+    // an existing farm. Expects a multipart request with:
+    //   - field "points": JSON string array of
+    //       { sequence, lat, lng, accuracy?, timestamp? }
+    //   - files with fieldname "boundaryPhoto_<sequence>" (one photo per point,
+    //     sequence matching the corresponding entry in "points")
+    // Each point's file is matched by its sequence number so ordering in the
+    // multipart payload doesn't matter. Optionally also accepts "location"
+    // (GeoJSON Polygon built from the same points) and "totalAreaHa" to update
+    // the farm's boundary/area in the same request.
+    async addBoundaryEvidence(req: Request, res: Response) {
+        try {
+            const { id } = req.params;
+            const farm = await this.farmRepository.findOne({ where: { id } });
+            if (!farm) return errorResponse(res, "Farm not found", [], 404);
+
+            const { points, location, totalAreaHa } = req.body;
+            if (!points) {
+                return errorResponse(res, "Missing 'points' field (JSON array of {sequence, lat, lng})", [], 400);
+            }
+
+            let parsedPoints: any[];
+            try {
+                parsedPoints = typeof points === "string" ? JSON.parse(points) : points;
+            } catch (e) {
+                return errorResponse(res, "Invalid JSON in 'points' field", [], 400);
+            }
+
+            if (!Array.isArray(parsedPoints) || parsedPoints.length < 4) {
+                return errorResponse(res, "At least 4 boundary points (with photos) are required", [], 400);
+            }
+
+            const files = (req as any).files as Express.Multer.File[] | undefined;
+
+            const evidence = parsedPoints.map((p: any) => {
+                const seq = p.sequence;
+                const file = files?.find(f => f.fieldname === `boundaryPhoto_${seq}`);
+                if (!file) {
+                    throw new Error(`Missing photo for boundary point ${seq} (expected field 'boundaryPhoto_${seq}')`);
+                }
+                return {
+                    sequence: seq,
+                    lat: parseFloat(p.lat),
+                    lng: parseFloat(p.lng),
+                    accuracy: p.accuracy !== undefined ? parseFloat(p.accuracy) : undefined,
+                    timestamp: p.timestamp,
+                    photoUrl: toPublicFileUrls([file.path])[0],
+                };
+            });
+
+            farm.boundaryEvidence = evidence;
+
+            if (location) {
+                const parsedLocation = typeof location === "string" ? JSON.parse(location) : location;
+                farm.location = parsedLocation;
+            }
+            if (totalAreaHa) {
+                farm.totalAreaHa = parseFloat(totalAreaHa);
+            }
+
+            await this.farmRepository.save(farm);
+            return successResponse(res, farm, "Boundary evidence saved successfully");
+        } catch (error: any) {
+            console.error("Error adding boundary evidence:", error);
+            return errorResponse(res, error.message || "Error adding boundary evidence", [error.message], 400);
+        }
+    }
+
     async offlineSync(req: Request, res: Response) {
         try {
             const { farmerId, name, cropType, location } = req.body;

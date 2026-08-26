@@ -13,5 +13,6 @@ router.get("/:id", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.
 router.post("/", authMiddleware([UserRole.FARMER, UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.create(req, res));
 router.post("/offline-sync", authMiddleware([UserRole.FARMER, UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.offlineSync(req, res));
 router.put("/:id/photos", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), upload.any(), (req, res) => controller.addPhotos(req, res));
+router.put("/:id/boundary-evidence", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), upload.any(), (req, res) => controller.addBoundaryEvidence(req, res));
 
 export default router;

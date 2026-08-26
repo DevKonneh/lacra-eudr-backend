@@ -91,6 +91,22 @@ export class Farm {
     @Column("simple-array", { nullable: true })
     farmPhotos!: string[];
 
+    // EUDR-standard boundary evidence: one entry per GPS point captured while
+    // walking/marking the farm boundary (minimum 4 points -> land polygon).
+    // Each entry ties a specific coordinate to the photo taken AT that exact
+    // point, which is what distinguishes this from a generic photo gallery -
+    // it's per-point, geotagged, timestamped proof of the physical boundary.
+    // Shape: [{ sequence, lat, lng, accuracy, timestamp, photoUrl }, ...]
+    @Column("jsonb", { nullable: true })
+    boundaryEvidence!: {
+        sequence: number;
+        lat: number;
+        lng: number;
+        accuracy?: number;
+        timestamp?: string;
+        photoUrl: string;
+    }[];
+
     @ManyToOne(() => Farmer, (farmer) => farmer.farms)
     farmer!: Farmer;
 
