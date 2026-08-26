@@ -162,6 +162,17 @@ export class AuthController {
         try {
             const body = req.body;
 
+            // Real, reliable identity of whoever is authenticated and making
+            // this request (from the verified JWT, not a free-text form
+            // field) — used for per-inspector data scoping in
+            // FarmerController.getAll(). Without this, every farmer
+            // registered from the mobile app ends up with a NULL
+            // registeredByUserId, which getAll()'s legacy-data fallback
+            // treats as visible to every inspector (this was the root cause
+            // of inspectors seeing each other's newly-registered farmers).
+            const requester = (req as any).user;
+            const registeredByUserId: string | undefined = requester?.id;
+
             // Parse farms if it's a string (since multipart sends it as string)
             let farmsData = body.farms;
             if (typeof farmsData === 'string') {
@@ -301,6 +312,7 @@ export class AuthController {
                 farmer.latitude = lat;
                 farmer.longitude = lng;
                 farmer.consent = consent === 'true' || consent === true;
+                farmer.registeredByUserId = registeredByUserId as any;
 
                 // Map Files — upload each to Cloudinary and store the
                 // permanent secure_url (undefined if that field wasn't sent).

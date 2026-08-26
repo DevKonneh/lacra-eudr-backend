@@ -29,3 +29,27 @@ export const authMiddleware = (roles: string[] = []) => {
         }
     };
 };
+
+// Like authMiddleware, but never rejects the request — it just populates
+// req.user when a valid Bearer token is present, and silently leaves it
+// undefined otherwise (missing token, or invalid/expired token). Use this
+// on routes that must remain reachable by fully unauthenticated callers
+// (e.g. the admin panel's public self-registration page) but that still
+// want to know/attribute the caller's identity when they ARE logged in
+// (e.g. the mobile app's inspector-led farmer registration flow, so
+// registeredByUserId can be stamped for correct per-inspector data
+// scoping — see FarmerController.getAll()).
+export const optionalAuthMiddleware = () => {
+    return (req: AuthRequest, _res: Response, next: NextFunction) => {
+        const token = req.headers.authorization?.split(" ")[1];
+        if (token) {
+            try {
+                req.user = jwt.verify(token, JWT_SECRET);
+            } catch (error) {
+                // Invalid/expired token on an optional-auth route: proceed
+                // as an anonymous request rather than blocking it.
+            }
+        }
+        next();
+    };
+};
