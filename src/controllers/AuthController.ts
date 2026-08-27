@@ -324,7 +324,18 @@ export class AuthController {
                 farmer.firstName = names[0] || "";
                 farmer.lastName = names.slice(1).join(' ') || "";
 
-                farmer.email = email;
+                // IMPORTANT: email is an OPTIONAL field on the mobile registration
+                // form. When left blank, the Flutter client sends an empty string
+                // '' (not omitted/null) — see FarmerRegistrationModel.toJson().
+                // The Farmer.email column is `nullable: true, unique: true`, and
+                // Postgres unique indexes treat '' as a real, comparable value
+                // (unlike NULL, where multiple NULLs are always allowed). Storing
+                // '' here caused every subsequent farmer with a blank email to
+                // collide against the first one that used it, permanently
+                // blocking sync for those farmers with "Duplicate entry: email
+                // already exists." Only store a real value; otherwise leave the
+                // column undefined/NULL so multiple blank-email farmers can coexist.
+                farmer.email = email && String(email).trim() !== '' ? email : undefined;
                 farmer.phoneNumber = phone;
                 farmer.gender = gender;
                 farmer.dob = dob ? new Date(dob) : new Date(); // Handle valid date parsing
