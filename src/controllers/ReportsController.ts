@@ -61,12 +61,17 @@ export class ReportsController {
             // 0 for any month that had no registrations. This is real data - a month can
             // legitimately show 0 if nobody registered that month, and that's shown as-is
             // rather than being masked or replaced.
+            // NOTE: group/order by the raw expression (not the "monthKey" alias) - Postgres
+            // folds unquoted mixed-case aliases to lowercase, so referencing "monthKey" in
+            // GROUP BY/ORDER BY throws 'column "monthkey" does not exist'. TypeORM's raw
+            // result object still exposes the alias as given (r.monthKey) since that part is
+            // just the SELECT column name, unaffected by the GROUP/ORDER BY clause issue.
             const rawTrend = await this.farmerRepository
                 .createQueryBuilder("farmer")
                 .select("TO_CHAR(farmer.createdAt, 'YYYY-MM')", "monthKey")
                 .addSelect("COUNT(farmer.id)", "count")
-                .groupBy("monthKey")
-                .orderBy("monthKey", "ASC")
+                .groupBy("TO_CHAR(farmer.createdAt, 'YYYY-MM')")
+                .orderBy("TO_CHAR(farmer.createdAt, 'YYYY-MM')", "ASC")
                 .getRawMany();
 
             const countByMonthKey = new Map<string, number>(
