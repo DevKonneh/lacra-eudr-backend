@@ -49,7 +49,15 @@ export interface WhispIndicators {
     loggingConcessionBefore2020?: 'yes' | 'no';
 }
 
-export type WhispRiskLabel = 'high' | 'low' | 'unknown';
+// 'more_info_needed' is a real value Whisp's decision-tree engine returns (visible in the
+// commodity-specific risk_pcrop/risk_acrop/risk_timber fields and confirmed via an official
+// Whisp HTML risk report exported directly from whisp.openforis.org on 2026-08-28). It means
+// Whisp's own tree could not reach a definitive low/high verdict for that commodity category -
+// NOT the same as "low risk". Treating it as equivalent to low (as an earlier version of this
+// code implicitly did, by only checking `=== 'high'`) understates real uncertainty that Whisp
+// itself is flagging. 'unknown' remains our own fallback for when Whisp didn't return a label at
+// all (e.g. cropType not mapped, or Whisp unavailable).
+export type WhispRiskLabel = 'high' | 'low' | 'more_info_needed' | 'unknown';
 
 export interface WhispAnalysisResult {
     resultId: string;           // Whisp job token (context.token) or plotId fallback

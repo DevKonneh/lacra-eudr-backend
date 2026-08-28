@@ -31,35 +31,38 @@ export class RiskService {
         // Call Open Foris Whisp for Deforestation Analysis
         const whispResult = await this.whispService.analyzeFarm(farmId, farm.location);
 
-        // 1. Deforestation Risk Check (Enhanced with real Whisp EUDR indicators)
+        // 1. Deforestation Risk Check
         //
-        // IMPORTANT - EUDR cutoff rule (Regulation (EU) 2023/1115): a commodity is
-        // "deforestation-free" as long as the land it comes from had NO forest loss
-        // AFTER 31 December 2020. Forest that existed (or was even cleared) BEFORE that
-        // date does not, by itself, make a plot non-compliant.
+        // STANDARD: match Whisp's own official verdict exactly - the EU's own reference
+        // methodology, and what an EU auditor testing against the Whisp API will expect
+        // to see reflected in our system. We do NOT recompute our own approximation from
+        // raw annual disturbance events. An earlier version of this code independently
+        // flagged any post-2020 TMF_deg_* (degradation) event as automatic high risk -
+        // but a real farm's own official Whisp HTML risk report (exported directly from
+        // whisp.openforis.org on 2026-08-28) proved that mismatch: Whisp's own decision
+        // tree did NOT count that same 0.077 ha 2024 degradation signal as "disturbance
+        // after 2020" (Ind_04_disturbance_after_2020 = "no"), yet our code still flagged
+        // the farm High. Trusting Whisp's own commodityRiskLabel directly removes that
+        // divergence entirely.
         //
-        // We therefore do NOT treat `eufo2020Ha > 0` (mere overlap with the EU's 2020
-        // forest-cover BASELINE map) as a risk trigger on its own - that field only tells
-        // us the plot touched forest as of the baseline snapshot date, not that anything
-        // was illegally cleared. Using it as a standalone trigger would wrongly flag
-        // farms that were legitimately cleared years before the cutoff (or are still
-        // sitting on legal standing forest with proper documentation).
-        //
-        // Instead we rely on two signals that Whisp itself computes with the cutoff
-        // rule already applied:
-        //   - hasPostBaselineDisturbance: any GFC/TMF/RADD/GLAD loss event dated AFTER
-        //     2020 - this is the actual EUDR violation signal.
-        //   - commodityRiskLabel: Whisp's own pre-computed risk_pcrop/risk_acrop/
-        //     risk_timber classification, which already incorporates the correct EUDR
-        //     methodology (including the 2020 cutoff) rather than a naive presence check.
+        // commodityRiskLabel is Whisp's pre-computed risk_pcrop / risk_acrop / risk_timber
+        // field (whichever matches this farm's crop category) and can be one of three
+        // real values - NOT just high/low:
+        //   'high'             -> Whisp's own tree reached a definitive high-risk verdict.
+        //   'low'              -> Whisp's own tree reached a definitive low-risk verdict.
+        //   'more_info_needed' -> Whisp could not reach a definitive verdict (e.g. primary/
+        //                         nat-regen forest present in 2020 with no clear later signal).
+        //                         This is a real, distinct state - not equivalent to low -
+        //                         so we surface it as our MEDIUM tier rather than silently
+        //                         treating it as compliant.
         const commodityRiskLabel = this.getCommodityRiskLabel(whispResult, farm.cropType);
         const postBaselineEvents = whispResult
             ? whispResult.annualEvents.filter(e => e.year > 2020)
             : [];
-        const hasPostBaselineDisturbance = postBaselineEvents.length > 0;
         const deforestationRisk = whispResult
-            ? (commodityRiskLabel === 'high' || hasPostBaselineDisturbance)
-            : await this.checkDeforestation(farm); // Fallback to local logic
+            ? commodityRiskLabel === 'high'
+            : await this.checkDeforestation(farm); // Fallback to local logic (Whisp unavailable)
+        const deforestationNeedsReview = whispResult ? commodityRiskLabel === 'more_info_needed' : false;
 
         // Build a plain-language, evidence-cited narrative explaining exactly WHY this
         // farm was classified the way it was - so an EU reviewer (or the farmer/inspector)
@@ -78,7 +81,9 @@ export class RiskService {
         const traceabilityRisk = await this.checkTraceability(farm);
 
         // Calculate Overall Risk
-        const overallRisk = this.calculateRiskScore(deforestationRisk, overlapResult, legalityRisk, traceabilityRisk);
+        const overallRisk = this.calculateRiskScore(
+            deforestationRisk, overlapResult, legalityRisk, traceabilityRisk, deforestationNeedsReview
+        );
 
         // Save Assessment
         const assessment = this.assessmentRepo.create({
@@ -172,8 +177,16 @@ export class RiskService {
             `of a ${area} ha plot${loc ? ` in ${loc}` : ''}.`
         );
 
-        if (deforestationRisk) {
-            // HIGH: cite the specific evidence that triggered it.
+        const categoryLabel = this.cropCategoryLabel(cropType);
+        const preCutoffEvents = whispResult.annualEvents.filter(e => e.year <= 2020);
+
+        lines.push(
+            `Whisp's own pre-computed ${categoryLabel} risk classification (${this.cropCategoryField(cropType)}) for this plot is "${commodityRiskLabel}" - ` +
+            `this is the EU's own reference verdict for this plot and commodity category, and is what this system reports as the deforestation risk.`
+        );
+
+        if (commodityRiskLabel === 'high') {
+            // HIGH: cite the specific post-2020 evidence, if Whisp surfaced any, for context.
             if (postBaselineEvents.length > 0) {
                 const eventDescriptions = postBaselineEvents.map(e => {
                     const parts: string[] = [];
@@ -185,40 +198,40 @@ export class RiskService {
                     if (e.gladS2AlertHa) parts.push(`GLAD-Sentinel2 alert ${e.gladS2AlertHa.toFixed(3)} ha`);
                     return `${e.year}: ${parts.join(', ')}`;
                 });
-                lines.push(
-                    `HIGH RISK - post-2020 forest disturbance was detected, which is the actual EUDR violation ` +
-                    `signal (deforestation/degradation occurring AFTER the 31 Dec 2020 cutoff): ${eventDescriptions.join('; ')}.`
-                );
+                lines.push(`Supporting evidence - post-2020 disturbance detected: ${eventDescriptions.join('; ')}.`);
             }
-            if (commodityRiskLabel === 'high') {
-                lines.push(
-                    `Whisp's own pre-computed ${this.cropCategoryLabel(cropType)} risk classification for this plot is ` +
-                    `"high" (derived from EUDR-aligned commodity-overlap and disturbance-timing analysis, not a raw baseline check).`
-                );
-            }
+        } else if (commodityRiskLabel === 'more_info_needed') {
+            // MORE INFO NEEDED: Whisp itself could not reach a definitive verdict. Explain the
+            // likely reason (forest present in 2020 with no clear later signal either way) rather
+            // than implying a clean pass.
+            lines.push(
+                `This means Whisp's decision tree could not conclusively determine low or high risk from ` +
+                `available satellite signals alone (commonly because primary or naturally-regenerating forest ` +
+                `was present on the plot as of the 2020 baseline, with no unambiguous later disturbance signal ` +
+                `either way). This plot is flagged for manual/documentary review rather than auto-cleared.`
+            );
         } else {
             // LOW/compliant: explain why, including addressing any pre-2020 baseline forest presence
             // so it's clear that was correctly NOT counted against the farm.
             lines.push(
-                `LOW RISK - no forest loss or degradation was detected AFTER 31 Dec 2020 (the EUDR cutoff date) on this plot, ` +
-                `and Whisp's pre-computed ${this.cropCategoryLabel(cropType)} risk classification is "${commodityRiskLabel}".`
+                `No forest loss or degradation was counted by Whisp as occurring AFTER 31 Dec 2020 (the EUDR cutoff date) on this plot.`
             );
             if (whispResult.eufo2020Ha > 0) {
                 lines.push(
                     `Note: this plot does overlap ${whispResult.eufo2020Ha.toFixed(3)} ha of the EU's 2020 forest-cover ` +
                     `BASELINE map (EUFO_2020), meaning the land was forested as of the reference snapshot date - but per ` +
-                    `EUDR rules, this alone does not indicate non-compliance since no disturbance was recorded after the ` +
-                    `cutoff. This is disclosed for transparency, not counted as risk.`
+                    `EUDR rules, this alone does not indicate non-compliance since Whisp did not count any disturbance ` +
+                    `after the cutoff. This is disclosed for transparency, not counted as risk.`
                 );
             }
-            const preCutoffEvents = whispResult.annualEvents.filter(e => e.year <= 2020);
-            if (preCutoffEvents.length > 0) {
-                const years = preCutoffEvents.map(e => e.year).join(', ');
-                lines.push(
-                    `Historical clearing/degradation signals were found for year(s) ${years}, all of which occurred ` +
-                    `BEFORE the EUDR cutoff and therefore do not affect this plot's compliance status.`
-                );
-            }
+        }
+
+        if (preCutoffEvents.length > 0) {
+            const years = preCutoffEvents.map(e => e.year).join(', ');
+            lines.push(
+                `Historical clearing/degradation signals were found for year(s) ${years}, all of which occurred ` +
+                `BEFORE the EUDR cutoff.`
+            );
         }
 
         if (whispResult.commodityOverlaps.length > 0) {
@@ -236,6 +249,13 @@ export class RiskService {
         if (PERENNIAL_CROPS.has(cropType)) return 'perennial crop';
         if (ANNUAL_CROPS.has(cropType)) return 'annual crop';
         return 'timber';
+    }
+
+    /** Raw Whisp field name (risk_pcrop / risk_acrop / risk_timber) for a given crop's category. */
+    private cropCategoryField(cropType: CropType): string {
+        if (PERENNIAL_CROPS.has(cropType)) return 'risk_pcrop';
+        if (ANNUAL_CROPS.has(cropType)) return 'risk_acrop';
+        return 'risk_timber';
     }
 
     private async checkDeforestation(farm: Farm): Promise<boolean> {
@@ -298,12 +318,17 @@ export class RiskService {
         deforestation: boolean,
         overlap: OverlapResult,
         legality: boolean,
-        traceability: boolean
+        traceability: boolean,
+        deforestationNeedsReview: boolean = false
     ): RiskLevel {
         if (deforestation || overlap === OverlapResult.FOREST || overlap === OverlapResult.PROTECTED_AREA) {
             return RiskLevel.HIGH;
         }
-        if (legality || traceability) {
+        // Whisp itself could not reach a definitive low/high verdict for this commodity
+        // category (risk_pcrop/risk_acrop/risk_timber = "more_info_needed") - surface this
+        // as MEDIUM rather than silently treating it as compliant, since the EU's own tool
+        // is flagging genuine uncertainty here, not a clean pass.
+        if (legality || traceability || deforestationNeedsReview) {
             return RiskLevel.MEDIUM;
         }
         return RiskLevel.LOW;
