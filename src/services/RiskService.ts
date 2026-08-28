@@ -32,17 +32,41 @@ export class RiskService {
         const whispResult = await this.whispService.analyzeFarm(farmId, farm.location);
 
         // 1. Deforestation Risk Check (Enhanced with real Whisp EUDR indicators)
-        // EUFO_2020 > 0 means the plot overlaps the EU's 2020 forest-cover baseline - the
-        // primary EUDR deforestation signal. We also flag it if Whisp's own pre-computed
-        // commodity-category risk label (matched to this farm's crop) comes back "high",
-        // or if any post-2020 disturbance/tree-cover-loss event was detected on the plot.
+        //
+        // IMPORTANT - EUDR cutoff rule (Regulation (EU) 2023/1115): a commodity is
+        // "deforestation-free" as long as the land it comes from had NO forest loss
+        // AFTER 31 December 2020. Forest that existed (or was even cleared) BEFORE that
+        // date does not, by itself, make a plot non-compliant.
+        //
+        // We therefore do NOT treat `eufo2020Ha > 0` (mere overlap with the EU's 2020
+        // forest-cover BASELINE map) as a risk trigger on its own - that field only tells
+        // us the plot touched forest as of the baseline snapshot date, not that anything
+        // was illegally cleared. Using it as a standalone trigger would wrongly flag
+        // farms that were legitimately cleared years before the cutoff (or are still
+        // sitting on legal standing forest with proper documentation).
+        //
+        // Instead we rely on two signals that Whisp itself computes with the cutoff
+        // rule already applied:
+        //   - hasPostBaselineDisturbance: any GFC/TMF/RADD/GLAD loss event dated AFTER
+        //     2020 - this is the actual EUDR violation signal.
+        //   - commodityRiskLabel: Whisp's own pre-computed risk_pcrop/risk_acrop/
+        //     risk_timber classification, which already incorporates the correct EUDR
+        //     methodology (including the 2020 cutoff) rather than a naive presence check.
         const commodityRiskLabel = this.getCommodityRiskLabel(whispResult, farm.cropType);
-        const hasPostBaselineDisturbance = whispResult
-            ? whispResult.annualEvents.some(e => e.year > 2020)
-            : false;
+        const postBaselineEvents = whispResult
+            ? whispResult.annualEvents.filter(e => e.year > 2020)
+            : [];
+        const hasPostBaselineDisturbance = postBaselineEvents.length > 0;
         const deforestationRisk = whispResult
-            ? (whispResult.eufo2020Ha > 0 || commodityRiskLabel === 'high' || hasPostBaselineDisturbance)
+            ? (commodityRiskLabel === 'high' || hasPostBaselineDisturbance)
             : await this.checkDeforestation(farm); // Fallback to local logic
+
+        // Build a plain-language, evidence-cited narrative explaining exactly WHY this
+        // farm was classified the way it was - so an EU reviewer (or the farmer/inspector)
+        // can see the actual satellite evidence behind the verdict, not just a label.
+        const deforestationNarrative = this.buildDeforestationNarrative(
+            whispResult, farm.cropType, commodityRiskLabel, postBaselineEvents, deforestationRisk
+        );
 
         // 2. Overlap Risk Check
         const overlapResult = await this.checkOverlap(farm);
@@ -69,10 +93,8 @@ export class RiskService {
             whispData: whispResult,
             details: {
                 assessedAt: new Date(),
-                notes: whispResult
-                    ? `Analysis via Open Foris Whisp: EUFO_2020 overlap ${whispResult.eufo2020Ha.toFixed(3)} ha, ` +
-                      `${farm.cropType} risk = ${commodityRiskLabel}${hasPostBaselineDisturbance ? ', post-2020 disturbance detected' : ''}.`
-                    : "Automated local analysis (Whisp unavailable)",
+                notes: deforestationNarrative,
+                narrative: deforestationNarrative,
                 commodities: whispResult?.commodityOverlaps.map(c => c.commodity)
             }
         });
@@ -117,6 +139,103 @@ export class RiskService {
         if (PERENNIAL_CROPS.has(cropType)) return whispResult.riskPerennialCrop;
         if (ANNUAL_CROPS.has(cropType)) return whispResult.riskAnnualCrop;
         return whispResult.riskTimber;
+    }
+
+    /**
+     * Builds a plain-language, evidence-cited explanation of the deforestation
+     * verdict, so an EU reviewer (or the farmer/inspector) can see exactly WHAT
+     * satellite evidence led to the classification - not just a bare Yes/No label.
+     *
+     * Cites concrete numbers (hectares, years, dataset names) pulled straight from
+     * the real Whisp/Earth Engine response, and is explicit about the EUDR
+     * post-2020 cutoff rule so pre-2020 baseline forest overlap is never confused
+     * with an actual violation.
+     */
+    private buildDeforestationNarrative(
+        whispResult: WhispAnalysisResult | null,
+        cropType: CropType,
+        commodityRiskLabel: WhispRiskLabel,
+        postBaselineEvents: WhispAnalysisResult['annualEvents'],
+        deforestationRisk: boolean
+    ): string {
+        if (!whispResult) {
+            return "Automated local analysis only (Open Foris Whisp satellite service was unavailable for this assessment) - " +
+                   "no real satellite deforestation evidence could be retrieved for this plot.";
+        }
+
+        const lines: string[] = [];
+        const area = whispResult.areaHa.toFixed(3);
+        const loc = [whispResult.adminLevel1, whispResult.country].filter(Boolean).join(', ');
+
+        lines.push(
+            `Satellite analysis (Open Foris Whisp v${whispResult.whispVersion || 'n/a'}, Google Earth Engine) ` +
+            `of a ${area} ha plot${loc ? ` in ${loc}` : ''}.`
+        );
+
+        if (deforestationRisk) {
+            // HIGH: cite the specific evidence that triggered it.
+            if (postBaselineEvents.length > 0) {
+                const eventDescriptions = postBaselineEvents.map(e => {
+                    const parts: string[] = [];
+                    if (e.gfcLossHa) parts.push(`Hansen/GFC tree-cover loss ${e.gfcLossHa.toFixed(3)} ha`);
+                    if (e.tmfDeforestationHa) parts.push(`JRC-TMF deforestation ${e.tmfDeforestationHa.toFixed(3)} ha`);
+                    if (e.tmfDegradationHa) parts.push(`JRC-TMF degradation ${e.tmfDegradationHa.toFixed(3)} ha`);
+                    if (e.raddAlertHa) parts.push(`RADD near-real-time alert ${e.raddAlertHa.toFixed(3)} ha`);
+                    if (e.gladLAlertHa) parts.push(`GLAD-Landsat alert ${e.gladLAlertHa.toFixed(3)} ha`);
+                    if (e.gladS2AlertHa) parts.push(`GLAD-Sentinel2 alert ${e.gladS2AlertHa.toFixed(3)} ha`);
+                    return `${e.year}: ${parts.join(', ')}`;
+                });
+                lines.push(
+                    `HIGH RISK - post-2020 forest disturbance was detected, which is the actual EUDR violation ` +
+                    `signal (deforestation/degradation occurring AFTER the 31 Dec 2020 cutoff): ${eventDescriptions.join('; ')}.`
+                );
+            }
+            if (commodityRiskLabel === 'high') {
+                lines.push(
+                    `Whisp's own pre-computed ${this.cropCategoryLabel(cropType)} risk classification for this plot is ` +
+                    `"high" (derived from EUDR-aligned commodity-overlap and disturbance-timing analysis, not a raw baseline check).`
+                );
+            }
+        } else {
+            // LOW/compliant: explain why, including addressing any pre-2020 baseline forest presence
+            // so it's clear that was correctly NOT counted against the farm.
+            lines.push(
+                `LOW RISK - no forest loss or degradation was detected AFTER 31 Dec 2020 (the EUDR cutoff date) on this plot, ` +
+                `and Whisp's pre-computed ${this.cropCategoryLabel(cropType)} risk classification is "${commodityRiskLabel}".`
+            );
+            if (whispResult.eufo2020Ha > 0) {
+                lines.push(
+                    `Note: this plot does overlap ${whispResult.eufo2020Ha.toFixed(3)} ha of the EU's 2020 forest-cover ` +
+                    `BASELINE map (EUFO_2020), meaning the land was forested as of the reference snapshot date - but per ` +
+                    `EUDR rules, this alone does not indicate non-compliance since no disturbance was recorded after the ` +
+                    `cutoff. This is disclosed for transparency, not counted as risk.`
+                );
+            }
+            const preCutoffEvents = whispResult.annualEvents.filter(e => e.year <= 2020);
+            if (preCutoffEvents.length > 0) {
+                const years = preCutoffEvents.map(e => e.year).join(', ');
+                lines.push(
+                    `Historical clearing/degradation signals were found for year(s) ${years}, all of which occurred ` +
+                    `BEFORE the EUDR cutoff and therefore do not affect this plot's compliance status.`
+                );
+            }
+        }
+
+        if (whispResult.commodityOverlaps.length > 0) {
+            const overlaps = whispResult.commodityOverlaps
+                .map(c => `${c.commodity} (${c.datasetKey}): ${c.overlapHa.toFixed(3)} ha`)
+                .join(', ');
+            lines.push(`Commodity-mapping overlap detected: ${overlaps}.`);
+        }
+
+        return lines.join(' ');
+    }
+
+    /** Human-readable label for which Whisp risk category applies to a given crop. */
+    private cropCategoryLabel(cropType: CropType): string {
+        if (PERENNIAL_CROPS.has(cropType)) return 'perennial crop';
+        if (ANNUAL_CROPS.has(cropType)) return 'annual crop';
+        return 'timber';
     }
 
     private async checkDeforestation(farm: Farm): Promise<boolean> {
