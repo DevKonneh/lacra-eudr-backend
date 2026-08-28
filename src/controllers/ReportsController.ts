@@ -53,34 +53,33 @@ export class ReportsController {
                 SHIPPED: shipments.filter(s => s.status === 'SHIPPED').length,
             };
 
-            // 2. Farmer Registration Trend (Last 6 Months)
-            // Note: In a real app with huge data, do this aggregation in SQL. 
-            // For MVP, we can fetch dates or simplified SQL group by.
+            // 2. Farmer Registration Trend - last 6 REAL calendar months, zero-filled.
+            //
+            // Groups actual farmer.createdAt timestamps by calendar month (YYYY-MM, not just
+            // "Mon" text, to avoid silently merging e.g. Jan 2025 and Jan 2026 into one bucket)
+            // and always returns exactly the last 6 months ending with the current month, with
+            // 0 for any month that had no registrations. This is real data - a month can
+            // legitimately show 0 if nobody registered that month, and that's shown as-is
+            // rather than being masked or replaced.
             const rawTrend = await this.farmerRepository
                 .createQueryBuilder("farmer")
-                .select("TO_CHAR(farmer.createdAt, 'Mon')", "month")
+                .select("TO_CHAR(farmer.createdAt, 'YYYY-MM')", "monthKey")
                 .addSelect("COUNT(farmer.id)", "count")
-                .groupBy("month")
-                .addGroupBy("EXTRACT(MONTH FROM farmer.createdAt)") // Order by month number
-                .orderBy("EXTRACT(MONTH FROM farmer.createdAt)", "ASC")
+                .groupBy("monthKey")
+                .orderBy("monthKey", "ASC")
                 .getRawMany();
 
-            // Map to clean format (if data is sparse, you might want to fill gaps, but let's keep it simple)
-            const registrationTrend = rawTrend.map(r => ({
-                month: r.month.trim(), // PG sometimes adds padding
-                count: parseInt(r.count)
-            }));
+            const countByMonthKey = new Map<string, number>(
+                rawTrend.map(r => [r.monthKey, parseInt(r.count, 10)])
+            );
 
-            // Fallback for demo if no trend data (since seeder bulk creates in one month)
-            if (registrationTrend.length <= 1) {
-                // Mock previous months for the "Trend" demo
-                const months = ['Aug', 'Sep', 'Oct', 'Nov', 'Dec', 'Jan'];
-                const result = months.map(m => {
-                    if (m === 'Jan') return { month: m, count: totalFarmers }; // Current month has real data
-                    return { month: m, count: Math.floor(Math.random() * 5) }; // Mock past data
-                });
-                // Assign the mock if real data is boring
-                registrationTrend.splice(0, registrationTrend.length, ...result);
+            const now = new Date();
+            const registrationTrend: { month: string; count: number }[] = [];
+            for (let i = 5; i >= 0; i--) {
+                const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+                const monthKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+                const monthLabel = d.toLocaleString('en-US', { month: 'short' });
+                registrationTrend.push({ month: monthLabel, count: countByMonthKey.get(monthKey) || 0 });
             }
 
             return successResponse(res, {

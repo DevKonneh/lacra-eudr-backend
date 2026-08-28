@@ -484,4 +484,38 @@ export class FarmerController {
             return errorResponse(res, "Error syncing farmer", [error.message], 500);
         }
     }
+
+    /**
+     * One-time maintenance endpoint: assigns a human-readable Farmer ID (LACRA-XXXXXXXX)
+     * + QR code to any existing farmer record that was created before this generation step
+     * existed on a given registration path (e.g. the mobile-app flow in AuthController.register,
+     * which was missing this logic until now). Safe to call repeatedly - only touches farmers
+     * whose farmerId is still NULL/empty, so already-assigned IDs are never overwritten.
+     */
+    async backfillFarmerIds(req: Request, res: Response) {
+        try {
+            const farmers = await this.farmerRepository
+                .createQueryBuilder("farmer")
+                .where("farmer.farmerId IS NULL")
+                .orWhere("farmer.farmerId = :empty", { empty: "" })
+                .getMany();
+
+            let updated = 0;
+            for (const farmer of farmers) {
+                const shortId = farmer.id.split('-')[0].toUpperCase();
+                farmer.farmerId = `LACRA-${shortId}`;
+                if (!farmer.qrCode) {
+                    const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${farmer.id}`;
+                    farmer.qrCode = await QRCode.toDataURL(publicProfileUrl);
+                }
+                await this.farmerRepository.save(farmer);
+                updated++;
+            }
+
+            return successResponse(res, { updated, total: farmers.length }, `Backfilled ${updated} farmer ID(s)`);
+        } catch (error: any) {
+            console.error(error);
+            return errorResponse(res, "Error backfilling farmer IDs", [error.message], 500);
+        }
+    }
 }

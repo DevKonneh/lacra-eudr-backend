@@ -10,6 +10,7 @@ import { JWT_SECRET } from "../middleware/auth.middleware";
 import { EmailService } from "../services/EmailService";
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary, uploadFilesToCloudinary } from "../utils/cloudUpload";
+import QRCode from "qrcode";
 
 export class AuthController {
     private userRepository = AppDataSource.getRepository(User);
@@ -376,6 +377,18 @@ export class AuthController {
 
                 farmer.user = user;
 
+                await queryRunner.manager.save(Farmer, farmer);
+
+                // Generate a human-readable Farmer ID + QR code (data URL) now that we have a
+                // real database id to derive it from. Without this step, farmer.farmerId stays
+                // NULL forever and the admin panel's Farmers Directory shows "N/A" under every
+                // single farmer's name - this is the mobile-app registration path (used by the
+                // Flutter inspector app), which was missing the same logic already present in
+                // FarmerController.ts's web-form registration path.
+                const shortId = farmer.id.split('-')[0].toUpperCase();
+                farmer.farmerId = `LACRA-${shortId}`;
+                const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${farmer.id}`;
+                farmer.qrCode = await QRCode.toDataURL(publicProfileUrl);
                 await queryRunner.manager.save(Farmer, farmer);
 
                 // Track created farm ids so the caller can follow up with
