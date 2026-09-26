@@ -78,6 +78,7 @@ import offlineSubmissionRoutes from "./routes/offlineSubmission.routes";
 import exportRoutes from "./routes/export.routes";
 import adminMaintenanceRoutes from "./routes/adminMaintenance.routes";
 import weatherRoutes from "./routes/weather.routes";
+import soilRoutes from "./routes/soil.routes";
 
 app.use("/api/public", publicRoutes);
 app.use("/api/business", businessRoutes);
@@ -103,6 +104,7 @@ app.use("/api/offline-submissions", offlineSubmissionRoutes);
 app.use("/api/export", exportRoutes);
 app.use("/api/admin-maintenance", adminMaintenanceRoutes);
 app.use("/api/weather", weatherRoutes);
+app.use("/api/soil", soilRoutes);
 
 import { errorHandler } from "./middleware/error.middleware";
 app.use(errorHandler);
