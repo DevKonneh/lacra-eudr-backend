@@ -237,7 +237,13 @@ export class AuthController {
                 // farmer, and any producer-group affiliation)
                 cooperativeName,
                 cooperativeId,
+                cooperativeSource,
                 enumeratorId,
+                // Stable client-generated id from the mobile offline sync
+                // queue (Flutter PendingSyncItem.id) - used below to detect
+                // and short-circuit duplicate sync submissions of the same
+                // locally-created record (task spec section 13).
+                clientRecordId,
                 // Location
                 county,
                 district,
@@ -286,6 +292,29 @@ export class AuthController {
             // below via uploadFileToCloudinary/uploadFilesToCloudinary.
             const files = (req as any).files as Express.Multer.File[];
             const getFile = (fieldname: string) => files?.find(f => f.fieldname === fieldname);
+
+            // Idempotency guard for offline-first sync (task spec section
+            // 13: "Prevent Duplicate Sync"). The mobile app sends the same
+            // clientRecordId on every retry of a given local record. If a
+            // Farmer already exists with this clientRecordId, this is a
+            // repeat submission (e.g. the client never received the first
+            // success response over a flaky connection) - short-circuit
+            // with the ALREADY-CREATED farmer instead of inserting a
+            // second row, so retries are always safe.
+            if (clientRecordId) {
+                const existingByClientId = await AppDataSource.getRepository(Farmer).findOne({
+                    where: { clientRecordId },
+                    relations: ["farms"],
+                });
+                if (existingByClientId) {
+                    return successResponse(
+                        res,
+                        { ...existingByClientId, createdFarmIds: (existingByClientId.farms || []).map(f => f.id) },
+                        "Farmer already synced (duplicate submission ignored)",
+                        200
+                    );
+                }
+            }
 
             const queryRunner = AppDataSource.createQueryRunner();
             await queryRunner.connect();
@@ -357,11 +386,19 @@ export class AuthController {
                 farmer.enumeratorId = enumeratorId;
                 farmer.cooperativeName = cooperativeName;
                 farmer.cooperativeId = cooperativeId;
+                farmer.cooperativeSource = cooperativeSource;
                 farmer.directions = directions;
                 farmer.latitude = lat;
                 farmer.longitude = lng;
                 farmer.consent = consent === 'true' || consent === true;
                 farmer.registeredByUserId = registeredByUserId as any;
+                // Undefined (not empty string) when the client didn't send
+                // one, so the column's `unique: true` constraint never
+                // sees multiple rows colliding on '' the way Farmer.email
+                // once did (see the farmer.email assignment above).
+                farmer.clientRecordId = clientRecordId && String(clientRecordId).trim() !== ''
+                    ? clientRecordId
+                    : undefined as any;
 
                 // Map Files — upload each to Cloudinary and store the
                 // permanent secure_url (undefined if that field wasn't sent).

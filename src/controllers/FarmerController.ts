@@ -407,10 +407,37 @@ export class FarmerController {
 
     async offlineSync(req: Request, res: Response) {
         try {
-            const { farmer: farmerData, farms: farmsData = [] } = req.body;
+            // clientRecordId is sent at the top level of the JSON body
+            // (sibling to farmer/farms) — see ApiService.syncFarmerOffline()
+            // on the Flutter side. It is the mobile offline queue's stable,
+            // client-generated PendingSyncItem.id, unchanged across retries
+            // of the same locally-created record.
+            const { farmer: farmerData, farms: farmsData = [], clientRecordId } = req.body;
             if (!farmerData?.firstName || !farmerData?.lastName || !farmerData?.phoneNumber) {
                 return errorResponse(res, "Farmer firstName, lastName and phoneNumber required", [], 400);
             }
+
+            // Idempotency guard (task spec section 13: "Prevent Duplicate
+            // Sync"). If this exact locally-created record was already
+            // synced previously (e.g. the client's connection dropped
+            // before it could see the first success response and it
+            // retried), return the EXISTING farmer instead of erroring or
+            // creating a second row — retries must always be safe.
+            if (clientRecordId) {
+                const existingByClientId = await this.farmerRepository.findOne({
+                    where: { clientRecordId },
+                    relations: ["farms"],
+                });
+                if (existingByClientId) {
+                    return successResponse(
+                        res,
+                        { ...existingByClientId, geometryValidation: {}, rejectedFarms: [] },
+                        "Farmer already synced (duplicate submission ignored)",
+                        200
+                    );
+                }
+            }
+
             if (farmerData.nationalId) {
                 const dup = await this.farmerRepository.findOneBy({ nationalId: farmerData.nationalId });
                 if (dup) return errorResponse(res, "Farmer with this National ID already exists", [], 400);
@@ -436,9 +463,16 @@ export class FarmerController {
             farmer.consent = farmerData.consent === true || farmerData.consent === "true";
             farmer.cooperativeName = farmerData.cooperativeName;
             farmer.cooperativeId = farmerData.cooperativeId;
+            farmer.cooperativeSource = farmerData.cooperativeSource;
             farmer.enumeratorId = farmerData.enumeratorId;
             farmer.enumeratorName = farmerData.enumeratorName;
             farmer.registeredByUserId = (req as any).user?.id;
+            // Undefined (not empty string) when absent, so the column's
+            // `unique: true` constraint never sees multiple rows colliding
+            // on '' (same reasoning as Farmer.email elsewhere in this file).
+            farmer.clientRecordId = clientRecordId && String(clientRecordId).trim() !== ''
+                ? clientRecordId
+                : undefined as any;
 
             if (farmerData.email) {
                 const user = new User();

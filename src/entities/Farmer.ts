@@ -64,6 +64,15 @@ export class Farmer {
     @Column({ nullable: true })
     cooperativeId!: string;
 
+    // Provenance of cooperativeName above: 'CDA_REGISTRY' when the
+    // enumerator picked a cooperative from the official CDA-registry
+    // searchable dropdown, or 'OTHER' when they used the "Other / Not
+    // Listed" free-text fallback (flagged for later back-office review).
+    // Nullable so pre-existing farmer records (registered before this
+    // field existed, or via the admin web panel) remain valid.
+    @Column({ nullable: true })
+    cooperativeSource!: string;
+
     @Column({ nullable: true })
     profilePhoto!: string; // Path to photo
 
@@ -122,6 +131,20 @@ export class Farmer {
 
     @Column({ nullable: true })
     longitude!: string;
+
+    // Stable client-generated identifier (Flutter offline queue's
+    // PendingSyncItem.id) sent by the mobile app on every sync attempt for
+    // a given locally-created farmer record. Because it is generated ONCE
+    // when the record is first queued offline and never changes, it lets
+    // the backend recognize retried/duplicate sync submissions (e.g. after
+    // a dropped connection where the client never received the success
+    // response and re-sends the same record) and treat them as idempotent
+    // instead of creating a second Farmer row. Nullable + unique so
+    // legacy/admin-web-panel records (which never send this field) are
+    // unaffected, while any two records that DO send a value can never
+    // collide accidentally.
+    @Column({ nullable: true, unique: true })
+    clientRecordId!: string;
 
     @CreateDateColumn()
     createdAt!: Date;
