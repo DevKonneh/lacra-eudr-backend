@@ -43,7 +43,7 @@ export class UserController {
             return successResponse(res, userWithoutPassword, "User created successfully", 201);
         } catch (error: any) {
             console.error("Create User Error", error);
-            return errorResponse(res, "Error creating user", [error.message], 500);
+            return errorResponse(res, "Error creating user", [], 500);
         }
     }
 
@@ -61,7 +61,7 @@ export class UserController {
             return successResponse(res, safeUsers);
         } catch (error: any) {
             console.error("Get Users Error", error);
-            return errorResponse(res, "Error fetching users", [error.message], 500);
+            return errorResponse(res, "Error fetching users", [], 500);
         }
     }
 
@@ -78,7 +78,7 @@ export class UserController {
             const { password, ...rest } = user;
             return successResponse(res, rest);
         } catch (error: any) {
-            return errorResponse(res, "Error fetching user", [error.message], 500);
+            return errorResponse(res, "Error fetching user", [], 500);
         }
     }
 
@@ -125,7 +125,7 @@ export class UserController {
             const { password: _, ...rest } = user;
             return successResponse(res, rest);
         } catch (error: any) {
-            return errorResponse(res, "Error updating user", [error.message], 500);
+            return errorResponse(res, "Error updating user", [], 500);
         }
     }
 
@@ -138,7 +138,7 @@ export class UserController {
             }
             return successResponse(res, { deleted: true }, "User deleted successfully");
         } catch (error: any) {
-            return errorResponse(res, "Error deleting user", [error.message], 500);
+            return errorResponse(res, "Error deleting user", [], 500);
         }
     }
 }

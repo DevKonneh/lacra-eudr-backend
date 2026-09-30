@@ -26,6 +26,8 @@ import { Farm } from "../entities/Farm";
 import { Farmer } from "../entities/Farmer";
 import { GeoIdService } from "../services/GeoIdService";
 import { getWhimoService } from "../services/WhimoService";
+import jwt from "jsonwebtoken";
+import { JWT_SECRET } from "../middleware/auth.middleware";
 
 export class FarmScanController {
     private farmRepository = AppDataSource.getRepository(Farm);
@@ -116,9 +118,33 @@ export class FarmScanController {
             }
 
             // ── FULL payload (LACRA internal app) ─────────────────────────────
-            // Includes farmer PII — only return when explicitly requested.
-            // In production, protect this with authMiddleware before exposing
-            // to non-LACRA clients.
+            // ?view=full returns farmer PII (phone, email, address, etc.).
+            // Require a valid LACRA Bearer token before returning it — even
+            // though this route is mounted under /api/public, the "full" view
+            // is only for authenticated LACRA staff and the mobile app (which
+            // always sends a token). Unauthenticated callers (WHIMO, auditors)
+            // get the safe geo-only payload above and must not reach this block.
+            const authHeader = (req as Request).headers.authorization;
+            const bearerToken = authHeader?.startsWith("Bearer ")
+                ? authHeader.slice(7)
+                : null;
+
+            if (!bearerToken) {
+                return res.status(401).json({
+                    success: false,
+                    message: "Unauthorized: Authentication required to access full farm details",
+                });
+            }
+
+            try {
+                jwt.verify(bearerToken, JWT_SECRET);
+            } catch {
+                return res.status(401).json({
+                    success: false,
+                    message: "Unauthorized: Invalid or expired token",
+                });
+            }
+
             const farmer = farm.farmer;
             const fullPayload = {
                 ...geoPayload,
