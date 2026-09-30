@@ -3,6 +3,7 @@ import { AppDataSource } from "../data-source";
 import { Farmer } from "../entities/Farmer";
 import { Farm } from "../entities/Farm";
 import { RiskAssessment } from "../entities/RiskAssessment";
+import { GeoIdService } from "../services/GeoIdService";
 
 /**
  * CSV Export for the Farmer & Farm Registry.
@@ -30,6 +31,9 @@ const CSV_COLUMNS = [
     "longitude",
     "polygon_wkt",
     "coordinate_system",
+    "geoid",           // FAO GeoID (UUIDv8) — content-addressed, anonymous
+    "geoid_uri",       // FAO GeoID resolver URI (view geometry on FAO portal)
+    "farm_scan_url",   // Public LACRA farm-scan URL (encodes the farm QR)
     "whimo_polygon_id",
     "mapping_source",
     "mapped_by",
@@ -213,6 +217,9 @@ export class ExportController {
                     ? `${process.env.FRONTEND_URL || "http://localhost:5173"}/public/farmers/${farmer.id}`
                     : "";
 
+                // ── Farm-scan URL (encodes the public QR endpoint) ─────────
+                const farmScanUrl = GeoIdService.farmScanUrl(farm.id);
+
                 const row = [
                     farmer.farmerId || "",                         // farmer_id
                     farm.id || "",                                  // farm_id
@@ -231,6 +238,9 @@ export class ExportController {
                     formatCoord(lng),                                // longitude
                     wkt || "",                                       // polygon_wkt
                     wkt ? "EPSG:4326" : "",                          // coordinate_system
+                    farm.geoId || "",                                // geoid
+                    farm.geoIdUri || "",                             // geoid_uri
+                    farmScanUrl,                                     // farm_scan_url
                     "",                                              // whimo_polygon_id (not yet tracked — left blank)
                     farm.boundaryEvidence && farm.boundaryEvidence.length > 0
                         ? "GPS Field Mapping"

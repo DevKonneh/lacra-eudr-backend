@@ -11,6 +11,8 @@ import { Batch } from "../entities/Batch";
 import { OfflineSubmission } from "../entities/OfflineSubmission";
 import { User, UserRole } from "../entities/User";
 import { successResponse, errorResponse } from "../utils/response";
+import { getGeoIdService } from "../services/GeoIdService";
+import { getWhimoService } from "../services/WhimoService";
 
 /**
  * Admin-only "reset test data" endpoint.
@@ -162,5 +164,137 @@ export class AdminMaintenanceController {
         } finally {
             await queryRunner.release();
         }
+    }
+
+    /**
+     * GET /api/admin-maintenance/integration-health
+     *
+     * Production health-check for all external integrations and GeoID statistics.
+     * Returns a JSON snapshot suitable for display on the GeoID Admin dashboard
+     * and for automated monitoring (Render health checks, uptime services).
+     *
+     * Checks:
+     *  1. Database connectivity
+     *  2. FAO GeoID API reachability
+     *  3. WHIMO API reachability
+     *  4. GeoID coverage stats (total farms, farms with GeoID, farms missing GeoID)
+     *  5. Environment variable configuration status (no values exposed — just present/absent)
+     *
+     * ADMIN only. Does NOT modify any data.
+     */
+    async integrationHealth(req: Request, res: Response) {
+        const startedAt = Date.now();
+
+        // ── 1. Database ───────────────────────────────────────────────────────
+        let dbOk = false;
+        let dbError: string | null = null;
+        try {
+            await AppDataSource.query("SELECT 1");
+            dbOk = true;
+        } catch (e: any) {
+            dbError = e.message;
+        }
+
+        // ── 2. FAO GeoID API ──────────────────────────────────────────────────
+        let geoIdOk = false;
+        let geoIdError: string | null = null;
+        try {
+            geoIdOk = await getGeoIdService().isHealthy();
+            if (!geoIdOk) geoIdError = "GeoID API returned non-ok status";
+        } catch (e: any) {
+            geoIdError = e.message;
+        }
+
+        // ── 3. WHIMO API ──────────────────────────────────────────────────────
+        let whimoOk = false;
+        let whimoError: string | null = null;
+        try {
+            whimoOk = await getWhimoService().isHealthy();
+            if (!whimoOk) whimoError = "WHIMO API returned non-ok status";
+        } catch (e: any) {
+            whimoError = e.message;
+        }
+
+        // ── 4. GeoID coverage stats ───────────────────────────────────────────
+        let stats: {
+            totalFarms: number;
+            farmsWithGeoId: number;
+            farmsMissingGeoId: number;
+            farmsWithQrCode: number;
+            coveragePct: number;
+        } | null = null;
+
+        if (dbOk) {
+            try {
+                const farmRepo = AppDataSource.getRepository(Farm);
+                const total = await farmRepo.count();
+                const withGeoId = await farmRepo
+                    .createQueryBuilder("farm")
+                    .where("farm.geoId IS NOT NULL AND farm.geoId != ''")
+                    .getCount();
+                const withQr = await farmRepo
+                    .createQueryBuilder("farm")
+                    .where("farm.farmQrCode IS NOT NULL AND farm.farmQrCode != ''")
+                    .getCount();
+
+                stats = {
+                    totalFarms: total,
+                    farmsWithGeoId: withGeoId,
+                    farmsMissingGeoId: total - withGeoId,
+                    farmsWithQrCode: withQr,
+                    coveragePct: total > 0 ? Math.round((withGeoId / total) * 100) : 100,
+                };
+            } catch {
+                // Non-fatal — stats unavailable if DB query fails
+            }
+        }
+
+        // ── 5. Environment variable configuration ─────────────────────────────
+        const envStatus = {
+            GEOID_BASE_URL:           !!process.env.GEOID_BASE_URL,
+            GEOID_COLLECTION_ID:      !!process.env.GEOID_COLLECTION_ID,
+            GEOID_API_TOKEN:          !!process.env.GEOID_API_TOKEN,
+            API_BASE_URL:             !!process.env.API_BASE_URL,
+            WHIMO_API_BASE_URL:       !!process.env.WHIMO_API_BASE_URL,
+            WHIMO_API_KEY:            !!process.env.WHIMO_API_KEY,
+            WHIMO_ORG_ID:             !!process.env.WHIMO_ORG_ID,
+            RATE_LIMIT_FARM_SCAN_MAX: !!process.env.RATE_LIMIT_FARM_SCAN_MAX,
+            CLOUDINARY_CLOUD_NAME:    !!process.env.CLOUDINARY_CLOUD_NAME,
+            SMTP_HOST:                !!process.env.SMTP_HOST,
+        };
+
+        // ── 6. Active env values (non-sensitive) ──────────────────────────────
+        const envValues = {
+            GEOID_BASE_URL:     process.env.GEOID_BASE_URL ?? "(using default: https://data.review.fao.org/geoid)",
+            GEOID_COLLECTION_ID: process.env.GEOID_COLLECTION_ID ?? "(not set — using public anonymous collection)",
+            WHIMO_API_BASE_URL: process.env.WHIMO_API_BASE_URL ?? "(using default: https://api.whimo.net/v1)",
+            WHIMO_ORG_ID:       process.env.WHIMO_ORG_ID ?? "(not set)",
+            API_BASE_URL:       process.env.API_BASE_URL ?? "(not set — QR codes may use incorrect base URL)",
+            NODE_ENV:           process.env.NODE_ENV ?? "development",
+        };
+
+        // ── Overall status ────────────────────────────────────────────────────
+        const allOk = dbOk && geoIdOk;  // WHIMO optional — doesn't block overall ok
+        const elapsedMs = Date.now() - startedAt;
+
+        const payload = {
+            status: allOk ? "ok" : "degraded",
+            checkedAt: new Date().toISOString(),
+            elapsedMs,
+            integrations: {
+                database:  { ok: dbOk,    error: dbError },
+                geoid_api: { ok: geoIdOk, error: geoIdError },
+                whimo_api: { ok: whimoOk, error: whimoError, note: "WHIMO is optional — degraded here does not block farm scanning" },
+            },
+            geoidCoverage: stats,
+            backfillRequired: stats ? stats.farmsMissingGeoId > 0 : null,
+            backfillEndpoint: "POST /api/farms/backfill-geoids",
+            backfillStreamEndpoint: "POST /api/farms/backfill-geoids?stream=1",
+            envConfigured: envStatus,
+            envValues,
+        };
+
+        const statusCode = dbOk ? 200 : 503;
+        return res.status(statusCode).json({ success: dbOk, data: payload });
     }
 }

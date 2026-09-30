@@ -7,6 +7,7 @@ import QRCode from 'qrcode';
 import bcrypt from 'bcryptjs';
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary, uploadFilesToCloudinary } from "../utils/cloudUpload";
+import { getGeoIdService, GeoIdService } from "../services/GeoIdService";
 
 export class FarmerController {
     private farmerRepository = AppDataSource.getRepository(Farmer);
@@ -227,6 +228,30 @@ export class FarmerController {
                 const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${savedFarmer.id}`;
                 savedFarmer.qrCode = await QRCode.toDataURL(publicProfileUrl);
                 await queryRunner.manager.save(Farmer, savedFarmer);
+
+                // ── Mint a GeoID + farm QR for every farm registered alongside the farmer ──
+                // Best-effort: GeoID failure does NOT abort farmer registration.
+                // Each farm gets its own GeoID (derived from its geometry) and its own
+                // farm-scan QR code (for WHIMO / trader scanning).
+                if (savedFarmer.farms && savedFarmer.farms.length > 0) {
+                    const geoIdSvc = getGeoIdService();
+                    for (const farm of savedFarmer.farms) {
+                        try {
+                            const geometry = GeoIdService.normaliseGeometry(farm.location);
+                            if (geometry) {
+                                const result = await geoIdSvc.mintGeoId(geometry, farm.id);
+                                farm.geoId = result.geoid;
+                                farm.geoIdUri = result.uri;
+                                const scanUrl = GeoIdService.farmScanUrl(farm.id);
+                                farm.farmQrCode = await QRCode.toDataURL(scanUrl);
+                                await queryRunner.manager.save(Farm, farm);
+                                console.log(`[GeoID] Minted ${result.geoid} for farm ${farm.id} (farmer reg)`);
+                            }
+                        } catch (geoErr: any) {
+                            console.warn(`[GeoID] Mint failed for farm ${farm.id} (non-fatal): ${geoErr.message}`);
+                        }
+                    }
+                }
 
                 await queryRunner.commitTransaction();
 
@@ -459,12 +484,15 @@ export class FarmerController {
             savedFarmer.qrCode = await QRCode.toDataURL(publicProfileUrl);
             await this.farmerRepository.save(savedFarmer);
 
+            const geoIdSvc = getGeoIdService();
+
             for (const f of farmsData) {
                 if (!f.name || !f.cropType || !f.location) continue;
                 const farm = new Farm();
                 farm.name = f.name;
                 farm.cropType = f.cropType;
-                farm.location = typeof f.location === "string" ? JSON.parse(f.location) : f.location;
+                const parsedLocation = typeof f.location === "string" ? JSON.parse(f.location) : f.location;
+                farm.location = parsedLocation;
                 if (f.totalAreaHa) farm.totalAreaHa = parseFloat(f.totalAreaHa);
                 if (f.numberOfTrees) farm.numberOfTrees = parseInt(f.numberOfTrees);
                 if (f.yearsInCultivation) farm.yearsInCultivation = parseInt(f.yearsInCultivation);
@@ -476,6 +504,22 @@ export class FarmerController {
                 farm.farmAddress = f.farmAddress;
                 farm.farmer = savedFarmer;
                 await this.farmRepository.save(farm);
+
+                // Mint GeoID best-effort for offline-synced farms
+                try {
+                    const geometry = GeoIdService.normaliseGeometry(parsedLocation);
+                    if (geometry) {
+                        const result = await geoIdSvc.mintGeoId(geometry, farm.id);
+                        farm.geoId = result.geoid;
+                        farm.geoIdUri = result.uri;
+                        const scanUrl = GeoIdService.farmScanUrl(farm.id);
+                        farm.farmQrCode = await QRCode.toDataURL(scanUrl);
+                        await this.farmRepository.save(farm);
+                        console.log(`[GeoID] Minted ${result.geoid} for offline farm ${farm.id}`);
+                    }
+                } catch (geoErr: any) {
+                    console.warn(`[GeoID] Mint failed for offline farm ${farm.id} (non-fatal): ${geoErr.message}`);
+                }
             }
 
             return successResponse(res, savedFarmer, "Farmer synced successfully", 201);
