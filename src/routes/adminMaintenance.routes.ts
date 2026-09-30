@@ -14,4 +14,15 @@ router.post(
     (req, res) => controller.resetFarmerFarmData(req, res)
 );
 
+// ── Integration health-check ──────────────────────────────────────────────────
+// GET /api/admin-maintenance/integration-health
+// Returns DB + GeoID + WHIMO connectivity status, GeoID coverage stats,
+// and environment variable configuration report.
+// ADMIN only — safe to call repeatedly (read-only).
+router.get(
+    "/integration-health",
+    authMiddleware([UserRole.ADMIN]),
+    (req, res) => controller.integrationHealth(req, res)
+);
+
 export default router;

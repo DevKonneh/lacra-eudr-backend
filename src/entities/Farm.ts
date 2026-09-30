@@ -107,6 +107,26 @@ export class Farm {
         photoUrl: string;
     }[];
 
+    // ─── GeoID (FAO OpenForis) ────────────────────────────────────────────────
+    // A globally-unique, geometry-derived UUIDv8 minted by the FAO GeoID API.
+    // The same polygon/point always produces the same GeoID (content-addressed),
+    // so this field is stable and safe to share publicly across systems
+    // (WHIMO, EUDR auditors, downstream buyers) without exposing raw coordinates
+    // or any farmer PII.
+    @Column({ nullable: true, unique: true })
+    geoId!: string;
+
+    // Durable resolver URI returned by the GeoID API alongside the geoid.
+    // e.g. "https://data.fao.org/geoid/019f3c…"
+    @Column({ nullable: true })
+    geoIdUri!: string;
+
+    // Per-farm QR code (data URL) encoding the farm-scan public endpoint.
+    // This is what traders / WHIMO scan — it is farm-specific, NOT the
+    // farmer-profile QR that already exists on the Farmer entity.
+    @Column({ type: "text", nullable: true })
+    farmQrCode!: string;
+
     @ManyToOne(() => Farmer, (farmer) => farmer.farms)
     farmer!: Farmer;
 
