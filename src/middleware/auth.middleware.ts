@@ -1,7 +1,15 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 
-export const JWT_SECRET = process.env.JWT_SECRET || "supersecretMVPkey";
+// Fail hard at process start if JWT_SECRET is not set.
+// The || "supersecretMVPkey" fallback was removed — a publicly-known default
+// means any environment that forgets to set the env var would silently issue
+// tokens that any attacker who reads this repo can forge.
+if (!process.env.JWT_SECRET) {
+    console.error("[FATAL] JWT_SECRET environment variable is not set. Refusing to start.");
+    process.exit(1);
+}
+export const JWT_SECRET: string = process.env.JWT_SECRET;
 
 export interface AuthRequest extends Request {
     user?: any;

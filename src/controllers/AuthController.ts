@@ -37,7 +37,7 @@ export class AuthController {
             return successResponse(res, { userId: user.id }, "User registered successfully", 201);
         } catch (error: any) {
             console.error("Register Error", error);
-            return errorResponse(res, "Error registering user", [error.message], 500);
+            return errorResponse(res, "Error registering user", [], 500);
         }
     }
 
@@ -82,7 +82,7 @@ export class AuthController {
             }, "Login successful");
         } catch (error: any) {
             console.error("Login Error", error);
-            return errorResponse(res, "Error logging in", [error.message], 500);
+            return errorResponse(res, "Error logging in", [], 500);
         }
     }
 
@@ -116,7 +116,7 @@ export class AuthController {
             return successResponse(res, null, "Verification code sent.");
         } catch (error: any) {
             console.error("Forgot Password Error", error);
-            return errorResponse(res, "Error sending code", [error.message], 500);
+            return errorResponse(res, "Error sending code", [], 500);
         }
     }
 
@@ -135,8 +135,8 @@ export class AuthController {
             if (!currentPassword || !newPassword) {
                 return errorResponse(res, "Current and new password are required", [], 400);
             }
-            if (String(newPassword).length < 6) {
-                return errorResponse(res, "New password must be at least 6 characters", [], 400);
+            if (String(newPassword).length < 8) {
+                return errorResponse(res, "New password must be at least 8 characters", [], 400);
             }
 
             const user = await this.userRepository.findOneBy({ id: userId });
@@ -153,7 +153,7 @@ export class AuthController {
             return successResponse(res, null, "Password updated successfully");
         } catch (error: any) {
             console.error("Change Password Error", error);
-            return errorResponse(res, "Error updating password", [error.message], 500);
+            return errorResponse(res, "Error updating password", [], 500);
         }
     }
 
@@ -192,7 +192,7 @@ export class AuthController {
             return successResponse(res, null, "Password reset successfully. You can now login.");
         } catch (error: any) {
             console.error("Reset Password Error", error);
-            return errorResponse(res, "Error resetting password", [error.message], 500);
+            return errorResponse(res, "Error resetting password", [], 500);
         }
     }
 
@@ -550,13 +550,13 @@ export class AuthController {
                     return errorResponse(res, "Duplicate entry found. Please check email or ID fields.", [], 400);
                 }
 
-                return errorResponse(res, "Error registering farmer", [error.message], 500);
+                return errorResponse(res, "Error registering farmer", [], 500);
             } finally {
                 await queryRunner.release();
             }
         } catch (error: any) {
             console.error("Auth Controller Error", error);
-            return errorResponse(res, "Internal server error", [error.message], 500);
+            return errorResponse(res, "Internal server error", [], 500);
         }
     }
 
@@ -568,7 +568,7 @@ export class AuthController {
             });
             return successResponse(res, users);
         } catch (error: any) {
-            return errorResponse(res, "Error fetching pending users", [error.message], 500);
+            return errorResponse(res, "Error fetching pending users", [], 500);
         }
     }
 
@@ -582,7 +582,7 @@ export class AuthController {
             await this.userRepository.save(user);
             return successResponse(res, null, "User approved successfully");
         } catch (error: any) {
-            return errorResponse(res, "Error approving user", [error.message], 500);
+            return errorResponse(res, "Error approving user", [], 500);
         }
     }
 
@@ -596,7 +596,7 @@ export class AuthController {
             await this.userRepository.save(user);
             return successResponse(res, null, "User rejected");
         } catch (error: any) {
-            return errorResponse(res, "Error rejecting user", [error.message], 500);
+            return errorResponse(res, "Error rejecting user", [], 500);
         }
     }
 }

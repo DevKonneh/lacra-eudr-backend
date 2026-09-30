@@ -105,3 +105,33 @@ export const generalPublicLimiter = rateLimit({
     keyGenerator: (req) => req.ip ?? "unknown",
     skip: (req) => req.ip === "127.0.0.1" || req.ip === "::1",
 });
+
+// ── Auth limiter (login, forgot-password, reset-password, register-farmer) ───
+/**
+ * 10 req / 15 min per IP by default.
+ *
+ * Auth endpoints are the primary target for credential-stuffing,
+ * brute-force, and password-spray attacks. A tight 15-minute window
+ * stops automated tools while still allowing legitimate human retries.
+ *
+ * Tunable via env vars:
+ *   RATE_LIMIT_AUTH_MAX        (default: 10)
+ *   RATE_LIMIT_AUTH_WINDOW_MS  (default: 900000 = 15 minutes)
+ */
+const authWindowMs = Number(process.env.RATE_LIMIT_AUTH_WINDOW_MS ?? 15 * 60_000); // 15 min
+
+export const authRateLimiter = rateLimit({
+    windowMs: authWindowMs,
+    max: Number(process.env.RATE_LIMIT_AUTH_MAX ?? 10),
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    handler: (_req: Request, res: Response, _next: unknown, options: Options) => {
+        res.status(options.statusCode).json({
+            success: false,
+            message: `Too many authentication attempts. You have exceeded ${options.max} requests per ${Math.round(authWindowMs / 60_000)} minutes. Please try again later.`,
+            retryAfterSeconds: Math.ceil(authWindowMs / 1000),
+        });
+    },
+    keyGenerator: (req) => req.ip ?? "unknown",
+    skip: (req) => req.ip === "127.0.0.1" || req.ip === "::1",
+});

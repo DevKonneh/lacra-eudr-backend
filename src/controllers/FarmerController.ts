@@ -42,7 +42,7 @@ export class FarmerController {
             return successResponse(res, farmers);
         } catch (error: any) {
             console.error(error);
-            return errorResponse(res, "Error fetching farmers", [error.message], 500);
+            return errorResponse(res, "Error fetching farmers", [], 500);
         }
     }
 
@@ -60,7 +60,7 @@ export class FarmerController {
             return successResponse(res, farmer);
         } catch (error: any) {
             console.error(error);
-            return errorResponse(res, "Error fetching profile", [error.message], 500);
+            return errorResponse(res, "Error fetching profile", [], 500);
         }
     }
 
@@ -75,7 +75,7 @@ export class FarmerController {
             return successResponse(res, farmer);
         } catch (error: any) {
             console.error(error);
-            return errorResponse(res, "Error fetching farmer", [error.message], 500);
+            return errorResponse(res, "Error fetching farmer", [], 500);
         }
     }
 
@@ -130,7 +130,13 @@ export class FarmerController {
                         return res.status(400).json({ message: "User with this email already exists" });
                     }
 
-                    const hashedPassword = await bcrypt.hash(password || "password123", 10);
+                    // Never fall back to a hardcoded default — if the caller
+                    // didn't supply a password, generate a cryptographically random
+                    // one (same approach used in AuthController.registerFarmer).
+                    const effectivePassword = password && String(password).trim() !== ''
+                        ? password
+                        : Math.random().toString(36).slice(-10) + Math.random().toString(36).slice(-10);
+                    const hashedPassword = await bcrypt.hash(effectivePassword, 10);
                     user = new User();
                     user.email = email;
                     user.password = hashedPassword;
@@ -259,13 +265,13 @@ export class FarmerController {
             } catch (error: any) {
                 await queryRunner.rollbackTransaction();
                 console.error("Error creating farmer:", error);
-                return errorResponse(res, "Error saving farmer", [error.message], 500);
+                return errorResponse(res, "Error saving farmer", [], 500);
             } finally {
                 await queryRunner.release();
             }
         } catch (error: any) {
             console.error(error);
-            return errorResponse(res, "Internal server error", [error.message], 500);
+            return errorResponse(res, "Internal server error", [], 500);
         }
     }
 
@@ -282,11 +288,27 @@ export class FarmerController {
         } = req.body;
 
         try {
+            const requester = (req as any).user;
+
             const farmer = await this.farmerRepository.findOne({
                 where: { id },
-                relations: ["farms"]
+                relations: ["farms", "user"]
             });
             if (!farmer) return errorResponse(res, "Farmer not found", [], 404);
+
+            // IDOR guard: a FARMER-role user may only update their own record.
+            // ADMIN and INSPECTOR are allowed to update any farmer record.
+            if (requester?.role === UserRole.FARMER) {
+                // The farmer record must be linked to the authenticated user's account.
+                if (!farmer.user || farmer.user.id !== requester.id) {
+                    return errorResponse(res, "Forbidden: You can only update your own profile", [], 403);
+                }
+                // A FARMER cannot promote their own identity status
+                // (only ADMIN/INSPECTOR can verify identity).
+                if (identityStatus && identityStatus !== farmer.identityStatus) {
+                    return errorResponse(res, "Forbidden: You cannot change your own identity status", [], 403);
+                }
+            }
 
             // Basic identity
             farmer.firstName = firstName ?? farmer.firstName;
@@ -338,7 +360,7 @@ export class FarmerController {
             return successResponse(res, farmer);
         } catch (error: any) {
             console.error(error);
-            return errorResponse(res, "Error updating farmer", [error.message], 500);
+            return errorResponse(res, "Error updating farmer", [], 500);
         }
     }
 
@@ -356,7 +378,7 @@ export class FarmerController {
             return successResponse(res, farmer, farmer.isActive ? "Farmer reactivated" : "Farmer deactivated");
         } catch (error: any) {
             console.error(error);
-            return errorResponse(res, "Error updating farmer status", [error.message], 500);
+            return errorResponse(res, "Error updating farmer status", [], 500);
         }
     }
 
@@ -372,21 +394,20 @@ export class FarmerController {
                 return res.status(404).json({ message: "Farmer not found" });
             }
 
-            // Return ALL fields as requested
+            // Public profile — intentionally omits high-sensitivity PII fields:
+            //   nationalId, dob, otherId, idType, idTypeOther, idPhoto, signature
+            // These are only accessible to authenticated LACRA staff via the
+            // /api/farmers/:id (auth-protected) endpoint.
+            // phoneNumber is also excluded here to prevent unauthenticated
+            // phone-number enumeration / spam.
             const publicData = {
                 id: farmer.id,
                 farmerId: farmer.farmerId,
                 firstName: farmer.firstName,
                 lastName: farmer.lastName,
-                email: farmer.email,
-                phoneNumber: farmer.phoneNumber,
-                nationalId: farmer.nationalId,
-                idType: farmer.idType,
-                idTypeOther: farmer.idTypeOther,
+                // email and phoneNumber intentionally omitted — PII
                 gender: farmer.gender,
-                dob: farmer.dob,
                 nationality: farmer.nationality,
-                otherId: farmer.otherId,
                 address: farmer.address,
                 community: farmer.community,
                 district: farmer.district,
@@ -395,9 +416,7 @@ export class FarmerController {
                 cooperativeId: farmer.cooperativeId,
                 enumeratorName: farmer.enumeratorName,
                 enumeratorId: farmer.enumeratorId,
-                profilePhoto: farmer.profilePhoto, // Assuming this is a public URL or path handled by frontend
-                idPhoto: farmer.idPhoto,
-                signature: farmer.signature,
+                profilePhoto: farmer.profilePhoto,
                 consent: farmer.consent,
                 identityStatus: farmer.identityStatus,
                 directions: farmer.directions,
@@ -426,7 +445,7 @@ export class FarmerController {
             return successResponse(res, publicData);
         } catch (error: any) {
             console.error("Error fetching public farmer profile:", error);
-            return errorResponse(res, "Error loading profile", [error.message], 500);
+            return errorResponse(res, "Error loading profile", [], 500);
         }
     }
 
@@ -468,7 +487,12 @@ export class FarmerController {
             if (farmerData.email) {
                 const user = new User();
                 user.email = farmerData.email;
-                user.password = await bcrypt.hash(farmerData.password || "password123", 10);
+                // Never fall back to a hardcoded default — generate a random
+                // password when none is supplied (same pattern as registerFarmer).
+                const offlinePassword = farmerData.password && String(farmerData.password).trim() !== ''
+                    ? farmerData.password
+                    : Math.random().toString(36).slice(-10) + Math.random().toString(36).slice(-10);
+                user.password = await bcrypt.hash(offlinePassword, 10);
                 user.role = UserRole.FARMER;
                 user.name = `${farmerData.firstName} ${farmerData.lastName}`;
                 await this.userRepository.save(user);
@@ -525,7 +549,7 @@ export class FarmerController {
             return successResponse(res, savedFarmer, "Farmer synced successfully", 201);
         } catch (error: any) {
             console.error(error);
-            return errorResponse(res, "Error syncing farmer", [error.message], 500);
+            return errorResponse(res, "Error syncing farmer", [], 500);
         }
     }
 
@@ -559,7 +583,7 @@ export class FarmerController {
             return successResponse(res, { updated, total: farmers.length }, `Backfilled ${updated} farmer ID(s)`);
         } catch (error: any) {
             console.error(error);
-            return errorResponse(res, "Error backfilling farmer IDs", [error.message], 500);
+            return errorResponse(res, "Error backfilling farmer IDs", [], 500);
         }
     }
 }
