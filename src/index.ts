@@ -7,11 +7,98 @@ import path from 'path';
 
 dotenv.config();
 
+// ── Production startup validation ─────────────────────────────────────────────
+// Warn loudly (but don't crash) when critical env vars are missing.
+// This surfaces misconfigurations in Render's deploy log at startup time
+// rather than silently falling back to defaults and breaking at request time.
+(function validateEnv() {
+    interface EnvCheck {
+        key: string;
+        required: boolean;
+        description: string;
+        defaultValue?: string;
+    }
+
+    const checks: EnvCheck[] = [
+        // Core
+        { key: "JWT_SECRET",           required: true,  description: "JWT signing secret — auth will be broken without this" },
+        { key: "DATABASE_URL",         required: false, description: "Postgres connection string (alternative to DB_HOST/PORT/etc.)" },
+        { key: "DB_HOST",              required: false, description: "Postgres host — required if DATABASE_URL not set" },
+        // GeoID
+        { key: "GEOID_BASE_URL",       required: false, description: "FAO GeoID API base — defaults to staging (data.review.fao.org)", defaultValue: "https://data.review.fao.org/geoid" },
+        { key: "GEOID_COLLECTION_ID",  required: false, description: "FAO named collection — leave blank for public anonymous collection" },
+        { key: "GEOID_API_TOKEN",      required: false, description: "FAO collection auth token — required when GEOID_COLLECTION_ID is set" },
+        { key: "API_BASE_URL",         required: false, description: "Backend public URL — used to build farm-scan QR code URLs", defaultValue: "http://localhost:8100" },
+        // WHIMO
+        { key: "WHIMO_API_BASE_URL",   required: false, description: "WHIMO API base", defaultValue: "https://api.whimo.net/v1" },
+        { key: "WHIMO_API_KEY",        required: false, description: "WHIMO API key — required to submit transactions on behalf of operators" },
+        { key: "WHIMO_ORG_ID",         required: false, description: "LACRA WHIMO organisation ID" },
+        // Cloudinary
+        { key: "CLOUDINARY_CLOUD_NAME",required: false, description: "Cloudinary — photo uploads will fail without this" },
+        { key: "CLOUDINARY_API_KEY",   required: false, description: "Cloudinary API key" },
+        { key: "CLOUDINARY_API_SECRET",required: false, description: "Cloudinary API secret" },
+    ];
+
+    const missing: string[] = [];
+    const warnings: string[] = [];
+
+    for (const check of checks) {
+        const value = process.env[check.key];
+        if (!value) {
+            if (check.required) {
+                missing.push(`  ❌  REQUIRED  ${check.key.padEnd(25)} — ${check.description}`);
+            } else if (!check.defaultValue) {
+                warnings.push(`  ⚠️   OPTIONAL  ${check.key.padEnd(25)} — ${check.description}`);
+            }
+            // If there's a hardcoded default, no noise needed — it's documented in .env.example
+        }
+    }
+
+    // Special cross-field check: named collection requires a token
+    if (process.env.GEOID_COLLECTION_ID && !process.env.GEOID_API_TOKEN) {
+        warnings.push("  ⚠️   GEOID_COLLECTION_ID is set but GEOID_API_TOKEN is missing — writes to the named collection will be rejected by FAO");
+    }
+
+    if (missing.length > 0) {
+        console.error("\n🚨  LACRA startup — REQUIRED env vars are missing:");
+        missing.forEach(m => console.error(m));
+        console.error("  The server will start but these features will be broken.\n");
+    }
+
+    if (warnings.length > 0) {
+        console.warn("\n⚠️   LACRA startup — optional env vars not set (features may be limited):");
+        warnings.forEach(w => console.warn(w));
+        console.warn("");
+    }
+
+    if (missing.length === 0 && warnings.length === 0) {
+        console.log("✅  LACRA startup — all env vars accounted for.");
+    }
+})();
+
 import { AppDataSource } from "./data-source";
 import farmerRoutes from "./routes/farmer.routes";
 
 const app = express();
 const PORT = process.env.PORT || 8100;
+
+// ── Trust proxy ───────────────────────────────────────────────────────────────
+// Render (and most cloud PaaS) sit behind a reverse proxy / load-balancer.
+// Without this setting, req.ip always equals the proxy's internal IP address,
+// which makes rate-limiting useless — every single client would share the same
+// "IP" from Express's perspective and collectively hit the cap in seconds.
+//
+// Setting trust proxy to 1 tells Express to read the real client IP from the
+// X-Forwarded-For header injected by Render's proxy layer.
+//
+// Do NOT set to `true` (which trusts all hops) — that would allow a client to
+// forge their own IP by sending a spoofed X-Forwarded-For header directly.
+// "1" means "trust exactly one proxy hop" which is correct for Render's setup.
+//
+// References:
+//   https://expressjs.com/en/guide/behind-proxies.html
+//   https://render.com/docs/web-services#http-headers
+app.set("trust proxy", 1);
 
 // Allow the known local/dev origins plus any extra origins supplied via the
 // CORS_EXTRA_ORIGINS env var (comma-separated), so the deployed frontend
