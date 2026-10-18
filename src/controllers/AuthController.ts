@@ -3,7 +3,11 @@ import { AppDataSource } from "../data-source";
 import { User, UserRole, UserStatus } from "../entities/User";
 import { Farmer } from "../entities/Farmer";
 import { Farm } from "../entities/Farm";
+import { Plot } from "../entities/Plot";
 import { FarmDocument, DocumentStatus, DocumentType } from "../entities/FarmDocument";
+import { buildPlotsForFarm, deriveLegacyCropType, CommodityInput } from "../services/CommodityService";
+import { CommodityRole, CroppingSystem } from "../entities/PlotCommodity";
+import { validateAndAnnotateFarm, assertGeometryNotBlocking } from "../services/FarmGeometryHelper";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { JWT_SECRET } from "../middleware/auth.middleware";
@@ -274,6 +278,7 @@ export class AuthController {
                 boundaryJson,
                 areaHa,
                 areaAc,
+                gpsAccuracyM,
                 // Misc
                 consent,
                 email // still needed for User account
@@ -439,7 +444,6 @@ export class AuthController {
                         const f = farmsData[i];
                         const farm = new Farm();
                         farm.name = f.name;
-                        farm.cropType = f.cropType;
                         farm.location = f.location;
                         farm.totalAreaHa = f.totalAreaHa ? parseFloat(f.totalAreaHa) : 0;
                         farm.ownershipType = f.ownershipType;
@@ -460,14 +464,44 @@ export class AuthController {
                             }
                         }
                         farm.farmer = farmer;
+
+                        // GPS polygon / farm-area geometry validation — same
+                        // gate as the admin-panel entry points (FarmController,
+                        // FarmerController). Invalid geometry rolls back the
+                        // whole registration transaction; valid-but-suspicious
+                        // geometry is allowed through as "Needs Review".
+                        const geometryResult = await validateAndAnnotateFarm(farm, {
+                            gpsAccuracyM: f.gpsAccuracyM !== undefined ? parseFloat(f.gpsAccuracyM) : null,
+                        });
+                        assertGeometryNotBlocking(geometryResult);
+
                         const savedFarm = await queryRunner.manager.save(Farm, farm);
                         createdFarmIds.push(savedFarm.id);
+
+                        // Multi-commodity structure (replaces single cropType).
+                        // Accepts `f.commodities` array, or falls back to
+                        // wrapping legacy `f.cropType` into an equivalent
+                        // single-commodity entry for mobile-app clients not
+                        // yet updated to the new "Add Commodity" format.
+                        let commodityInputs: CommodityInput[] = Array.isArray(f.commodities) ? f.commodities : [];
+                        if (commodityInputs.length === 0 && f.cropType) {
+                            commodityInputs = [{ commodityName: f.cropType, role: CommodityRole.PRIMARY, croppingSystem: CroppingSystem.MONOCROP }];
+                        }
+                        if (commodityInputs.length > 0) {
+                            const { plots } = await buildPlotsForFarm(savedFarm, commodityInputs);
+                            for (const plot of plots) {
+                                plot.farm = savedFarm;
+                                plot.farmId = savedFarm.id;
+                            }
+                            const savedPlots = await queryRunner.manager.save(Plot, plots);
+                            savedFarm.cropType = deriveLegacyCropType(savedPlots);
+                            await queryRunner.manager.save(Farm, savedFarm);
+                        }
                     }
                 } else if (farmName) {
                     // Fallback to flat fields if farms array not used
                     const farm = new Farm();
                     farm.name = farmName;
-                    farm.cropType = crop;
                     farm.ownershipType = ownership;
                     farm.farmRegistrationStatus = regStatus;
                     farm.totalAreaHa = areaHa ? parseFloat(areaHa) : 0;
@@ -506,8 +540,28 @@ export class AuthController {
 
                     farm.farmer = farmer;
 
+                    // GPS polygon / farm-area geometry validation — same
+                    // gate as the farmsData[] array path above and every
+                    // other farm-creation entry point.
+                    const geometryResult = await validateAndAnnotateFarm(farm, {
+                        gpsAccuracyM: gpsAccuracyM !== undefined ? parseFloat(gpsAccuracyM) : null,
+                    });
+                    assertGeometryNotBlocking(geometryResult);
+
                     const savedFarm = await queryRunner.manager.save(Farm, farm);
                     createdFarmIds.push(savedFarm.id);
+
+                    if (crop) {
+                        const commodityInputs: CommodityInput[] = [{ commodityName: crop, role: CommodityRole.PRIMARY, croppingSystem: CroppingSystem.MONOCROP }];
+                        const { plots } = await buildPlotsForFarm(savedFarm, commodityInputs);
+                        for (const plot of plots) {
+                            plot.farm = savedFarm;
+                            plot.farmId = savedFarm.id;
+                        }
+                        const savedPlots = await queryRunner.manager.save(Plot, plots);
+                        savedFarm.cropType = deriveLegacyCropType(savedPlots);
+                        await queryRunner.manager.save(Farm, savedFarm);
+                    }
                 }
 
                 // EUDR compliance documents (National ID, Land Deed, Lease
@@ -585,6 +639,10 @@ export class AuthController {
                     }
                     // Fallback if detail parsing fails but we know it's a unique constraint
                     return errorResponse(res, "Duplicate entry found. Please check email or ID fields.", [], 400);
+                }
+
+                if (error.isGeometryValidationError) {
+                    return errorResponse(res, error.message, [error.message], 400);
                 }
 
                 return errorResponse(res, "Error registering farmer", [error.message], 500);

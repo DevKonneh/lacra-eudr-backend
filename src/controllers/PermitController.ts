@@ -4,6 +4,80 @@ import { Permit, PermitStatus } from "../entities/Permit";
 import { Business, BusinessEligibility } from "../entities/Business";
 import { successResponse, errorResponse } from "../utils/response";
 
+// Fields the applicant is allowed to set themselves, matching LACRA Form
+// No. 0050 Sections A-D. Kept as an explicit whitelist (rather than
+// spreading req.body directly onto the entity) so applicants can never set
+// internal/staff-only fields like status, permitNumber, or internalRemarks
+// through this endpoint.
+const APPLICANT_FIELDS = [
+    // Section A — Applicant Information
+    "businessName", "typeOfEntity", "tinNumber", "county", "district",
+    "businessAddress", "contactPerson", "phoneNumber", "emailAddress", "whatsapp",
+    // Section B — Ownership and Management
+    "ownerManagerName", "dateOfBirth", "gender", "placeOfBirth", "nationality",
+    "position", "idType", "idNumber",
+    // Section C — Operational Information
+    "intendedCommodities", "estimatedPurchaseVolume", "warehousingLocation",
+    "expectedAreasOfOperation",
+    // Section D — Declaration
+    "declarationAccepted", "declarationName", "declarationDate"
+] as const;
+
+function pickApplicantFields(body: any): Partial<Permit> {
+    const data: any = {};
+    for (const field of APPLICANT_FIELDS) {
+        if (body[field] !== undefined) {
+            data[field] = body[field];
+        }
+    }
+    // Date fields arrive as ISO strings over JSON; coerce explicitly.
+    if (data.dateOfBirth) data.dateOfBirth = new Date(data.dateOfBirth);
+    if (data.declarationDate) data.declarationDate = new Date(data.declarationDate);
+    return data;
+}
+
+/**
+ * Required-field check for final submission (Section A/B/C "Yes" required
+ * fields per Form No. 0050, plus the Section D declaration). Draft saves are
+ * intentionally NOT validated this strictly, so an applicant can save
+ * partial progress — only submit() enforces completeness.
+ */
+function findMissingRequiredFields(permit: Permit): string[] {
+    const required: Array<[keyof Permit, string]> = [
+        ["businessName", "Business Name"],
+        ["typeOfEntity", "Type of Entity"],
+        ["tinNumber", "TIN Number"],
+        ["county", "County / District"],
+        ["businessAddress", "Business Address"],
+        ["contactPerson", "Contact Person"],
+        ["phoneNumber", "Phone Number"],
+        ["ownerManagerName", "Owner/Manager Name(s)"],
+        ["dateOfBirth", "Date of Birth"],
+        ["gender", "Gender"],
+        ["placeOfBirth", "Place of Birth"],
+        ["nationality", "Nationality"],
+        ["position", "Position"],
+        ["idType", "ID Type"],
+        ["idNumber", "ID Number"],
+        ["intendedCommodities", "Intended Commodity"],
+        ["estimatedPurchaseVolume", "Estimated Purchase Volume"],
+        ["warehousingLocation", "Warehousing Location"],
+        ["expectedAreasOfOperation", "Expected Areas of Operation"],
+        ["declarationName", "Declaration: Name of Applicant"],
+    ];
+    const missing: string[] = [];
+    for (const [key, label] of required) {
+        const value: any = (permit as any)[key];
+        if (value === null || value === undefined || value === "" ||
+            (Array.isArray(value) && value.length === 0)) {
+            missing.push(label);
+        }
+    }
+    if (!permit.declarationAccepted) {
+        missing.push("Declaration acceptance");
+    }
+    return missing;
+}
 
 export class PermitController {
     private permitRepository = AppDataSource.getRepository(Permit);
@@ -20,17 +94,62 @@ export class PermitController {
                 return errorResponse(res, "Your business type is not eligible for Permits", [], 403);
             }
 
+            const applicantData = pickApplicantFields(req.body || {});
+
             const permit = this.permitRepository.create({
                 business,
                 status: PermitStatus.DRAFT,
-                documents: []
+                documents: [],
+                // Pre-fill from the Business Registry where the paper form's
+                // Section A overlaps with what was already captured at
+                // business registration, so the applicant doesn't retype it.
+                businessName: business.name,
+                ...applicantData
             });
 
             await this.permitRepository.save(permit);
-            return successResponse(res, permit, "Permit creating successfully", 201);
+            return successResponse(res, permit, "Permit application draft created successfully", 201);
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error creating permit application", [error.message], 500);
+        }
+    }
+
+    async getOne(req: any, res: Response) {
+        try {
+            const { id } = req.params;
+            const permit = await this.permitRepository.findOne({
+                where: { id },
+                relations: ["business", "business.owner"]
+            });
+            if (!permit) return errorResponse(res, "Permit not found", [], 404);
+            return successResponse(res, permit);
+        } catch (error: any) {
+            return errorResponse(res, "Error fetching permit", [error.message], 500);
+        }
+    }
+
+    // Save/edit form fields on a Draft (or a Returned-for-Correction) permit.
+    // This is what the online form's "Save" button calls while the applicant
+    // is filling in Sections A-D — separate from submit(), which locks it in.
+    async update(req: any, res: Response) {
+        try {
+            const { id } = req.params;
+            const permit = await this.permitRepository.findOneBy({ id });
+            if (!permit) return errorResponse(res, "Permit not found", [], 404);
+
+            if (permit.status !== PermitStatus.DRAFT && permit.status !== PermitStatus.RETURNED_FOR_CORRECTION) {
+                return errorResponse(res, "Cannot edit permit application in current status", [], 400);
+            }
+
+            const applicantData = pickApplicantFields(req.body || {});
+            Object.assign(permit, applicantData);
+
+            await this.permitRepository.save(permit);
+            return successResponse(res, permit, "Permit application saved");
+        } catch (error: any) {
+            console.error(error);
+            return errorResponse(res, "Error updating permit application", [error.message], 500);
         }
     }
 
@@ -45,6 +164,19 @@ export class PermitController {
 
             if (permit.status !== PermitStatus.DRAFT && permit.status !== PermitStatus.RETURNED_FOR_CORRECTION) {
                 return errorResponse(res, "Cannot submit permit in current status", [], 400);
+            }
+
+            // Mirrors Form No. 0050's Sections A-D being fully filled in before
+            // it can be handed over the counter — an incomplete online form
+            // should not be allowed to reach Commercial & Marketing review.
+            const missing = findMissingRequiredFields(permit);
+            if (missing.length > 0) {
+                return errorResponse(
+                    res,
+                    "Please complete all required fields before submitting",
+                    missing,
+                    400
+                );
             }
 
             permit.status = PermitStatus.SUBMITTED;

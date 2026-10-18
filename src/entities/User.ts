@@ -6,7 +6,30 @@ export enum UserRole {
     INSPECTOR = "INSPECTOR",
     BUYER = "BUYER",
     EXPORTER = "EXPORTER",
-    FARMER = "FARMER"
+    FARMER = "FARMER",
+    // Added for the CMIS Application workflow (Commercial verification +
+    // DG approval stages). Kept as simple string values in the existing
+    // flat enum, consistent with how every other role in this codebase is
+    // gated (authMiddleware(roles: string[]) against this exact claim) —
+    // the separate Role/assignedRole/permissions mechanism is not used by
+    // any route today, so it is intentionally left untouched here.
+    COMMERCIAL = "COMMERCIAL",
+    DG = "DG",
+    // Added for Phase 3 (Technical Review + Inspector Assignment +
+    // Warehouse Assessment + Second DG Approval). INSPECTOR already
+    // existed above and is reused as-is for the warehouse-assessment
+    // actions; TECHNICAL is the new Technical Services role that assigns
+    // inspectors and verifies their findings.
+    TECHNICAL = "TECHNICAL",
+    // Added for Phase 4 (Billing + Payment + Final DG Approval +
+    // Certificate Issuance). FINANCE covers both the Billing Review stage
+    // (creates/approves invoices) and the Payment Verification stage
+    // (confirms applicant payments, clears cheques) — the workflow spec's
+    // RETURNED_TO_FINANCE status treats these as one department. IT is
+    // the separate role that prints/issues the final certificate after
+    // final DG approval.
+    FINANCE = "FINANCE",
+    IT = "IT"
 }
 
 export enum UserStatus {

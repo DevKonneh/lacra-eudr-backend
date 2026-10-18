@@ -6,5 +6,6 @@ const reportsController = new ReportsController();
 
 router.get("/dashboard", (req, res) => reportsController.getDashboardStats(req, res));
 router.get("/farm-mapping-stats", (req, res) => reportsController.getFarmMappingStats(req, res));
+router.get("/compliance-calculation", (req, res) => reportsController.getComplianceCalculationDetails(req, res));
 
 export default router;

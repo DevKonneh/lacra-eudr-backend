@@ -2,6 +2,9 @@ import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, ManyToOne, Jo
 import { Batch } from "./Batch";
 import { Business } from "./Business";
 import { Farmer } from "./Farmer";
+import { Farm } from "./Farm";
+import { Plot } from "./Plot";
+import { PlotCommodity } from "./PlotCommodity";
 
 export enum TransferType {
     PURCHASE = "PURCHASE",
@@ -34,6 +37,31 @@ export class Transfer {
 
     @Column({ nullable: true })
     fromFarmerId?: string;
+
+    // Traceability source (denormalized from the linked Batch at transfer
+    // time, when available) — "each harvest and transaction must identify
+    // its exact farm, plot and commodity source." Nullable: a transfer's
+    // batch may pool produce with no single attributable farm/plot.
+    @ManyToOne(() => Farm, { nullable: true })
+    @JoinColumn()
+    sourceFarm?: Farm;
+
+    @Column({ nullable: true })
+    sourceFarmId?: string;
+
+    @ManyToOne(() => Plot, { nullable: true })
+    @JoinColumn()
+    sourcePlot?: Plot;
+
+    @Column({ nullable: true })
+    sourcePlotId?: string;
+
+    @ManyToOne(() => PlotCommodity, { nullable: true })
+    @JoinColumn()
+    sourcePlotCommodity?: PlotCommodity;
+
+    @Column({ nullable: true })
+    sourcePlotCommodityId?: string;
 
     @ManyToOne(() => Business, { nullable: true })
     @JoinColumn()

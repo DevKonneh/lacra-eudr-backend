@@ -16,6 +16,19 @@ import { Transfer } from "./entities/Transfer";
 import { SatelliteAlert } from "./entities/SatelliteAlert";
 import { Notification } from "./entities/Notification";
 import { OfflineSubmission } from "./entities/OfflineSubmission";
+import { Application } from "./entities/Application";
+import { ApplicationStatusHistory } from "./entities/ApplicationStatusHistory";
+import { WarehouseAssessment } from "./entities/WarehouseAssessment";
+import { Invoice } from "./entities/Invoice";
+import { PaymentSubmission } from "./entities/PaymentSubmission";
+import { Certificate } from "./entities/Certificate";
+import { FarmerAuditLog } from "./entities/FarmerAuditLog";
+import { Plot } from "./entities/Plot";
+import { Commodity } from "./entities/Commodity";
+import { PlotCommodity } from "./entities/PlotCommodity";
+import { Inspection } from "./entities/Inspection";
+import { QualityControl } from "./entities/QualityControl";
+import { EnforcementAction } from "./entities/EnforcementAction";
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -45,7 +58,7 @@ export const AppDataSource = new DataSource({
     ssl: useSsl ? { rejectUnauthorized: false } : false,
     synchronize: true,
     logging: false,
-    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission],
+    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission, Application, ApplicationStatusHistory, WarehouseAssessment, Invoice, PaymentSubmission, Certificate, FarmerAuditLog, Plot, Commodity, PlotCommodity, Inspection, QualityControl, EnforcementAction],
     subscribers: [],
     migrations: [],
 });

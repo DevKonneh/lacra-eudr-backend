@@ -16,6 +16,13 @@ export class RiskController {
             const result = await this.riskService.analyzeFarm(farmId);
             return successResponse(res, result);
         } catch (error: any) {
+            // Geometry validation blocking compliance analysis is a client-
+            // correctable condition (bad/missing boundary), not a server
+            // error — surface it as 400 with the full validation detail so
+            // the frontend can show exactly what needs fixing.
+            if (error.isGeometryValidationError) {
+                return errorResponse(res, error.message, [error.geometryValidationResult || error.message], 400);
+            }
             return errorResponse(res, error.message, [error.message], 500);
         }
     }

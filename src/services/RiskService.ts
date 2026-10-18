@@ -8,6 +8,8 @@ import { Forest, RiskLevel as ForestRiskLevel } from "../entities/Forest";
 
 import { WhispService, WhispAnalysisResult, WhispRiskLabel } from "./WhispService";
 import { CropType } from "../entities/Farm";
+import { validateAndAnnotateFarm } from "./FarmGeometryHelper";
+import { GeometryStatus } from "./GeometryValidationService";
 
 /** Perennial tree crops map to Whisp's risk_pcrop label; annual crops map to risk_acrop. */
 const PERENNIAL_CROPS = new Set<CropType>([CropType.COCOA, CropType.COFFEE, CropType.PALM, CropType.RUBBER]);
@@ -27,6 +29,45 @@ export class RiskService {
         });
 
         if (!farm) throw new Error("Farm not found");
+
+        // --- GPS polygon / farm-area geometry validation gate ---
+        //
+        // Compliance/risk analysis must NOT run until basic geometry
+        // validation passes. This directly fixes the reported bug where a
+        // farm with a declared area of thousands of hectares but a
+        // calculated polygon area of 0.00 ha could still be scored/shown
+        // as fully compliant. Re-validates on every assessment run (rather
+        // than trusting a possibly-stale cached status) so a farm whose
+        // boundary was corrected since its last assessment is picked up
+        // immediately, and one that still has bad geometry is blocked
+        // every time until fixed.
+        //
+        // - MISSING polygon: blocks compliance approval (a real EUDR
+        //   compliance verdict cannot be reached without a boundary at
+        //   all) but is a distinct, softer failure than INVALID geometry.
+        // - INVALID geometry: hard-blocks analysis.
+        // - NEEDS_REVIEW / VALID: analysis proceeds (the "Needs Review"
+        //   flag itself remains visible on the farm record for admins).
+        const geometryResult = await validateAndAnnotateFarm(farm, { excludeFarmId: farm.id });
+        await this.farmRepo.save(farm);
+
+        if (geometryResult.status === GeometryStatus.INVALID) {
+            const err: any = new Error(
+                `Compliance analysis blocked: farm boundary failed geometry validation. ${geometryResult.errors.join(" ")}`
+            );
+            err.isGeometryValidationError = true;
+            err.geometryValidationResult = geometryResult;
+            throw err;
+        }
+        if (geometryResult.status === GeometryStatus.MISSING) {
+            const err: any = new Error(
+                "Compliance analysis blocked: this farm has no mapped boundary polygon yet. " +
+                "A polygon is required before a compliance status can be assigned."
+            );
+            err.isGeometryValidationError = true;
+            err.geometryValidationResult = geometryResult;
+            throw err;
+        }
 
         // Call Open Foris Whisp for Deforestation Analysis
         const whispResult = await this.whispService.analyzeFarm(farmId, farm.location);
@@ -55,7 +96,11 @@ export class RiskService {
         //                         This is a real, distinct state - not equivalent to low -
         //                         so we surface it as our MEDIUM tier rather than silently
         //                         treating it as compliant.
-        const commodityRiskLabel = this.getCommodityRiskLabel(whispResult, farm.cropType);
+        // farm.cropType is now a nullable, auto-derived legacy display field
+        // (source of truth is Plot/PlotCommodity — see CommodityService.ts).
+        // Fall back to CropType.OTHER's category bucket when a farm has no
+        // commodities recorded yet, so Whisp categorization never crashes.
+        const commodityRiskLabel = this.getCommodityRiskLabel(whispResult, (farm.cropType as CropType) || CropType.OTHER);
         const postBaselineEvents = whispResult
             ? whispResult.annualEvents.filter(e => e.year > 2020)
             : [];
@@ -68,11 +113,13 @@ export class RiskService {
         // farm was classified the way it was - so an EU reviewer (or the farmer/inspector)
         // can see the actual satellite evidence behind the verdict, not just a label.
         const deforestationNarrative = this.buildDeforestationNarrative(
-            whispResult, farm.cropType, commodityRiskLabel, postBaselineEvents, deforestationRisk
+            whispResult, (farm.cropType as CropType) || CropType.OTHER, commodityRiskLabel, postBaselineEvents, deforestationRisk
         );
 
-        // 2. Overlap Risk Check
-        const overlapResult = await this.checkOverlap(farm);
+        // 2. Overlap Risk Check (forest/protected-area AND farm-to-farm,
+        // the latter driven by geometryResult.overlapsExistingFarm which
+        // GeometryValidationService already computed above via PostGIS)
+        const overlapResult = await this.checkOverlap(farm, geometryResult.overlapsExistingFarm);
 
         // 3. Legality/Document Check
         const legalityRisk = await this.checkLegality(farmId);
@@ -80,9 +127,15 @@ export class RiskService {
         // 4. Traceability/Identity Check
         const traceabilityRisk = await this.checkTraceability(farm);
 
-        // Calculate Overall Risk
+        // Calculate Overall Risk. A geometry flagged "Needs Review" (area
+        // mismatch beyond tolerance, unusual shape, poor GPS accuracy, or
+        // farm overlap) is folded in as an additional MEDIUM-risk signal —
+        // this is precisely what closes the reported gap where a farm with
+        // a declared area of thousands of hectares but a 0.00 ha
+        // calculated polygon could still show 100% compliant.
         const overallRisk = this.calculateRiskScore(
-            deforestationRisk, overlapResult, legalityRisk, traceabilityRisk, deforestationNeedsReview
+            deforestationRisk, overlapResult, legalityRisk, traceabilityRisk,
+            deforestationNeedsReview, geometryResult.needsReview
         );
 
         // Save Assessment
@@ -267,13 +320,18 @@ export class RiskService {
         return false;
     }
 
-    private async checkOverlap(farm: Farm): Promise<OverlapResult> {
-        // Check intersection with Forests/Protected Areas using PostGIS
-        // Assuming 'location' is a GeoJSON Polygon
-        // We use raw query for spatial intersection since TypeORM support varies
-
+    /**
+     * Checks Forest/Protected-Area overlap (highest severity — always
+     * checked first) and, as a fallback, farm-to-farm overlap (detected by
+     * GeometryValidationService.findOverlappingFarms() via PostGIS
+     * ST_Intersects, run earlier in analyzeFarm() and passed in here as
+     * `farmOverlapDetected`). Previously this method ONLY checked Forests —
+     * farm-to-farm overlap was a genuine gap (OverlapResult.FARM existed in
+     * the enum but was never actually produced anywhere).
+     */
+    private async checkOverlap(farm: Farm, farmOverlapDetected: boolean = false): Promise<OverlapResult> {
         try {
-            // Check against Forests
+            // Check against Forests (highest severity)
             const forestOverlap = await this.forestRepo
                 .createQueryBuilder("forest")
                 .where("ST_Intersects(forest.geom, ST_GeomFromGeoJSON(:farmGeom))", {
@@ -283,14 +341,14 @@ export class RiskService {
 
             if (forestOverlap) return OverlapResult.FOREST;
 
-            // Could also check against other farms here using separate query if needed
-            // For now return NONE if no forest overlap
+            if (farmOverlapDetected) return OverlapResult.FARM;
+
             return OverlapResult.NONE;
 
         } catch (error) {
             console.error("Spatial query error:", error);
             // Fallback for safety
-            return OverlapResult.NONE;
+            return farmOverlapDetected ? OverlapResult.FARM : OverlapResult.NONE;
         }
     }
 
@@ -319,7 +377,8 @@ export class RiskService {
         overlap: OverlapResult,
         legality: boolean,
         traceability: boolean,
-        deforestationNeedsReview: boolean = false
+        deforestationNeedsReview: boolean = false,
+        geometryNeedsReview: boolean = false
     ): RiskLevel {
         if (deforestation || overlap === OverlapResult.FOREST || overlap === OverlapResult.PROTECTED_AREA) {
             return RiskLevel.HIGH;
@@ -328,7 +387,13 @@ export class RiskService {
         // category (risk_pcrop/risk_acrop/risk_timber = "more_info_needed") - surface this
         // as MEDIUM rather than silently treating it as compliant, since the EU's own tool
         // is flagging genuine uncertainty here, not a clean pass.
-        if (legality || traceability || deforestationNeedsReview) {
+        //
+        // geometryNeedsReview (declared-vs-calculated area mismatch beyond
+        // tolerance, unusual polygon shape, poor GPS accuracy, or farm-to-farm
+        // overlap) is folded in the same way: a suspicious boundary is a real
+        // due-diligence concern, not something that should still read as a
+        // clean "Low risk / compliant" verdict.
+        if (legality || traceability || deforestationNeedsReview || geometryNeedsReview || overlap === OverlapResult.FARM) {
             return RiskLevel.MEDIUM;
         }
         return RiskLevel.LOW;

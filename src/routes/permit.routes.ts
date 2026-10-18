@@ -6,6 +6,8 @@ const router = Router();
 const permitController = new PermitController();
 
 router.post("/", authMiddleware(), (req, res) => permitController.create(req, res));
+router.get("/:id", authMiddleware(), (req, res) => permitController.getOne(req, res));
+router.put("/:id", authMiddleware(), (req, res) => permitController.update(req, res));
 router.post("/:id/submit", authMiddleware(), (req, res) => permitController.submit(req, res));
 router.post("/:id/recommend", authMiddleware(), (req, res) => permitController.recommend(req, res)); // Commercial
 router.post("/:id/approve", authMiddleware(), (req, res) => permitController.approve(req, res)); // DG
