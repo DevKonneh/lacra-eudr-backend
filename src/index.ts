@@ -177,6 +177,7 @@ import adminMaintenanceRoutes from "./routes/adminMaintenance.routes";
 import applicationRoutes from "./routes/application.routes";
 import weatherRoutes from "./routes/weather.routes";
 import soilRoutes from "./routes/soil.routes";
+import cooperativeRoutes from "./routes/cooperative.routes";
 
 app.use("/api/public", publicRoutes);
 app.use("/api/business", businessRoutes);
@@ -204,6 +205,7 @@ app.use("/api/admin-maintenance", adminMaintenanceRoutes);
 app.use("/api/applications", applicationRoutes);
 app.use("/api/weather", weatherRoutes);
 app.use("/api/soil", soilRoutes);
+app.use("/api/cooperatives", cooperativeRoutes);
 
 import { errorHandler } from "./middleware/error.middleware";
 app.use(errorHandler);
