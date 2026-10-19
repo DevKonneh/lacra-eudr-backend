@@ -79,25 +79,57 @@ export class FarmController {
     async getAll(req: Request, res: Response) {
         try {
             const user = (req as any).user;
-            let whereClause = {};
 
             if (user && user.role === UserRole.FARMER) {
                 // Find Farmer profile linked to this user
                 const farmerRepository = AppDataSource.getRepository("Farmer");
                 const farmer = await farmerRepository.findOne({ where: { user: { id: user.id } } });
 
-                if (farmer) {
-                    whereClause = { farmer: { id: farmer.id } };
-                } else {
-                    return successResponse(res, []);
-                }
+                if (!farmer) return successResponse(res, []);
+
+                const farms = await this.farmRepository.find({
+                    where: { farmer: { id: farmer.id } },
+                    relations: FARM_COMMODITY_RELATIONS,
+                    order: { name: "ASC" }
+                });
+                return successResponse(res, farms);
             }
 
-            const farms = await this.farmRepository.find({
-                where: whereClause,
-                relations: FARM_COMMODITY_RELATIONS,
-                order: { name: "ASC" }
-            });
+            // Access rule (same per-enumerator visibility scoping already
+            // used by FarmerController.getAll(), kept consistent so the
+            // Farm Registry and Farmers list always agree on what a given
+            // inspector can see):
+            // - ADMIN sees every farm, no restrictions.
+            // - INSPECTOR sees only (a) farms belonging to a farmer THEY
+            //   personally registered (farmer.registeredByUserId matches
+            //   their own user id), plus (b) farms whose farmer is
+            //   "legacy" (registeredByUserId IS NULL), so no
+            //   previously-visible data disappears for anyone. Before
+            //   this fix, every INSPECTOR saw every farm from every
+            //   enumerator here with zero filtering, even though the
+            //   Farmers list was already correctly scoped — this closes
+            //   that gap so the two lists behave consistently.
+            // - BUYER unaffected for now (out of scope of this fix, same
+            //   as the farmers-side scoping).
+            let farms: Farm[];
+            if (user && user.role === UserRole.INSPECTOR) {
+                farms = await this.farmRepository
+                    .createQueryBuilder("farm")
+                    .leftJoinAndSelect("farm.farmer", "farmer")
+                    .leftJoinAndSelect("farm.plots", "plots")
+                    .leftJoinAndSelect("plots.plotCommodities", "plotCommodities")
+                    .leftJoinAndSelect("plotCommodities.commodity", "commodity")
+                    .where("farmer.registeredByUserId = :userId", { userId: user.id })
+                    .orWhere("farmer.registeredByUserId IS NULL")
+                    .orderBy("farm.name", "ASC")
+                    .getMany();
+            } else {
+                farms = await this.farmRepository.find({
+                    relations: FARM_COMMODITY_RELATIONS,
+                    order: { name: "ASC" }
+                });
+            }
+
             return successResponse(res, farms);
         } catch (error: any) {
             console.error(error);
