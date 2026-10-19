@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { AppDataSource } from "../data-source";
 import { Cooperative } from "../entities/Cooperative";
 import { successResponse, errorResponse } from "../utils/response";
+import { CDA_COOPERATIVE_SEED_DATA } from "../data/cdaCooperativeSeedData";
 
 /**
  * Read-mostly access to the CDA cooperative registry (see Cooperative.ts
@@ -61,6 +62,58 @@ export class CooperativeController {
         } catch (error: any) {
             console.error("Error fetching cooperative:", error);
             return errorResponse(res, "Error fetching cooperative", [error.message], 500);
+        }
+    }
+
+    /**
+     * ADMIN-only: (re-)seeds the Cooperative table from the embedded CDA
+     * registry data (src/data/cdaCooperativeSeedData.ts - 95 cooperatives
+     * parsed from the official "CDA COOPERATIVE LISTING 2025" letter).
+     *
+     * Exists specifically so production can be seeded over HTTP by an
+     * admin, without needing direct database/shell access to the Render
+     * instance - call once after deploy:
+     *   POST /api/cooperatives/seed  (Authorization: Bearer <admin token>)
+     *
+     * Idempotent: upserts by `slug`, identical logic to the standalone
+     * seedCooperatives.ts script (safe to call again later if the
+     * registry data is corrected and redeployed - it will update
+     * existing rows rather than duplicate them).
+     */
+    async seed(req: Request, res: Response) {
+        try {
+            let created = 0;
+            let updated = 0;
+
+            for (const rec of CDA_COOPERATIVE_SEED_DATA) {
+                let coop = await this.cooperativeRepository.findOne({ where: { slug: rec.id } });
+                const isNew = !coop;
+                if (!coop) coop = new Cooperative();
+
+                coop.slug = rec.id;
+                coop.name = rec.name;
+                coop.county = rec.county || undefined as any;
+                coop.location = rec.location || undefined as any;
+                coop.commodities = rec.commodities;
+                coop.membershipTotal = rec.membership.total;
+                coop.membershipMale = rec.membership.male;
+                coop.membershipFemale = rec.membership.female;
+                coop.contactName = rec.contact.name || undefined as any;
+                coop.contactRole = rec.contact.role || undefined as any;
+                coop.contactPhones = rec.contact.phones;
+                coop.rawMembership = rec.membership.raw || undefined as any;
+                coop.rawContact = rec.contact.raw || undefined as any;
+                coop.isActive = true;
+
+                await this.cooperativeRepository.save(coop);
+                if (isNew) created++; else updated++;
+            }
+
+            const total = await this.cooperativeRepository.count();
+            return successResponse(res, { created, updated, total });
+        } catch (error: any) {
+            console.error("Error seeding cooperatives:", error);
+            return errorResponse(res, "Error seeding cooperatives", [error.message], 500);
         }
     }
 }

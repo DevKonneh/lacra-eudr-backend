@@ -264,7 +264,7 @@ export class FarmerController {
             const {
                 firstName, lastName, email, phoneNumber, password,
                 gender, dob, nationality, nationalId, idType, idTypeOther, otherId, address, community, district, region,
-                cooperativeName, cooperativeId, enumeratorName, enumeratorId, consent,
+                cooperativeName, cooperativeId, cooperativeSource, enumeratorName, enumeratorId, consent,
                 directions, latitude, longitude
             } = body;
 
@@ -334,6 +334,14 @@ export class FarmerController {
                 farmer.region = region;
                 farmer.cooperativeName = cooperativeName;
                 farmer.cooperativeId = cooperativeId;
+                // 'CDA_REGISTRY' when the picked value came from the real CDA
+                // registry dropdown, 'OTHER' for the free-text fallback -
+                // mirrors how the mobile app's /auth/register-farmer path
+                // already tags this (see AuthController.registerFarmer).
+                // Falls back to undefined (not '') for older admin-panel
+                // builds that don't send this field yet, so existing
+                // behavior is unaffected.
+                farmer.cooperativeSource = cooperativeSource;
                 farmer.enumeratorName = enumeratorName;
                 farmer.enumeratorId = enumeratorId;
                 farmer.registeredByUserId = registeredByUserId as any;
@@ -501,7 +509,7 @@ export class FarmerController {
             firstName, lastName, email, phoneNumber,
             gender, dob, nationality, nationalId, idType, idTypeOther, otherId,
             address, community, district, region,
-            cooperativeName, cooperativeId,
+            cooperativeName, cooperativeId, cooperativeSource,
             enumeratorName, enumeratorId,
             directions, latitude, longitude,
             identityStatus, consent
@@ -547,6 +555,7 @@ export class FarmerController {
             // Cooperative / Enumerator
             farmer.cooperativeName = cooperativeName ?? farmer.cooperativeName;
             farmer.cooperativeId = cooperativeId ?? farmer.cooperativeId;
+            farmer.cooperativeSource = cooperativeSource ?? farmer.cooperativeSource;
             farmer.enumeratorName = enumeratorName ?? farmer.enumeratorName;
             farmer.enumeratorId = enumeratorId ?? farmer.enumeratorId;
 
