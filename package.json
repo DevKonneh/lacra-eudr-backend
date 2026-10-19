@@ -8,6 +8,7 @@
     "start": "node dist/index.js",
     "dev": "nodemon src/index.ts",
     "seed": "node dist/seedAdmin.js",
+    "seed:cooperatives": "node dist/seedCooperatives.js",
     "test": "jest"
   },
   "keywords": [],
