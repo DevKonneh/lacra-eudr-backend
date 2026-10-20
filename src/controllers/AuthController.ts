@@ -233,6 +233,10 @@ export class AuthController {
                 dob,
                 phone, // maps to phoneNumber
                 nationality,
+                // County the farmer originally comes from (place of
+                // origin), distinct from `county` below (where they are
+                // being registered/currently live).
+                countyOfOrigin,
                 nationalId,
                 idType,
                 idTypeOther,
@@ -248,14 +252,24 @@ export class AuthController {
                 // and short-circuit duplicate sync submissions of the same
                 // locally-created record (task spec section 13).
                 clientRecordId,
-                // Location
+                // Location (where the farmer currently lives/is being
+                // registered)
                 county,
                 district,
                 community,
+                // Free-text residential address (house description/street)
+                // - separate from the GPS coordinate pair (lat/lng) and
+                // from `directions` (how to find the place).
+                address,
                 inspectorName,
                 lat,
                 lng,
                 directions,
+                // Farm's own GPS reference point - deliberately distinct
+                // from the farmer's lat/lng above, which is the farmer's
+                // RESIDENCE and may be captured nowhere near the farm.
+                farmLat,
+                farmLng,
                 // Farm
                 farmName,
                 crop,
@@ -375,16 +389,18 @@ export class AuthController {
                 farmer.gender = gender;
                 farmer.dob = dob ? new Date(dob) : new Date(); // Handle valid date parsing
                 farmer.nationality = nationality;
+                farmer.countyOfOrigin = countyOfOrigin;
                 farmer.nationalId = nationalId;
                 farmer.idType = idType;
                 farmer.idTypeOther = idTypeOther;
                 farmer.otherId = otherId;
                 farmer.district = district;
                 farmer.community = community;
+                farmer.address = address;
 
-                // Map county to region/address or just save in address for now if no county col, 
-                // but we added none. Assuming county maps to region or address. 
-                // Let's put county in region for this mapping.
+                // `region` doubles as the farmer's CURRENT county (where
+                // they are being registered/live now) - kept separate from
+                // countyOfOrigin above (where they originally come from).
                 farmer.region = county;
 
                 farmer.enumeratorName = inspectorName;
@@ -456,6 +472,12 @@ export class AuthController {
                         farm.useChemicals = f.useChemicals === 'true' || f.useChemicals === true;
                         farm.extensionServices = f.extensionServices === 'true' || f.extensionServices === true;
                         farm.farmAddress = f.farmAddress;
+                        if (f.farmLat !== undefined && f.farmLat !== null && f.farmLat !== '') {
+                            farm.farmLatitude = parseFloat(f.farmLat);
+                        }
+                        if (f.farmLng !== undefined && f.farmLng !== null && f.farmLng !== '') {
+                            farm.farmLongitude = parseFloat(f.farmLng);
+                        }
                         // Handle farm photos for first farm
                         if (i === 0) {
                             const farmPhotos = files?.filter(file => file.fieldname === 'farmPhotos[]' || file.fieldname === 'farmPhotos');
@@ -518,6 +540,17 @@ export class AuthController {
                     farm.useChemicals = useChemicals === 'true' || useChemicals === true;
                     farm.extensionServices = extensionServices === 'true' || extensionServices === true;
                     farm.farmAddress = farmAddress;
+                    // Farm's own GPS reference point (task spec: capture
+                    // the farm's GPS coordinate explicitly, independent of
+                    // the farmer's residential lat/lng below). Stored even
+                    // when a boundary polygon is also present, so the farm
+                    // always has a single reference point on record.
+                    if (farmLat !== undefined && farmLat !== null && farmLat !== '') {
+                        farm.farmLatitude = parseFloat(farmLat);
+                    }
+                    if (farmLng !== undefined && farmLng !== null && farmLng !== '') {
+                        farm.farmLongitude = parseFloat(farmLng);
+                    }
 
                     if (boundaryJson) {
                         try {
@@ -526,8 +559,16 @@ export class AuthController {
                         } catch (e) {
                             console.error("Invalid GeoJSON", e);
                         }
+                    } else if (farmLat && farmLng) {
+                        // Prefer the farm's own GPS point when it was
+                        // explicitly captured - more correct than reusing
+                        // the farmer's residential coordinate below.
+                        farm.location = { type: 'Point', coordinates: [parseFloat(farmLng), parseFloat(farmLat)] };
                     } else if (lat && lng) {
-                        // Point geom if no boundary
+                        // Legacy fallback (preserved for backward
+                        // compatibility): if no farm GPS was captured
+                        // either, fall back to the farmer's residential
+                        // lat/lng as before.
                         const point = { type: 'Point', coordinates: [parseFloat(lng), parseFloat(lat)] };
                         farm.location = point;
                     }

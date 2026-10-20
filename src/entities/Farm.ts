@@ -110,6 +110,19 @@ export class Farm {
     @Column({ nullable: true })
     farmAddress!: string;
 
+    // Farm's own GPS coordinate (a single reference point, e.g. the main
+    // gate/entrance or a point the enumerator stood at while surveying) -
+    // kept separate from `location` above (the full boundary geometry,
+    // Point or Polygon, used for mapping/EUDR compliance) and from the
+    // Farmer's own latitude/longitude (their RESIDENCE, which can be far
+    // from the farm - see Farmer.latitude/longitude). Nullable: a farm
+    // mapped only via boundary polygon may never set this explicitly.
+    @Column({ type: "float", nullable: true })
+    farmLatitude!: number;
+
+    @Column({ type: "float", nullable: true })
+    farmLongitude!: number;
+
     @Column("simple-array", { nullable: true })
     farmPhotos!: string[];
 

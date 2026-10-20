@@ -43,11 +43,23 @@ export class Farmer {
     @Column({ nullable: true })
     nationality!: string;
 
+    // County the farmer originally comes from (place of origin/birth) -
+    // distinct from `community`/`district`/`region` above, which describe
+    // where the enumerator is registering them (their CURRENT residence
+    // area). A farmer can live in a different county from the one they
+    // originate from, which matters for some reporting/outreach purposes.
+    @Column({ nullable: true })
+    countyOfOrigin!: string;
+
     @Column({ nullable: true })
     otherId!: string; // LASSRA Number / Other
 
     @Column({ nullable: true })
-    address!: string; // Home Address
+    address!: string; // Home / Residential Address (free-text, e.g. house
+    // description, street) - distinct from the GPS coordinate pair
+    // (latitude/longitude below) and from `directions` (how to physically
+    // find the place). A readable address gives a human-usable record even
+    // when GPS wasn't captured or was inaccurate.
 
     @Column({ nullable: true })
     community!: string;
