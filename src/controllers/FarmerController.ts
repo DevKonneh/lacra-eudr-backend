@@ -766,6 +766,7 @@ export class FarmerController {
             farmer.idTypeOther = farmerData.idTypeOther;
             farmer.gender = farmerData.gender;
             farmer.address = farmerData.address;
+            farmer.countyOfOrigin = farmerData.countyOfOrigin;
             farmer.community = farmerData.community;
             farmer.district = farmerData.district;
             farmer.region = farmerData.region;
@@ -826,6 +827,15 @@ export class FarmerController {
                 farm.useChemicals = f.useChemicals === true || f.useChemicals === "true";
                 farm.extensionServices = f.extensionServices === true || f.extensionServices === "true";
                 farm.farmAddress = f.farmAddress;
+                // Farm's own GPS reference point (see AuthController.registerFarmer
+                // for the live-path equivalent) - kept consistent across both
+                // the live and offline-queue-replay sync paths.
+                if (f.farmLat !== undefined && f.farmLat !== null && f.farmLat !== '') {
+                    farm.farmLatitude = parseFloat(f.farmLat);
+                }
+                if (f.farmLng !== undefined && f.farmLng !== null && f.farmLng !== '') {
+                    farm.farmLongitude = parseFloat(f.farmLng);
+                }
                 farm.farmer = savedFarmer;
 
                 // GPS polygon / farm-area geometry validation — invalid

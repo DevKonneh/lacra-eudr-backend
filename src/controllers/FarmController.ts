@@ -459,6 +459,7 @@ export class FarmController {
                 numberOfTrees, yearsInCultivation, harvestSeason, averageYield,
                 buyers, useChemicals, extensionServices, farmAddress, farmNotes,
                 manualSizeInput, manualSizeUnit, commodities, gpsAccuracyM,
+                farmLat, farmLng,
             } = req.body;
             // NOTE: cropType is no longer strictly required — a farm can now be
             // synced with a `commodities` array instead. At least one of the
@@ -502,6 +503,14 @@ export class FarmController {
             if (useChemicals !== undefined) farm.useChemicals = useChemicals === true || useChemicals === "true";
             if (extensionServices !== undefined) farm.extensionServices = extensionServices === true || extensionServices === "true";
             if (farmAddress !== undefined) farm.farmAddress = farmAddress;
+            // Farm's own GPS reference point - same semantics as
+            // AuthController.registerFarmer / FarmerController.offlineSync.
+            if (farmLat !== undefined && farmLat !== null && farmLat !== '') {
+                farm.farmLatitude = parseFloat(farmLat);
+            }
+            if (farmLng !== undefined && farmLng !== null && farmLng !== '') {
+                farm.farmLongitude = parseFloat(farmLng);
+            }
             if (farmNotes !== undefined) farm.farmNotes = farmNotes;
             if (manualSizeInput !== undefined && manualSizeInput !== "") farm.manualSizeInput = String(manualSizeInput);
             if (manualSizeUnit !== undefined) farm.manualSizeUnit = manualSizeUnit;
