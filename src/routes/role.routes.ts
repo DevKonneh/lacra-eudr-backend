@@ -1,12 +1,19 @@
 import { Router } from "express";
 import { RoleController } from "../controllers/RoleController";
 import { authMiddleware } from "../middleware/auth.middleware";
+import { UserRole } from "../entities/User";
 
 const router = Router();
 const roleController = new RoleController();
 
-// Apply auth middleware 
-router.use(authMiddleware());
+// Role/permission definitions (create/list/update/delete) are an
+// admin-only capability — the admin panel's own nav config gates "Roles &
+// Permissions" to ADMIN (and a frontend-only SUPER_ADMIN that has no
+// backend equivalent). Previously this only required authMiddleware()
+// with no role check, so ANY authenticated user (e.g. INSPECTOR, FARMER)
+// could call these endpoints directly, bypassing the UI restriction
+// entirely.
+router.use(authMiddleware([UserRole.ADMIN]));
 
 router.post("/", (req, res) => roleController.create(req, res));
 router.get("/", (req, res) => roleController.getAll(req, res));
