@@ -78,17 +78,60 @@ export class LicenseController {
     }
 
     // DG Decision
+    // Accepts an explicit `decision` in the body so the DG can either
+    // approve or reject a license recommended by Commercial review.
+    // Previously this always hard-coded DG_APPROVED regardless of what the
+    // caller intended, so Reject (and the frontend's Suspend, which also
+    // misused this same endpoint) silently approved the license instead.
+    // Defaults to DG_APPROVED only when no decision is supplied, to keep
+    // any existing caller that never sent a body working exactly as before.
+    private static readonly VALID_DG_DECISIONS = [LicenseStatus.DG_APPROVED, LicenseStatus.DG_REJECTED];
+
     async approve(req: any, res: Response) {
+        try {
+            const { id } = req.params;
+            const { decision } = req.body || {};
+
+            const license = await this.licenseRepository.findOneBy({ id });
+            if (!license) return errorResponse(res, "License not found", [], 404);
+
+            if (license.status !== LicenseStatus.RECOMMENDED_TO_DG) {
+                return errorResponse(res, `Cannot record a DG decision while license is in status ${license.status}. It must first be recommended by Commercial review.`, [], 400);
+            }
+
+            const resolvedDecision: LicenseStatus = decision ?? LicenseStatus.DG_APPROVED;
+            if (!LicenseController.VALID_DG_DECISIONS.includes(resolvedDecision)) {
+                return errorResponse(res, `Invalid DG decision "${decision}". Must be one of: ${LicenseController.VALID_DG_DECISIONS.join(", ")}.`, [], 400);
+            }
+
+            license.status = resolvedDecision;
+            await this.licenseRepository.save(license);
+            return successResponse(res, license);
+        } catch (error: any) {
+            return errorResponse(res, "Error recording DG decision on license", [error.message], 500);
+        }
+    }
+
+    // Suspend an already-issued license. Previously the admin panel routed
+    // "Suspend" through the DG-decision endpoint (approve()), which always
+    // hard-coded DG_APPROVED, so clicking Suspend silently re-approved the
+    // license instead. This is now its own endpoint with its own status
+    // guard so a license can only be suspended while it is actually active.
+    async suspend(req: any, res: Response) {
         try {
             const { id } = req.params;
             const license = await this.licenseRepository.findOneBy({ id });
             if (!license) return errorResponse(res, "License not found", [], 404);
 
-            license.status = LicenseStatus.DG_APPROVED;
+            if (license.status !== LicenseStatus.LICENSE_ISSUED && license.status !== LicenseStatus.ACTIVE) {
+                return errorResponse(res, `Cannot suspend a license in status ${license.status}. Only an issued/active license can be suspended.`, [], 400);
+            }
+
+            license.status = LicenseStatus.SUSPENDED;
             await this.licenseRepository.save(license);
             return successResponse(res, license);
         } catch (error: any) {
-            return errorResponse(res, "Error approving license", [error.message], 500);
+            return errorResponse(res, "Error suspending license", [error.message], 500);
         }
     }
 
