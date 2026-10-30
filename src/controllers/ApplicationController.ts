@@ -9,6 +9,7 @@ import { Certificate } from "../entities/Certificate";
 import { User, UserRole } from "../entities/User";
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary } from "../utils/cloudUpload";
+import { NotificationService } from "../services/NotificationService";
 
 // Pulls a human-readable applicant/business name out of the category-
 // specific `data` blob, matching ConfirmationPage.tsx's getApplicantName()
@@ -70,6 +71,23 @@ export class ApplicationController {
             ipAddress: params.ipAddress || undefined,
         });
         await this.historyRepository.save(row);
+    }
+
+    /**
+     * Notifies every user in the given department role(s) that an
+     * application needs their attention — called at every point an
+     * application is routed into a new department's queue, so staff see
+     * it via the admin panel's notification bell instead of only finding
+     * it by polling their queue page. Kept best-effort: a notification
+     * failure must never block the underlying workflow transition, so
+     * callers fire-and-log rather than await-and-fail on this.
+     */
+    private async notifyQueue(roles: UserRole[], applicationNumber: string, title: string, body: string) {
+        try {
+            await NotificationService.createForRoles(roles, "APPLICATION_WORKFLOW", title, `${body} (${applicationNumber})`);
+        } catch (error) {
+            console.error("Error sending application workflow notification", error);
+        }
     }
 
     /**
@@ -229,6 +247,13 @@ export class ApplicationController {
                 newStatus: ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION,
                 comments: "Automatically routed to the Commercial and Marketing work queue.",
             });
+
+            await this.notifyQueue(
+                [UserRole.COMMERCIAL],
+                application.applicationNumber,
+                "New application awaiting Commercial review",
+                `A new ${category} application was submitted and needs Commercial verification.`
+            );
 
             return successResponse(res, application, "Application submitted successfully", 201);
         } catch (error: any) {
@@ -403,6 +428,13 @@ export class ApplicationController {
                 comments: "Automatically routed to the Director-General for first approval.",
             });
 
+            await this.notifyQueue(
+                [UserRole.DG],
+                application.applicationNumber,
+                "Application awaiting your first approval",
+                "Commercial has verified an application and it now needs your decision."
+            );
+
             return successResponse(res, application, "Application verified and routed to the Director-General");
         } catch (error: any) {
             return errorResponse(res, "Error verifying application", [error.message], 500);
@@ -444,6 +476,13 @@ export class ApplicationController {
                 comments: "Automatically routed to Technical Services for review.",
             });
 
+            await this.notifyQueue(
+                [UserRole.TECHNICAL],
+                application.applicationNumber,
+                "Application awaiting Technical review",
+                "The Director-General approved an application and it now needs Technical Services review."
+            );
+
             return successResponse(res, application, "Application approved and routed to Technical Review");
         } catch (error: any) {
             return errorResponse(res, "Error approving application", [error.message], 500);
@@ -478,6 +517,13 @@ export class ApplicationController {
                 comments: `Returned to Commercial by the Director-General: ${reason}`,
                 ipAddress: req.ip,
             });
+
+            await this.notifyQueue(
+                [UserRole.COMMERCIAL],
+                application.applicationNumber,
+                "Application returned by the Director-General",
+                `The DG returned an application to Commercial: ${reason}`
+            );
 
             return successResponse(res, application, "Application returned to Commercial");
         } catch (error: any) {
@@ -593,6 +639,17 @@ export class ApplicationController {
                 comments: `Inspector assigned: ${inspector.name || inspector.email}.`,
                 ipAddress: req.ip,
             });
+
+            try {
+                await NotificationService.createForUser(
+                    inspector.id,
+                    "APPLICATION_WORKFLOW",
+                    "Warehouse assessment assigned to you",
+                    `You have been assigned to carry out a warehouse assessment (${application.applicationNumber}).`
+                );
+            } catch (error) {
+                console.error("Error notifying assigned inspector", error);
+            }
 
             return successResponse(res, { application, assessment }, "Inspector assigned");
         } catch (error: any) {
@@ -730,6 +787,13 @@ export class ApplicationController {
                 comments: "Automatically routed to Technical Services for verification.",
             });
 
+            await this.notifyQueue(
+                [UserRole.TECHNICAL],
+                application.applicationNumber,
+                "Warehouse assessment ready for verification",
+                `The inspector submitted a warehouse assessment (outcome: ${outcome}) for your review.`
+            );
+
             return successResponse(res, application, "Assessment submitted");
         } catch (error: any) {
             return errorResponse(res, "Error submitting assessment", [error.message], 500);
@@ -770,6 +834,13 @@ export class ApplicationController {
                 newStatus: application.status,
                 comments: "Automatically routed to the Director-General for second approval.",
             });
+
+            await this.notifyQueue(
+                [UserRole.DG],
+                application.applicationNumber,
+                "Application awaiting your second approval",
+                "Technical Services verified the warehouse assessment and it now needs your decision."
+            );
 
             return successResponse(res, application, "Verified and routed to the Director-General");
         } catch (error: any) {
@@ -824,6 +895,19 @@ export class ApplicationController {
                 ipAddress: req.ip,
             });
 
+            if (nextAssessment.inspectorId) {
+                try {
+                    await NotificationService.createForUser(
+                        nextAssessment.inspectorId,
+                        "APPLICATION_WORKFLOW",
+                        "Reinspection required",
+                        `Technical Services requires a reinspection (${application.applicationNumber}): ${reason}`
+                    );
+                } catch (error) {
+                    console.error("Error notifying inspector of reinspection", error);
+                }
+            }
+
             return successResponse(res, application, "Reinspection required; returned to the inspector for scheduling");
         } catch (error: any) {
             return errorResponse(res, "Error requiring reinspection", [error.message], 500);
@@ -865,6 +949,13 @@ export class ApplicationController {
                 comments: "Automatically routed to Billing for invoice preparation.",
             });
 
+            await this.notifyQueue(
+                [UserRole.FINANCE],
+                application.applicationNumber,
+                "Application awaiting billing review",
+                "The Director-General approved the technical stage and it now needs an invoice prepared."
+            );
+
             return successResponse(res, application, "Application approved and routed to Billing");
         } catch (error: any) {
             return errorResponse(res, "Error approving application", [error.message], 500);
@@ -899,6 +990,13 @@ export class ApplicationController {
                 comments: `Returned to Technical Services by the Director-General: ${reason}`,
                 ipAddress: req.ip,
             });
+
+            await this.notifyQueue(
+                [UserRole.TECHNICAL],
+                application.applicationNumber,
+                "Application returned by the Director-General",
+                `The DG returned an application to Technical Services: ${reason}`
+            );
 
             return successResponse(res, application, "Application returned to Technical Services");
         } catch (error: any) {
@@ -1180,6 +1278,13 @@ export class ApplicationController {
                 comments: "Automatically routed to the Director-General for final approval.",
             });
 
+            await this.notifyQueue(
+                [UserRole.DG],
+                application.applicationNumber,
+                "Application awaiting your final approval",
+                "Finance verified payment and it now needs your final decision."
+            );
+
             return successResponse(res, application, "Payment verified and routed to the Director-General");
         } catch (error: any) {
             return errorResponse(res, "Error verifying payment", [error.message], 500);
@@ -1229,6 +1334,13 @@ export class ApplicationController {
                 newStatus: application.status,
                 comments: "Automatically routed to the Director-General for final approval.",
             });
+
+            await this.notifyQueue(
+                [UserRole.DG],
+                application.applicationNumber,
+                "Application awaiting your final approval",
+                "Finance cleared the cheque and it now needs your final decision."
+            );
 
             return successResponse(res, application, "Cheque cleared and routed to the Director-General");
         } catch (error: any) {
@@ -1318,6 +1430,13 @@ export class ApplicationController {
                 comments: "Automatically routed to IT for certificate printing.",
             });
 
+            await this.notifyQueue(
+                [UserRole.IT],
+                application.applicationNumber,
+                "Certificate ready for printing",
+                "The Director-General gave final approval and the certificate now needs to be printed and issued."
+            );
+
             return successResponse(res, application, "Application approved for issuance and routed to IT");
         } catch (error: any) {
             return errorResponse(res, "Error giving final approval", [error.message], 500);
@@ -1352,6 +1471,13 @@ export class ApplicationController {
                 comments: `Returned to Finance by the Director-General: ${reason}`,
                 ipAddress: req.ip,
             });
+
+            await this.notifyQueue(
+                [UserRole.FINANCE],
+                application.applicationNumber,
+                "Application returned by the Director-General",
+                `The DG returned an application to Finance: ${reason}`
+            );
 
             return successResponse(res, application, "Application returned to Finance");
         } catch (error: any) {
