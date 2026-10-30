@@ -68,9 +68,4 @@ export class BusinessController {
             return errorResponse(res, "Error fetching businesses", [error.message], 500);
         }
     }
-
-    async updateStatus(req: Request, res: Response) {
-        // Placeholder for future admin verification logic
-        return errorResponse(res, "Not implemented", [], 501);
-    }
 }
