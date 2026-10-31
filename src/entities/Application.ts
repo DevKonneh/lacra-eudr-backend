@@ -161,6 +161,37 @@ export class Application {
     @Column({ type: "timestamp", nullable: true })
     submittedAt!: Date;
 
+    // -----------------------------------------------------------------
+    // Additive Commercial-stage review support. These two columns do NOT
+    // introduce any new approval stage or status value — they only let
+    // the existing APPLICANT_CORRECTION_REQUIRED status actually resolve
+    // (previously there was no way back out of it once a correction was
+    // requested) and let a Commercial officer save in-progress review
+    // work without transitioning status. Both are nullable and ignored
+    // entirely by every pre-existing transition in ApplicationController.
+    // -----------------------------------------------------------------
+
+    // Set only when a correction cycle completes via resubmitAfterCorrection().
+    // Kept separate from submittedAt so the original submission date/time
+    // is always preserved for "oldest first" queue sorting, while the
+    // queue/detail UI can still show "resubmitted on <date>" separately.
+    @Column({ type: "timestamp", nullable: true })
+    resubmittedAt!: Date;
+
+    // Free-form JSONB bag for Commercial-stage review-in-progress state:
+    // per-document verification status + comment, a verification
+    // checklist, internal-only notes, and a draft applicant-visible
+    // message. Populated by saveCommercialReviewProgress() and read back
+    // by the Application Review page; never read or required by any
+    // other stage's logic, so it cannot affect existing business rules.
+    @Column({ type: "jsonb", nullable: true })
+    commercialReview!: {
+        documents?: Record<string, { status: 'PENDING' | 'VERIFIED' | 'NEEDS_CORRECTION'; comment?: string }>;
+        checklist?: Record<string, boolean>;
+        internalNotes?: string;
+        applicantMessageDraft?: string;
+    } | null;
+
     @CreateDateColumn()
     createdAt!: Date;
 

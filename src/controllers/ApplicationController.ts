@@ -262,6 +262,17 @@ export class ApplicationController {
         }
     }
 
+    // Same best-effort officer derivation as getAll(), but from a
+    // single application's already-loaded history array (used by getOne(),
+    // which fetches full history anyway, so no extra query is needed here).
+    private deriveAssignedOfficer(history: ApplicationStatusHistory[]): string | undefined {
+        const relevant = history
+            .filter((h) => h.action === "COMMERCIAL_REVIEW_STARTED" || h.action === "RESUBMITTED")
+            .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+        const last = relevant[relevant.length - 1];
+        return last?.userName || undefined;
+    }
+
     async getOne(req: any, res: Response) {
         try {
             const { id } = req.params;
@@ -276,14 +287,16 @@ export class ApplicationController {
                 const invoices = await this.invoiceRepository.find({ where: { applicationId: byNumber.id }, order: { versionNumber: "ASC" } });
                 const payments = await this.paymentRepository.find({ where: { applicationId: byNumber.id }, order: { versionNumber: "ASC" } });
                 const certificate = await this.certificateRepository.findOne({ where: { applicationId: byNumber.id } });
-                return successResponse(res, { ...byNumber, history, warehouseAssessments, invoices, payments, certificate });
+                const assignedOfficer = this.deriveAssignedOfficer(history);
+                return successResponse(res, { ...byNumber, history, warehouseAssessments, invoices, payments, certificate, assignedOfficer });
             }
             const history = await this.historyRepository.find({ where: { applicationId: application.id }, order: { createdAt: "ASC" } });
             const warehouseAssessments = await this.warehouseAssessmentRepository.find({ where: { applicationId: application.id }, order: { versionNumber: "ASC" } });
             const invoices = await this.invoiceRepository.find({ where: { applicationId: application.id }, order: { versionNumber: "ASC" } });
             const payments = await this.paymentRepository.find({ where: { applicationId: application.id }, order: { versionNumber: "ASC" } });
             const certificate = await this.certificateRepository.findOne({ where: { applicationId: application.id } });
-            return successResponse(res, { ...application, history, warehouseAssessments, invoices, payments, certificate });
+            const assignedOfficer = this.deriveAssignedOfficer(history);
+            return successResponse(res, { ...application, history, warehouseAssessments, invoices, payments, certificate, assignedOfficer });
         } catch (error: any) {
             return errorResponse(res, "Error fetching application", [error.message], 500);
         }
@@ -320,13 +333,24 @@ export class ApplicationController {
         return true;
     }
 
-    /** Commercial officer opens an application and starts working on it. */
+    /**
+     * Commercial officer opens an application and starts working on it.
+     * Also accepts RETURNED_TO_COMMERCIAL (the DG sent it back for more
+     * work) — this was previously a dead end with no way back into an
+     * active review, even though dgReturn() already routes it into this
+     * exact queue. No new status/stage is introduced; this just lets an
+     * existing status actually be acted on.
+     */
     async startCommercialReview(req: any, res: Response) {
         try {
             const { id } = req.params;
             const application = await this.loadApplicationOr404(id, res);
             if (!application) return;
-            if (!this.requireStatus(application, [ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION], res)) return;
+            if (!this.requireStatus(
+                application,
+                [ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION, ApplicationStatus.RETURNED_TO_COMMERCIAL],
+                res
+            )) return;
 
             const previousStatus = application.status;
             application.status = ApplicationStatus.COMMERCIAL_REVIEW_IN_PROGRESS;
@@ -362,7 +386,11 @@ export class ApplicationController {
             if (!application) return;
             if (!this.requireStatus(
                 application,
-                [ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION, ApplicationStatus.COMMERCIAL_REVIEW_IN_PROGRESS],
+                [
+                    ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION,
+                    ApplicationStatus.COMMERCIAL_REVIEW_IN_PROGRESS,
+                    ApplicationStatus.RETURNED_TO_COMMERCIAL,
+                ],
                 res
             )) return;
 
@@ -398,7 +426,11 @@ export class ApplicationController {
             if (!application) return;
             if (!this.requireStatus(
                 application,
-                [ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION, ApplicationStatus.COMMERCIAL_REVIEW_IN_PROGRESS],
+                [
+                    ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION,
+                    ApplicationStatus.COMMERCIAL_REVIEW_IN_PROGRESS,
+                    ApplicationStatus.RETURNED_TO_COMMERCIAL,
+                ],
                 res
             )) return;
 
@@ -438,6 +470,88 @@ export class ApplicationController {
             return successResponse(res, application, "Application verified and routed to the Director-General");
         } catch (error: any) {
             return errorResponse(res, "Error verifying application", [error.message], 500);
+        }
+    }
+
+    /**
+     * Commercial officer resubmits an application after the applicant has
+     * addressed a requested correction (office receives the updated
+     * information/documents and re-enters/confirms them — the same
+     * office-assisted-staff-acting-on-the-applicant's-behalf pattern
+     * already used for OFFICE_ASSISTED intake elsewhere in this
+     * controller). This does not add a new approval stage: it simply
+     * closes the previously-unreachable APPLICANT_CORRECTION_REQUIRED
+     * status by returning the application to the exact same Commercial
+     * queue status it left (AWAITING_COMMERCIAL_VERIFICATION), while
+     * stamping `resubmittedAt` separately so the original `submittedAt`
+     * is never overwritten.
+     */
+    async resubmitAfterCorrection(req: any, res: Response) {
+        try {
+            const { id } = req.params;
+            const { comments } = req.body || {};
+            const application = await this.loadApplicationOr404(id, res);
+            if (!application) return;
+            if (!this.requireStatus(application, [ApplicationStatus.APPLICANT_CORRECTION_REQUIRED], res)) return;
+
+            const previousStatus = application.status;
+            application.status = ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION;
+            application.resubmittedAt = new Date();
+            await this.applicationRepository.save(application);
+
+            await this.recordHistory({
+                applicationId: application.id,
+                action: "RESUBMITTED",
+                previousStatus,
+                newStatus: application.status,
+                userId: req.user?.id,
+                userName: req.user?.name,
+                role: "Commercial and Marketing Officer",
+                comments: comments || "Applicant's correction received and resubmitted for Commercial review.",
+                ipAddress: req.ip,
+            });
+
+            return successResponse(res, application, "Application resubmitted for review");
+        } catch (error: any) {
+            return errorResponse(res, "Error resubmitting application", [error.message], 500);
+        }
+    }
+
+    /**
+     * Saves in-progress Commercial-stage review work (per-document
+     * verification status/comments, checklist, internal notes, draft
+     * applicant-visible message) WITHOUT changing the application's
+     * status. Purely additive bookkeeping on top of the existing
+     * workflow — read back by the review UI's "Save Progress" action, and
+     * never consulted by any other stage's transition logic.
+     */
+    async saveCommercialReviewProgress(req: any, res: Response) {
+        try {
+            const { id } = req.params;
+            const { documents, checklist, internalNotes, applicantMessageDraft } = req.body || {};
+            const application = await this.loadApplicationOr404(id, res);
+            if (!application) return;
+            if (!this.requireStatus(
+                application,
+                [
+                    ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION,
+                    ApplicationStatus.COMMERCIAL_REVIEW_IN_PROGRESS,
+                ],
+                res
+            )) return;
+
+            application.commercialReview = {
+                ...(application.commercialReview || {}),
+                ...(documents !== undefined ? { documents } : {}),
+                ...(checklist !== undefined ? { checklist } : {}),
+                ...(internalNotes !== undefined ? { internalNotes } : {}),
+                ...(applicantMessageDraft !== undefined ? { applicantMessageDraft } : {}),
+            };
+            await this.applicationRepository.save(application);
+
+            return successResponse(res, application, "Review progress saved");
+        } catch (error: any) {
+            return errorResponse(res, "Error saving review progress", [error.message], 500);
         }
     }
 
@@ -1616,6 +1730,29 @@ export class ApplicationController {
 
             const applications = await qb.getMany();
 
+            // Best-effort "assigned officer" derivation for the Commercial
+            // queue: the most recent COMMERCIAL_REVIEW_STARTED/RESUBMITTED
+            // history row's userName for each application, fetched in one
+            // batched query rather than per-row N+1 lookups. Purely a
+            // display convenience — no column or new business rule is
+            // introduced; applications with no such history row simply
+            // show as unassigned on the frontend.
+            const appIds = applications.map((a) => a.id);
+            const assignedOfficerByAppId: Record<string, string | undefined> = {};
+            if (appIds.length > 0) {
+                const assignmentRows = await this.historyRepository
+                    .createQueryBuilder("h")
+                    .where("h.applicationId IN (:...appIds)", { appIds })
+                    .andWhere("h.action IN (:...actions)", { actions: ["COMMERCIAL_REVIEW_STARTED", "RESUBMITTED"] })
+                    .orderBy("h.createdAt", "ASC")
+                    .getMany();
+                for (const row of assignmentRows) {
+                    // Later rows overwrite earlier ones since we ordered ASC,
+                    // leaving the most recent officer per application.
+                    assignedOfficerByAppId[row.applicationId] = row.userName || undefined;
+                }
+            }
+
             // Lightweight list projection (no full `data` blob) for
             // dashboard/queue tables — full detail is fetched via getOne()
             // when an "Open Application" action is taken.
@@ -1629,8 +1766,12 @@ export class ApplicationController {
                 status: a.status,
                 applicantName: extractApplicantName(a.category, a.data),
                 county: a.data?.buyer?.county || a.data?.agency?.county || a.data?.cooperative?.county || a.data?.exporter?.county || a.data?.warehouse?.county,
+                tin: a.data?.buyer?.tin || a.data?.agency?.tin || a.data?.cooperative?.tin || a.data?.exporter?.tin,
+                businessName: a.data?.buyer?.businessName || a.data?.agency?.legalName || a.data?.cooperative?.legalName || a.data?.exporter?.legalName,
                 submittedAt: a.submittedAt,
+                resubmittedAt: a.resubmittedAt,
                 createdAt: a.createdAt,
+                assignedOfficer: assignedOfficerByAppId[a.id],
             }));
 
             return successResponse(res, list);

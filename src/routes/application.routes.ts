@@ -63,6 +63,21 @@ router.post(
     authMiddleware(["DG", "ADMIN"]),
     (req, res) => controller.dgReturn(req, res)
 );
+// Additive: lets a Commercial officer resolve APPLICANT_CORRECTION_REQUIRED
+// (previously a dead end — no endpoint existed to move out of it) and save
+// in-progress review notes/checklist without changing status. Does not add
+// a new approval stage; resubmission re-enters the exact same Commercial
+// queue the application started in.
+router.post(
+    "/:id/commercial/resubmit",
+    authMiddleware(["COMMERCIAL", "ADMIN"]),
+    (req, res) => controller.resubmitAfterCorrection(req, res)
+);
+router.post(
+    "/:id/commercial/save-review-progress",
+    authMiddleware(["COMMERCIAL", "ADMIN"]),
+    (req, res) => controller.saveCommercialReviewProgress(req, res)
+);
 
 // -----------------------------------------------------------------
 // Stage 3: Technical Review + Inspector Assignment + Warehouse
