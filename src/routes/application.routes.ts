@@ -78,6 +78,11 @@ router.post(
     authMiddleware(["COMMERCIAL", "ADMIN"]),
     (req, res) => controller.saveCommercialReviewProgress(req, res)
 );
+router.post(
+    "/:id/commercial/replace-document",
+    authMiddleware(["COMMERCIAL", "ADMIN"]),
+    (req, res) => controller.replaceDocument(req, res)
+);
 
 // -----------------------------------------------------------------
 // Stage 3: Technical Review + Inspector Assignment + Warehouse

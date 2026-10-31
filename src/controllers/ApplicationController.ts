@@ -11,6 +11,32 @@ import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary } from "../utils/cloudUpload";
 import { NotificationService } from "../services/NotificationService";
 
+// Required-document keys per application category, kept in sync with the
+// admin panel's pages/apply/documentRequirements.ts (the single source of
+// truth for what applicants are asked to upload). Duplicated here
+// deliberately so "Verify & Forward to DG" can be enforced server-side —
+// the frontend's own gating is only a UX convenience and must never be the
+// sole guard for a workflow transition. This does not add a new approval
+// stage or document type; it only validates documents the applicant was
+// already required to provide.
+const REQUIRED_DOCUMENT_KEYS: Record<string, string[]> = {
+    LOCAL_BUYER: ["nationalIdOrPassport", "businessRegistration", "passportPhoto"],
+    AGENCY: ["ownerIdOrPassport", "citizenshipProof", "businessRegistration", "bankStatement", "personnelIds", "warehouseDocs"],
+    COOPERATIVE: [
+        "cdaCertificate", "businessRegistration", "taxClearance", "articlesOfIncorporation", "bylaws",
+        "constitution", "bankStatement", "leadershipList", "farmerMemberList", "leadershipIds",
+        "personnelIds", "warehouseDocs",
+    ],
+    LOCAL_EXPORTER: [
+        "businessRegistration", "taxClearance", "bankConfirmation", "ownersIds", "citizenshipProof",
+        "warehouseDocs", "qualityControlDocs", "supplierInfo",
+    ],
+    FOREIGN_EXPORTER: [
+        "businessRegistration", "taxClearance", "bankConfirmation", "ownersIds",
+        "warehouseDocs", "qualityControlDocs", "supplierInfo",
+    ],
+};
+
 // Pulls a human-readable applicant/business name out of the category-
 // specific `data` blob, matching ConfirmationPage.tsx's getApplicantName()
 // on the frontend exactly, so internal list views show the same name the
@@ -434,6 +460,31 @@ export class ApplicationController {
                 res
             )) return;
 
+            // Server-side enforcement of the forwarding requirements — the
+            // frontend's own "Verify & Forward" gating is only a UX
+            // convenience and must never be the sole guard. Every required
+            // document for this category must be marked VERIFIED in the
+            // saved commercialReview.documents bag, and the verification
+            // checklist (one item per required document plus the final
+            // "information matches documents" check) must be fully ticked.
+            const requiredKeys = REQUIRED_DOCUMENT_KEYS[application.category] || [];
+            const savedDocs = application.commercialReview?.documents || {};
+            const unverifiedDocs = requiredKeys.filter((k) => savedDocs[k]?.status !== "VERIFIED");
+            const savedChecklist = application.commercialReview?.checklist || {};
+            const checklistKeys = [...requiredKeys.map((k) => `doc:${k}`), "info-match"];
+            const incompleteChecklist = checklistKeys.filter((k) => !savedChecklist[k]);
+            if (unverifiedDocs.length > 0 || incompleteChecklist.length > 0) {
+                return errorResponse(
+                    res,
+                    "This application cannot be forwarded yet — all required documents must be verified and the verification checklist completed.",
+                    [
+                        ...unverifiedDocs.map((k) => `Document not verified: ${k}`),
+                        ...incompleteChecklist.map((k) => `Checklist item not completed: ${k}`),
+                    ],
+                    409
+                );
+            }
+
             let previousStatus: ApplicationStatus = application.status;
             application.status = ApplicationStatus.COMMERCIALLY_VERIFIED;
             await this.applicationRepository.save(application);
@@ -540,6 +591,23 @@ export class ApplicationController {
                 res
             )) return;
 
+            // Enforce "a correction reason is required when a document is
+            // marked Needs Correction" server-side too — mirrors the
+            // frontend's own validation but must not depend on it alone.
+            if (documents && typeof documents === "object") {
+                const missingReasons = Object.entries(documents as Record<string, { status?: string; comment?: string }>)
+                    .filter(([, v]) => v?.status === "NEEDS_CORRECTION" && !String(v?.comment || "").trim())
+                    .map(([key]) => key);
+                if (missingReasons.length > 0) {
+                    return errorResponse(
+                        res,
+                        "A correction reason is required for every document marked 'Needs Correction'.",
+                        missingReasons.map((k) => `Missing reason for: ${k}`),
+                        400
+                    );
+                }
+            }
+
             application.commercialReview = {
                 ...(application.commercialReview || {}),
                 ...(documents !== undefined ? { documents } : {}),
@@ -552,6 +620,90 @@ export class ApplicationController {
             return successResponse(res, application, "Review progress saved");
         } catch (error: any) {
             return errorResponse(res, "Error saving review progress", [error.message], 500);
+        }
+    }
+
+    /**
+     * Commercial officer (or, in practice, the system acting on the
+     * applicant's behalf during office-assisted resubmission) replaces one
+     * uploaded document with a newly-uploaded file. The previous file's URL
+     * and the decision made about it (status/comment) are archived into
+     * commercialReview.documentHistory rather than discarded, so a prior
+     * verification/correction decision is never silently lost. The new
+     * document's verification status is reset to PENDING so Commercial
+     * must explicitly re-review it — it cannot inherit the old file's
+     * VERIFIED status. Purely additive to the data model; does not change
+     * `data.documents` shape beyond swapping one entry's value, and does
+     * not touch application status.
+     */
+    async replaceDocument(req: any, res: Response) {
+        try {
+            const { id } = req.params;
+            const { documentKey, url, name, size, type } = req.body || {};
+            if (!documentKey || !url) {
+                return errorResponse(res, "documentKey and url are required", [], 400);
+            }
+            const application = await this.loadApplicationOr404(id, res);
+            if (!application) return;
+            if (!this.requireStatus(
+                application,
+                [
+                    ApplicationStatus.AWAITING_COMMERCIAL_VERIFICATION,
+                    ApplicationStatus.COMMERCIAL_REVIEW_IN_PROGRESS,
+                    ApplicationStatus.APPLICANT_CORRECTION_REQUIRED,
+                ],
+                res
+            )) return;
+
+            const previousDoc = application.data?.documents?.[documentKey] || null;
+            const previousDecision = application.commercialReview?.documents?.[documentKey] || null;
+
+            application.data = {
+                ...application.data,
+                documents: {
+                    ...(application.data?.documents || {}),
+                    [documentKey]: { url, name, size, type, status: "done" },
+                },
+            };
+
+            const existingHistory = application.commercialReview?.documentHistory || {};
+            const keyHistory = Array.isArray(existingHistory[documentKey]) ? existingHistory[documentKey] : [];
+            application.commercialReview = {
+                ...(application.commercialReview || {}),
+                documents: {
+                    ...(application.commercialReview?.documents || {}),
+                    // Resets this document's verification status — the
+                    // officer must explicitly re-verify the replacement.
+                    [documentKey]: { status: "PENDING" },
+                },
+                documentHistory: {
+                    ...existingHistory,
+                    [documentKey]: [
+                        ...keyHistory,
+                        {
+                            url: previousDoc?.url,
+                            name: previousDoc?.name,
+                            decision: previousDecision,
+                            replacedAt: new Date().toISOString(),
+                        },
+                    ],
+                },
+            };
+            await this.applicationRepository.save(application);
+
+            await this.recordHistory({
+                applicationId: application.id,
+                action: "DOCUMENT_REPLACED",
+                userId: req.user?.id,
+                userName: req.user?.name,
+                role: "Commercial and Marketing Officer",
+                comments: `Document replaced: ${documentKey}${previousDoc?.name ? ` (previously: ${previousDoc.name})` : ""}.`,
+                ipAddress: req.ip,
+            });
+
+            return successResponse(res, application, "Document replaced");
+        } catch (error: any) {
+            return errorResponse(res, "Error replacing document", [error.message], 500);
         }
     }
 

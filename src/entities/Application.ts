@@ -190,6 +190,15 @@ export class Application {
         checklist?: Record<string, boolean>;
         internalNotes?: string;
         applicantMessageDraft?: string;
+        // Archive of replaced documents per key, written by
+        // replaceDocument() so a prior verification/correction decision on
+        // a since-replaced file is never silently lost.
+        documentHistory?: Record<string, Array<{
+            url?: string;
+            name?: string;
+            decision?: { status: 'PENDING' | 'VERIFIED' | 'NEEDS_CORRECTION'; comment?: string } | null;
+            replacedAt: string;
+        }>>;
     } | null;
 
     @CreateDateColumn()
