@@ -464,14 +464,16 @@ export class ApplicationController {
             // frontend's own "Verify & Forward" gating is only a UX
             // convenience and must never be the sole guard. Every required
             // document for this category must be marked VERIFIED in the
-            // saved commercialReview.documents bag, and the verification
-            // checklist (one item per required document plus the final
-            // "information matches documents" check) must be fully ticked.
+            // saved commercialReview.documents bag (the document's own
+            // status is the single source of truth — there is no separate
+            // per-document checklist item to also satisfy), and the
+            // broader, non-document verification checklist (currently just
+            // "information matches submitted documents") must be ticked.
             const requiredKeys = REQUIRED_DOCUMENT_KEYS[application.category] || [];
             const savedDocs = application.commercialReview?.documents || {};
             const unverifiedDocs = requiredKeys.filter((k) => savedDocs[k]?.status !== "VERIFIED");
             const savedChecklist = application.commercialReview?.checklist || {};
-            const checklistKeys = [...requiredKeys.map((k) => `doc:${k}`), "info-match"];
+            const checklistKeys = ["info-match"];
             const incompleteChecklist = checklistKeys.filter((k) => !savedChecklist[k]);
             if (unverifiedDocs.length > 0 || incompleteChecklist.length > 0) {
                 return errorResponse(
