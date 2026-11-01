@@ -828,13 +828,24 @@ export class ApplicationController {
         return rows[0] || null;
     }
 
-    /** Technical Services opens an application and starts the inspector-assignment step. */
+    /**
+     * Technical Services opens an application and starts the
+     * inspector-assignment step. Also accepts RETURNED_TO_TECHNICAL_SERVICES
+     * (the DG sent it back for more work at the second-approval stage) so
+     * the department has a way to resume the application after a DG
+     * rejection — mirroring how startCommercialReview() also accepts
+     * RETURNED_TO_COMMERCIAL for the equivalent first-stage return.
+     */
     async startTechnicalAssignment(req: any, res: Response) {
         try {
             const { id } = req.params;
             const application = await this.loadApplicationOr404(id, res);
             if (!application) return;
-            if (!this.requireStatus(application, [ApplicationStatus.AWAITING_TECHNICAL_REVIEW], res)) return;
+            if (!this.requireStatus(
+                application,
+                [ApplicationStatus.AWAITING_TECHNICAL_REVIEW, ApplicationStatus.RETURNED_TO_TECHNICAL_SERVICES],
+                res
+            )) return;
 
             const previousStatus = application.status;
             application.status = ApplicationStatus.INSPECTOR_ASSIGNMENT_PENDING;
@@ -848,7 +859,9 @@ export class ApplicationController {
                 userId: req.user?.id,
                 userName: req.user?.name,
                 role: "Technical Services Officer",
-                comments: "Technical Services review started; awaiting inspector assignment.",
+                comments: previousStatus === ApplicationStatus.RETURNED_TO_TECHNICAL_SERVICES
+                    ? "Technical Services resumed review after the Director-General's return; awaiting inspector assignment."
+                    : "Technical Services review started; awaiting inspector assignment.",
                 ipAddress: req.ip,
             });
 
@@ -858,7 +871,14 @@ export class ApplicationController {
         }
     }
 
-    /** Technical Services assigns a specific inspector to carry out the warehouse assessment. */
+    /**
+     * Technical Services assigns a specific inspector to carry out the
+     * warehouse assessment. Also accepts RETURNED_TO_TECHNICAL_SERVICES
+     * directly, so the department can jump straight to (re)assigning an
+     * inspector after a DG return without first clicking "start review" —
+     * the same flexibility verifyCommercial() gives the Commercial stage
+     * for its own RETURNED_TO_COMMERCIAL return path.
+     */
     async assignInspector(req: any, res: Response) {
         try {
             const { id } = req.params;
@@ -870,7 +890,11 @@ export class ApplicationController {
             if (!application) return;
             if (!this.requireStatus(
                 application,
-                [ApplicationStatus.AWAITING_TECHNICAL_REVIEW, ApplicationStatus.INSPECTOR_ASSIGNMENT_PENDING],
+                [
+                    ApplicationStatus.AWAITING_TECHNICAL_REVIEW,
+                    ApplicationStatus.INSPECTOR_ASSIGNMENT_PENDING,
+                    ApplicationStatus.RETURNED_TO_TECHNICAL_SERVICES,
+                ],
                 res
             )) return;
 
