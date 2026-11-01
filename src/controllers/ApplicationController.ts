@@ -1884,49 +1884,93 @@ export class ApplicationController {
 
             const applications = await qb.getMany();
 
-            // Best-effort "assigned officer" derivation for the Commercial
-            // queue: the most recent COMMERCIAL_REVIEW_STARTED/RESUBMITTED
-            // history row's userName for each application, fetched in one
-            // batched query rather than per-row N+1 lookups. Purely a
-            // display convenience — no column or new business rule is
-            // introduced; applications with no such history row simply
-            // show as unassigned on the frontend.
+            // One batched history fetch per request (not per row) powers
+            // three purely-derived, additive display fields below:
+            // assignedOfficer (existing), plus — for the DG Approvals
+            // Queue redesign — currentStageEnteredAt (when the application
+            // entered its present status, distinct from the original
+            // submittedAt) and recommendedBy (the officer whose
+            // department-level recommendation most recently preceded that
+            // transition). None of these introduce a new column, status,
+            // or business rule; they are all re-derivations of the exact
+            // same immutable history rows already written by the
+            // verify/approve actions elsewhere in this controller.
             const appIds = applications.map((a) => a.id);
-            const assignedOfficerByAppId: Record<string, string | undefined> = {};
+            const historyByApp: Record<string, { action: string; newStatus?: string; userName?: string; createdAt: Date }[]> = {};
             if (appIds.length > 0) {
-                const assignmentRows = await this.historyRepository
+                const allHistoryRows = await this.historyRepository
                     .createQueryBuilder("h")
+                    .select(["h.applicationId", "h.action", "h.newStatus", "h.userName", "h.createdAt"])
                     .where("h.applicationId IN (:...appIds)", { appIds })
-                    .andWhere("h.action IN (:...actions)", { actions: ["COMMERCIAL_REVIEW_STARTED", "RESUBMITTED"] })
                     .orderBy("h.createdAt", "ASC")
                     .getMany();
-                for (const row of assignmentRows) {
-                    // Later rows overwrite earlier ones since we ordered ASC,
-                    // leaving the most recent officer per application.
-                    assignedOfficerByAppId[row.applicationId] = row.userName || undefined;
+                for (const row of allHistoryRows) {
+                    (historyByApp[row.applicationId] ||= []).push(row);
+                }
+            }
+
+            // Actions that represent a department completing its own
+            // review/verification immediately before an application is
+            // auto-routed onward (to the DG, or elsewhere) — i.e. the
+            // "recommendation" a DG approval decision is based on.
+            const RECOMMENDATION_ACTIONS = new Set([
+                "COMMERCIALLY_VERIFIED", "TECHNICALLY_VERIFIED", "PAYMENT_VERIFIED", "CHEQUE_CLEARED",
+            ]);
+
+            function deriveStageInfo(appId: string, currentStatus: string): { stageEnteredAt?: Date; recommendedBy?: string } {
+                const rows = historyByApp[appId] || [];
+                let stageEnteredAt: Date | undefined;
+                for (let i = rows.length - 1; i >= 0; i--) {
+                    if (rows[i].newStatus === currentStatus) { stageEnteredAt = rows[i].createdAt; break; }
+                }
+                let recommendedBy: string | undefined;
+                for (let i = rows.length - 1; i >= 0; i--) {
+                    if (RECOMMENDATION_ACTIONS.has(rows[i].action)) { recommendedBy = rows[i].userName || undefined; break; }
+                }
+                return { stageEnteredAt, recommendedBy };
+            }
+
+            const assignedOfficerByAppId: Record<string, string | undefined> = {};
+            for (const appId of appIds) {
+                const rows = historyByApp[appId] || [];
+                for (const row of rows) {
+                    if (row.action === "COMMERCIAL_REVIEW_STARTED" || row.action === "RESUBMITTED") {
+                        // Later rows overwrite earlier ones since rows are
+                        // ASC, leaving the most recent officer per application.
+                        assignedOfficerByAppId[appId] = row.userName || undefined;
+                    }
                 }
             }
 
             // Lightweight list projection (no full `data` blob) for
             // dashboard/queue tables — full detail is fetched via getOne()
             // when an "Open Application" action is taken.
-            const list = applications.map((a) => ({
-                id: a.id,
-                applicationNumber: a.applicationNumber,
-                category: a.category,
-                commodity: a.commodity,
-                channel: a.channel,
-                submissionMethod: a.submissionMethod,
-                status: a.status,
-                applicantName: extractApplicantName(a.category, a.data),
-                county: a.data?.buyer?.county || a.data?.agency?.county || a.data?.cooperative?.county || a.data?.exporter?.county || a.data?.warehouse?.county,
-                tin: a.data?.buyer?.tin || a.data?.agency?.tin || a.data?.cooperative?.tin || a.data?.exporter?.tin,
-                businessName: a.data?.buyer?.businessName || a.data?.agency?.legalName || a.data?.cooperative?.legalName || a.data?.exporter?.legalName,
-                submittedAt: a.submittedAt,
-                resubmittedAt: a.resubmittedAt,
-                createdAt: a.createdAt,
-                assignedOfficer: assignedOfficerByAppId[a.id],
-            }));
+            const list = applications.map((a) => {
+                const { stageEnteredAt, recommendedBy } = deriveStageInfo(a.id, a.status);
+                return {
+                    id: a.id,
+                    applicationNumber: a.applicationNumber,
+                    category: a.category,
+                    commodity: a.commodity,
+                    channel: a.channel,
+                    submissionMethod: a.submissionMethod,
+                    status: a.status,
+                    applicantName: extractApplicantName(a.category, a.data),
+                    county: a.data?.buyer?.county || a.data?.agency?.county || a.data?.cooperative?.county || a.data?.exporter?.county || a.data?.warehouse?.county,
+                    tin: a.data?.buyer?.tin || a.data?.agency?.tin || a.data?.cooperative?.tin || a.data?.exporter?.tin,
+                    businessName: a.data?.buyer?.businessName || a.data?.agency?.legalName || a.data?.cooperative?.legalName || a.data?.exporter?.legalName,
+                    submittedAt: a.submittedAt,
+                    resubmittedAt: a.resubmittedAt,
+                    createdAt: a.createdAt,
+                    assignedOfficer: assignedOfficerByAppId[a.id],
+                    // Additive, DG-queue-specific: when the application
+                    // entered ITS CURRENT status (e.g. AWAITING_FIRST_DG_APPROVAL),
+                    // separate from submittedAt, plus who made the
+                    // preceding department recommendation.
+                    currentStageEnteredAt: stageEnteredAt,
+                    recommendedBy,
+                };
+            });
 
             return successResponse(res, list);
         } catch (error: any) {
