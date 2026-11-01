@@ -15,10 +15,12 @@ import { EmailService } from "../services/EmailService";
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary, uploadFilesToCloudinary } from "../utils/cloudUpload";
 import QRCode from "qrcode";
+import { UserAuditLog, UserAuditAction } from "../entities/UserAuditLog";
 
 export class AuthController {
     private userRepository = AppDataSource.getRepository(User);
     private emailService = new EmailService();
+    private userAuditLogRepository = AppDataSource.getRepository(UserAuditLog);
 
     async register(req: Request, res: Response) {
         try {
@@ -64,6 +66,28 @@ export class AuthController {
             const isMatch = await bcrypt.compare(password, user.password);
             if (!isMatch) {
                 return errorResponse(res, "Invalid credentials", [], 401);
+            }
+
+            // Record this login so the User Management screen can show
+            // "last active" instead of every account looking identical.
+            // Best-effort: never let a logging hiccup block a successful
+            // login.
+            user.lastLoginAt = new Date();
+            try {
+                await this.userRepository.save(user);
+                await this.userAuditLogRepository.save(
+                    this.userAuditLogRepository.create({
+                        userId: user.id,
+                        action: UserAuditAction.LOGIN,
+                        previousValue: null,
+                        newValue: null,
+                        performedByUserId: user.id,
+                        performedByName: user.name,
+                        notes: null,
+                    })
+                );
+            } catch (logError) {
+                console.error("Failed to record login timestamp/audit log", logError);
             }
 
             const permissions = user.assignedRole?.permissions || [];
@@ -714,8 +738,23 @@ export class AuthController {
             const user = await this.userRepository.findOneBy({ id });
             if (!user) return errorResponse(res, "User not found", [], 404);
 
+            const previousStatus = user.status;
             user.status = UserStatus.ACTIVE;
             await this.userRepository.save(user);
+
+            const requester = (req as any).user;
+            await this.userAuditLogRepository.save(
+                this.userAuditLogRepository.create({
+                    userId: user.id,
+                    action: UserAuditAction.APPROVED,
+                    previousValue: previousStatus,
+                    newValue: UserStatus.ACTIVE,
+                    performedByUserId: requester?.id || null,
+                    performedByName: requester?.name || null,
+                    notes: null,
+                })
+            );
+
             return successResponse(res, null, "User approved successfully");
         } catch (error: any) {
             return errorResponse(res, "Error approving user", [error.message], 500);
@@ -728,8 +767,23 @@ export class AuthController {
             const user = await this.userRepository.findOneBy({ id });
             if (!user) return errorResponse(res, "User not found", [], 404);
 
+            const previousStatus = user.status;
             user.status = UserStatus.REJECTED;
             await this.userRepository.save(user);
+
+            const requester = (req as any).user;
+            await this.userAuditLogRepository.save(
+                this.userAuditLogRepository.create({
+                    userId: user.id,
+                    action: UserAuditAction.REJECTED,
+                    previousValue: previousStatus,
+                    newValue: UserStatus.REJECTED,
+                    performedByUserId: requester?.id || null,
+                    performedByName: requester?.name || null,
+                    notes: null,
+                })
+            );
+
             return successResponse(res, null, "User rejected");
         } catch (error: any) {
             return errorResponse(res, "Error rejecting user", [error.message], 500);

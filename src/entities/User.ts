@@ -35,7 +35,14 @@ export enum UserRole {
 export enum UserStatus {
     PENDING = "PENDING",
     ACTIVE = "ACTIVE",
-    REJECTED = "REJECTED"
+    REJECTED = "REJECTED",
+    // Distinct from REJECTED (which only ever applied to a PENDING
+    // self-registration that was turned down before first use).
+    // SUSPENDED is for an admin deliberately deactivating a
+    // previously-ACTIVE account (e.g. an inspector who left LACRA) without
+    // deleting their row/history, so the account can be reactivated later
+    // and every record they created/touched still resolves to a real user.
+    SUSPENDED = "SUSPENDED"
 }
 
 @Entity()
@@ -69,11 +76,24 @@ export class User {
     @Column({ nullable: true })
     name!: string;
 
+    // Optional contact number for staff accounts (not the farmer's own
+    // phoneNumber, which lives on the Farmer entity) - useful for admins
+    // to reach a colleague about an account issue without digging through
+    // another system.
+    @Column({ nullable: true })
+    phone!: string;
+
     @Column({ nullable: true })
     verificationCode!: string;
 
     @Column({ nullable: true })
     verificationCodeExpires!: Date;
+
+    // Updated every successful login (see AuthController.login). Lets the
+    // User Management screen distinguish active staff from dormant/never-
+    // used accounts at a glance, instead of every row looking identical.
+    @Column({ nullable: true })
+    lastLoginAt!: Date;
 
     @CreateDateColumn()
     createdAt!: Date;
