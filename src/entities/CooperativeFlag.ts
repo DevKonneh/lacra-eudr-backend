@@ -51,7 +51,10 @@ export class CooperativeFlag {
 
     // For SUSPECTED_DUPLICATE: the other cooperative this one was matched
     // against, so the reviewer can open both side by side.
-    @Column({ nullable: true })
+    // NOTE: explicit `type: "varchar"` required - a `string | null`
+    // property's reflected design type is `Object`, which TypeORM cannot
+    // map to a SQL column type on its own.
+    @Column({ type: "varchar", nullable: true })
     relatedCooperativeId!: string | null;
 
     @Column({ type: "enum", enum: CooperativeFlagStatus, default: CooperativeFlagStatus.OPEN })
@@ -59,10 +62,10 @@ export class CooperativeFlag {
 
     // Who/when raised it — null createdByUserId means it was raised by
     // the automated similarity/completeness scan rather than a person.
-    @Column({ nullable: true })
+    @Column({ type: "varchar", nullable: true })
     createdByUserId!: string | null;
 
-    @Column({ nullable: true })
+    @Column({ type: "varchar", nullable: true })
     createdByName!: string | null;
 
     // Review outcome — populated only once an authorised staff member
@@ -73,10 +76,10 @@ export class CooperativeFlag {
     @Column({ type: "text", nullable: true })
     reviewOutcome!: string | null;
 
-    @Column({ nullable: true })
+    @Column({ type: "varchar", nullable: true })
     reviewedByUserId!: string | null;
 
-    @Column({ nullable: true })
+    @Column({ type: "varchar", nullable: true })
     reviewedByName!: string | null;
 
     @Column({ type: "timestamp", nullable: true })

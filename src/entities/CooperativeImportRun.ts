@@ -22,10 +22,13 @@ export class CooperativeImportRun {
     @Column()
     source!: string;
 
-    @Column({ nullable: true })
+    // NOTE: explicit `type: "varchar"` required - a `string | null`
+    // property's reflected design type is `Object`, which TypeORM cannot
+    // map to a SQL column type on its own.
+    @Column({ type: "varchar", nullable: true })
     performedByUserId!: string | null;
 
-    @Column({ nullable: true })
+    @Column({ type: "varchar", nullable: true })
     performedByName!: string | null;
 
     @Column({ type: "int", default: 0 })

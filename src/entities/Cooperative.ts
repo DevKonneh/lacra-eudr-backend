@@ -51,13 +51,19 @@ export class Cooperative {
     // CooperativeController#correct). The registry UI must show "Not
     // recorded" for these rather than inventing a value, per the data-
     // quality requirement that missing information is never fabricated.
-    @Column({ nullable: true })
+    // NOTE: TypeScript's emitted reflection metadata collapses a
+    // `string | null` property type to `Object`, which TypeORM cannot map
+    // to a SQL column type on its own - an explicit `type: "varchar"` is
+    // required here (see also Farm.cropType for the same established
+    // pattern in this codebase). Without it, the app fails to start with
+    // "DataTypeNotSupportedError: Data type \"Object\" ... is not supported".
+    @Column({ type: "varchar", nullable: true })
     district!: string | null;
 
-    @Column({ nullable: true })
+    @Column({ type: "varchar", nullable: true })
     community!: string | null;
 
-    @Column({ nullable: true })
+    @Column({ type: "varchar", nullable: true })
     address!: string | null;
 
     // One cooperative can be active in more than one commodity (a handful

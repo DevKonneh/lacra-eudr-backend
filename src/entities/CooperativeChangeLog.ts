@@ -39,15 +39,19 @@ export class CooperativeChangeLog {
     @Column({ type: "enum", enum: CooperativeChangeSource })
     source!: CooperativeChangeSource;
 
-    @Column({ nullable: true })
+    // NOTE: explicit `type: "varchar"` required on every `string | null`
+    // column below - TypeScript's reflected design type for a union type
+    // is `Object`, which TypeORM cannot map to a SQL column type on its
+    // own (it would otherwise throw DataTypeNotSupportedError at startup).
+    @Column({ type: "varchar", nullable: true })
     performedByUserId!: string | null;
 
-    @Column({ nullable: true })
+    @Column({ type: "varchar", nullable: true })
     performedByName!: string | null;
 
     // Set when source === CDA_IMPORT, linking back to the specific import
     // run that applied this change — see CooperativeImportRun.
-    @Column({ nullable: true })
+    @Column({ type: "varchar", nullable: true })
     importRunId!: string | null;
 
     @Column({ type: "text", nullable: true })
