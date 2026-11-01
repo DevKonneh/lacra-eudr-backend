@@ -42,6 +42,24 @@ export class Cooperative {
     @Column({ nullable: true })
     location!: string; // Free-text town/district, as published by CDA
 
+    // Structured fields added for the searchable registry directory.
+    // IMPORTANT: none of these are auto-derived/guessed from `location` or
+    // `name` — the source CDA letter only published the free-text
+    // `location` string above, so `district`/`community`/`address` start
+    // out null for every seeded record and stay null until an authorised
+    // staff member fills them in via the correction endpoint (see
+    // CooperativeController#correct). The registry UI must show "Not
+    // recorded" for these rather than inventing a value, per the data-
+    // quality requirement that missing information is never fabricated.
+    @Column({ nullable: true })
+    district!: string | null;
+
+    @Column({ nullable: true })
+    community!: string | null;
+
+    @Column({ nullable: true })
+    address!: string | null;
+
     // One cooperative can be active in more than one commodity (a handful
     // of real entries in the source letter are, e.g. both Cocoa and
     // Rubber) — stored as a simple string array rather than a join table

@@ -30,6 +30,9 @@ import { Inspection } from "./entities/Inspection";
 import { QualityControl } from "./entities/QualityControl";
 import { EnforcementAction } from "./entities/EnforcementAction";
 import { Cooperative } from "./entities/Cooperative";
+import { CooperativeFlag } from "./entities/CooperativeFlag";
+import { CooperativeChangeLog } from "./entities/CooperativeChangeLog";
+import { CooperativeImportRun } from "./entities/CooperativeImportRun";
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -59,7 +62,7 @@ export const AppDataSource = new DataSource({
     ssl: useSsl ? { rejectUnauthorized: false } : false,
     synchronize: true,
     logging: false,
-    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission, Application, ApplicationStatusHistory, WarehouseAssessment, Invoice, PaymentSubmission, Certificate, FarmerAuditLog, Plot, Commodity, PlotCommodity, Inspection, QualityControl, EnforcementAction, Cooperative],
+    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission, Application, ApplicationStatusHistory, WarehouseAssessment, Invoice, PaymentSubmission, Certificate, FarmerAuditLog, Plot, Commodity, PlotCommodity, Inspection, QualityControl, EnforcementAction, Cooperative, CooperativeFlag, CooperativeChangeLog, CooperativeImportRun],
     subscribers: [],
     migrations: [],
 });
