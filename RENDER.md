@@ -20,9 +20,13 @@ Go to **Render Dashboard → lacra-eudr-backend → Environment** and set every 
 
 | Variable | Value | Notes |
 |---|---|---|
-| `FRONTEND_URL` | `https://eudr.netdivs.us` | Used for CORS + QR profile links |
+| `FRONTEND_URL` | `https://lacra-admin.onrender.com` | Used for CORS + QR profile links. **Must point at the current admin panel** — if this is unset or stale, newly-created/updated farmers get a QR code baked with the wrong (or `localhost`) URL at save time (QR codes are generated once and are NOT regenerated later just because this env var changes — see "Known issue" note below). |
 | `API_BASE_URL` | `https://lacra-eudr-backend.onrender.com` | Used to build farm-scan QR code URLs — **must be the public backend URL** |
-| `CORS_EXTRA_ORIGINS` | `https://eudr.netdivs.us` | Comma-separated extra CORS origins beyond defaults |
+| `CORS_EXTRA_ORIGINS` | `https://lacra-admin.onrender.com` | Comma-separated extra CORS origins beyond defaults. Not strictly required for this origin specifically, since `src/index.ts`'s CORS allowlist already wildcard-matches any `*.onrender.com` origin — but setting it explicitly here keeps this table self-describing and covers any future custom domain. |
+
+> **Retired domain — do not use**: `eudr.netdivs.us` was the previous developer's frontend URL and is **no longer part of this system** (confirmed by the project owner, Nov 2026). It currently returns a 502 and should not be investigated, repaired, or deployed to. The current, correct production frontend is `https://lacra-admin.onrender.com`. This table previously listed `eudr.netdivs.us` as the example `FRONTEND_URL`/`CORS_EXTRA_ORIGINS` value — that has been corrected above; see git history on this file if the old reference is needed for context.
+>
+> **Known issue (found during Nov 2026 Identity Verification deployment, not yet fixed)**: every farmer record checked in production has a QR code embedding `http://localhost:5173/public/farmers/<id>` — meaning `FRONTEND_URL` was unset (or pointing at a dev URL) in production at the time these farmers were created/last QR-regenerated, predating and unrelated to the `netdivs.us` domain. `qrCode` is only generated once (`FarmerController.ts`, farmer-creation / `!farmer.qrCode` backfill paths) and is never refreshed just because `FRONTEND_URL` is corrected afterward — correcting the env var only fixes QR codes for *newly created* farmers, not existing ones. A one-off backfill script (recompute and re-save `qrCode` for every existing farmer) would be needed to fix the existing 15 records. Not performed as part of this deployment — flagging for a decision on whether/when to run it.
 | `NODE_ENV` | `production` | Enables production optimisations |
 
 ### Cloudinary (photo uploads)

@@ -103,8 +103,17 @@ app.set("trust proxy", 1);
 // Allow the known local/dev origins plus any extra origins supplied via the
 // CORS_EXTRA_ORIGINS env var (comma-separated), so the deployed frontend
 // domain can be added without another code change/redeploy of this file.
+//
+// NOTE: the current production frontend (https://lacra-admin.onrender.com)
+// does NOT need an entry here — it's already covered by the *.onrender.com
+// wildcard match below. This list previously hardcoded the PREVIOUS
+// developer's frontend domain (eudr.netdivs.us) as a default-allowed
+// origin; that domain is retired and no longer part of this system
+// (confirmed by the project owner, Nov 2026 — it now 502s and must not be
+// investigated/redeployed to), so the entry was removed rather than
+// replaced. If a non-onrender.com custom domain is adopted in the future,
+// add it here or via CORS_EXTRA_ORIGINS.
 const defaultOrigins = [
-    "https://eudr.netdivs.us",
     "http://localhost:8100",
     "http://localhost:8180",
     "http://localhost:5173",
