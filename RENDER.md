@@ -69,6 +69,18 @@ Go to **Render Dashboard → lacra-eudr-backend → Environment** and set every 
 
 ---
 
+## 1a. Feature-Specific Migrations
+
+Some features ship an explicit, reviewed SQL migration instead of relying
+on `synchronize: true` alone. **Run these before deploying the
+corresponding application code.**
+
+| Feature | Migration | Notes |
+|---|---|---|
+| Identity Verification | `migrations/2026_identity_verification/up.sql` | See `migrations/2026_identity_verification/README.md` for the full backup/run/verify/rollback procedure. Adds 4 nullable `farmer` columns + 3 `farmer_audit_log_action_enum` values. Tested idempotent against a full schema clone. |
+
+---
+
 ## 2. First Deploy Checklist
 
 After setting all env vars and deploying:
