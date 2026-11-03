@@ -137,7 +137,11 @@ confirm:
 - That the frontend queue/profile/badges/dialogs work correctly together
   in a real browser.
 
-Those are covered separately by the functional API tests (already run
-locally) and the required browser smoke test in staging (see the
-project's task list — this must be completed and reported before the
-feature is described as production-verified).
+Those are covered separately by the functional API tests and the browser
+smoke test in a local staging-like environment — both have now been
+completed (28/28 smoke checks passed; all 8 `IDENTITY_REVERIFICATION_FIELDS`
+individually confirmed to trigger the auto-revert + audit entry, not just
+`firstName`). **None of this is production verification** — see
+`DEPLOYMENT_PLAN.md` in this same folder for the live deployment steps
+and the post-deployment checks that must pass against the real production
+environment before the feature is described as production-verified.

@@ -77,7 +77,7 @@ corresponding application code.**
 
 | Feature | Migration | Notes |
 |---|---|---|
-| Identity Verification | `migrations/2026_identity_verification/up.sql` | See `migrations/2026_identity_verification/README.md` for the full backup/run/verify/rollback procedure. Adds 4 nullable `farmer` columns + 3 `farmer_audit_log_action_enum` values. Tested idempotent against a full schema clone. |
+| Identity Verification | `migrations/2026_identity_verification/up.sql` | See `migrations/2026_identity_verification/README.md` for the migration rationale/rollback, and `migrations/2026_identity_verification/DEPLOYMENT_PLAN.md` for the full ordered live deployment runbook (backup → migrate → verify → deploy code → post-deploy checks). Adds 4 nullable `farmer` columns + 3 `farmer_audit_log_action_enum` values. Tested idempotent against a full schema clone. |
 
 ---
 
