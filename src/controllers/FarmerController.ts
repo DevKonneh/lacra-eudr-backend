@@ -582,7 +582,18 @@ export class FarmerController {
             // Basic identity
             farmer.firstName = firstName ?? farmer.firstName;
             farmer.lastName = lastName ?? farmer.lastName;
-            farmer.email = email ?? farmer.email;
+            // `email` has a nullable + unique DB constraint. The edit form
+            // submits "" (never undefined) for farmers with no email, and
+            // Postgres treats "" as a normal, comparable value for a unique
+            // index (unlike NULL, which is always distinct from every other
+            // NULL) — so a second farmer saving email: "" collides with any
+            // existing row that already has email === "" and the update
+            // fails with a 500 (duplicate key value violates unique
+            // constraint). Normalise "" to null here so "no email" is
+            // represented consistently and multiple farmers without an
+            // email can coexist, same as nationalId/clientRecordId already
+            // rely on NULL (not "") for their own unique+nullable columns.
+            if (email !== undefined) farmer.email = email.trim() === "" ? null as any : email;
             farmer.phoneNumber = phoneNumber ?? farmer.phoneNumber;
             farmer.gender = gender ?? farmer.gender;
             farmer.dob = dob ? new Date(dob) : farmer.dob;
