@@ -905,6 +905,20 @@ export class FarmerController {
             const previousStatus = farmer.identityStatus;
             const isReversingVerification = previousStatus === "Verified" && status !== "Verified";
 
+            // NOTE: `farmer` above is fetched WITHOUT relations (we only need
+            // scalar columns to validate/mutate identityStatus). The response
+            // sent back to the admin panel, however, replaces the entire
+            // in-memory `farmer` object on the profile page (setFarmer(res.data.data)
+            // in FarmerProfile.tsx), which unconditionally reads farmer.farms
+            // (e.g. farmer.farms.find(...), farmer.farms.length) to render the
+            // "Registered Farms" section. Returning the relation-less farmer
+            // here previously caused farmer.farms to be undefined client-side,
+            // crashing the whole page with "Cannot read properties of
+            // undefined (reading 'find')" immediately after every successful
+            // verify/flag-conflict/revert action. Re-fetch with the same
+            // relations used by getOne() before responding, so the profile
+            // page gets a complete farmer object and keeps rendering normally.
+
             if (status === "Conflict" && !reason?.trim()) {
                 return errorResponse(res, "A reason is required when flagging a Conflict", [], 400);
             }
@@ -944,7 +958,16 @@ export class FarmerController {
             row.performedByName = requester.name;
             await this.auditLogRepository.save(row);
 
-            return successResponse(res, farmer, `Farmer identity status set to ${status}`);
+            // Re-fetch with the full relation set (see note above) so the
+            // admin panel's FarmerProfile page receives a complete farmer
+            // object, matching what getOne() returns, instead of a
+            // relation-less entity that crashes farmer.farms.find()/.map().
+            const farmerWithRelations = await this.farmerRepository.findOne({
+                where: { id: farmer.id },
+                relations: FARMER_FARM_COMMODITY_RELATIONS
+            });
+
+            return successResponse(res, farmerWithRelations ?? farmer, `Farmer identity status set to ${status}`);
         } catch (error: any) {
             console.error("Error setting farmer verification status:", error);
             return errorResponse(res, "Error setting farmer verification status", [error.message], 500);
