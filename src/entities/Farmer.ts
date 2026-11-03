@@ -122,6 +122,35 @@ export class Farmer {
     })
     identityStatus!: string;
 
+    // --- Identity verification metadata (Identity Verification feature) ---
+    // IMPORTANT: identityStatus above is ONLY ever changed via
+    // FarmerController.setVerificationStatus()/bulkSetVerificationStatus()
+    // (PATCH /farmers/:id/verification, POST /farmers/verification/bulk),
+    // both ADMIN-only. It is deliberately NOT accepted by the generic
+    // update() (PUT /farmers/:id) endpoint, which is reachable by the
+    // FARMER role — a farmer must never be able to verify their own
+    // identity. Do not re-add identityStatus handling to update().
+    //
+    // This verifies the farmer's IDENTITY only — it says nothing about
+    // whether their farm boundaries, land rights, or EUDR requirements
+    // have been validated (see Farm.geometryStatus / RiskAssessment for
+    // those, entirely separate concerns).
+    @Column({ type: "timestamp", nullable: true })
+    identityVerifiedAt!: Date | null;
+
+    @Column({ nullable: true })
+    identityVerifiedByUserId!: string;
+
+    @Column({ nullable: true })
+    identityVerifiedByName!: string;
+
+    // Most recent reason given for the CURRENT identityStatus (e.g. why a
+    // Conflict was flagged, or why a Verified status was reversed). Kept
+    // for quick display without joining the audit log; full history of
+    // every status change still lives in FarmerAuditLog.
+    @Column({ type: "text", nullable: true })
+    identityStatusReason!: string | null;
+
     @Column({ default: true })
     isActive!: boolean;
 

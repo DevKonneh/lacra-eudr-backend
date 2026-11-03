@@ -12,6 +12,12 @@ import { Farmer } from "./Farmer";
 export enum FarmerAuditAction {
     CONTACT_UPDATED = "CONTACT_UPDATED",
     FARM_ADDED = "FARM_ADDED",
+    // NOTE: IDENTITY_CONFIRMED (legacy name, distinct from the Identity
+    // Verification feature below) refers to the "Add Farm to Existing
+    // Farmer" flow's identity-confirmation screen re-confirming/updating
+    // contact details — it does NOT mean the farmer's identityStatus was
+    // set to "Verified". Kept only so historical rows using this value
+    // remain readable; new code should not emit it.
     IDENTITY_CONFIRMED = "IDENTITY_CONFIRMED",
     // Added for the multi-commodity-per-farm feature: logged whenever a
     // commodity is added, updated or deactivated on one of this farmer's
@@ -21,6 +27,25 @@ export enum FarmerAuditAction {
     COMMODITY_ADDED = "COMMODITY_ADDED",
     COMMODITY_UPDATED = "COMMODITY_UPDATED",
     COMMODITY_DEACTIVATED = "COMMODITY_DEACTIVATED",
+    // --- Identity Verification feature ---
+    // One row per farmer per status change, recording who made the
+    // decision, when (createdAt), the previous/new status (previousValue/
+    // newValue on the "identityStatus" fieldName), and the reason (notes).
+    // IDENTITY_VERIFIED: identityStatus set to "Verified".
+    // IDENTITY_CONFLICT_FLAGGED: identityStatus set to "Conflict" — an
+    //   unresolved issue (e.g. contradictory documents, suspected
+    //   duplicate identity), NOT a final rejection of the farmer.
+    // IDENTITY_REVERTED_TO_UNVERIFIED: either (a) an admin manually moved
+    //   a Verified farmer back to Unverified (reason required), or (b) a
+    //   previously-Verified farmer was automatically reverted to
+    //   Unverified because one of the identity-defining fields changed
+    //   (see IDENTITY_REVERIFICATION_FIELDS in FarmerController) — both
+    //   cases record performedByUserId (whoever made the edit/decision);
+    //   they're distinguished by the `notes` text ("Automatically
+    //   reverted: ..." prefix for case (b)).
+    IDENTITY_VERIFIED = "IDENTITY_VERIFIED",
+    IDENTITY_CONFLICT_FLAGGED = "IDENTITY_CONFLICT_FLAGGED",
+    IDENTITY_REVERTED_TO_UNVERIFIED = "IDENTITY_REVERTED_TO_UNVERIFIED",
 }
 
 @Entity()

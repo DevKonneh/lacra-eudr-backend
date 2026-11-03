@@ -33,6 +33,19 @@ const FARMER_FARM_COMMODITY_RELATIONS = ["farms", "farms.plots", "farms.plots.pl
 // screen, WITHOUT re-collecting the farmer's full personal profile.
 // Every change to one of these fields is written to FarmerAuditLog (see
 // update() below) so there is a reviewable trail of who changed what.
+// Fields that define WHO a farmer is for identity-verification purposes.
+// If any of these change on a farmer whose identityStatus is currently
+// "Verified", the verification no longer applies to the record as it now
+// stands — identityStatus is automatically reverted to "Unverified" (see
+// update() below) and an IDENTITY_REVERTED_TO_UNVERIFIED audit row is
+// written, so the record goes back through review rather than silently
+// keeping a stale "Verified" badge. idPhoto is included because it is the
+// visual evidence verification was based on, even though it's uploaded as
+// a file rather than a form field.
+const IDENTITY_REVERIFICATION_FIELDS: (keyof Farmer)[] = [
+    "firstName", "lastName", "dob", "nationalId", "idType", "idTypeOther", "otherId", "idPhoto",
+];
+
 const AUDITABLE_CONTACT_FIELDS: (keyof Farmer)[] = [
     "phoneNumber", "email", "address", "community", "district", "region", "directions",
 ];
@@ -519,7 +532,16 @@ export class FarmerController {
             cooperativeName, cooperativeId, cooperativeSource,
             enumeratorName, enumeratorId,
             directions, latitude, longitude,
-            identityStatus, consent
+            consent
+            // NOTE: identityStatus is intentionally NOT accepted here.
+            // This endpoint (PUT /farmers/:id) is reachable by the FARMER
+            // role itself (see farmer.routes.ts), so a farmer must never
+            // be able to set their own verification status through it —
+            // hiding the button client-side is not enough. Identity
+            // verification is ONLY possible via the dedicated, ADMIN-only
+            // setVerificationStatus()/bulkSetVerificationStatus() endpoints
+            // below. Any identityStatus field sent in this request body is
+            // silently ignored.
         } = req.body;
 
         try {
@@ -536,6 +558,26 @@ export class FarmerController {
             for (const field of AUDITABLE_CONTACT_FIELDS) {
                 before[field as string] = (farmer as any)[field] ?? "";
             }
+
+            // Same capture for the identity-reverification fields (see
+            // IDENTITY_REVERIFICATION_FIELDS) — used after save to decide
+            // whether a currently-"Verified" farmer must be bounced back
+            // to "Unverified" because one of their identity-defining
+            // fields just changed. Values are normalised through
+            // String(...) so Date fields (dob) compare by calendar value,
+            // not by object reference (farmer.dob = new Date(dob) always
+            // creates a fresh instance, which would otherwise look like a
+            // "change" even when the exact same date is resubmitted).
+            const normaliseIdentityValue = (value: any): string => {
+                if (value === null || value === undefined) return "";
+                if (value instanceof Date) return value.toISOString();
+                return String(value);
+            };
+            const identityBefore: Record<string, string> = {};
+            for (const field of IDENTITY_REVERIFICATION_FIELDS) {
+                identityBefore[field as string] = normaliseIdentityValue((farmer as any)[field]);
+            }
+            const wasVerifiedBeforeEdit = farmer.identityStatus === "Verified";
 
             // Basic identity
             farmer.firstName = firstName ?? farmer.firstName;
@@ -566,8 +608,6 @@ export class FarmerController {
             farmer.enumeratorName = enumeratorName ?? farmer.enumeratorName;
             farmer.enumeratorId = enumeratorId ?? farmer.enumeratorId;
 
-            // Verification
-            if (identityStatus) farmer.identityStatus = identityStatus;
             if (consent !== undefined) farmer.consent = consent === true || consent === 'true';
 
             // Optional photo re-uploads (multipart) — uploaded to Cloudinary.
@@ -582,6 +622,36 @@ export class FarmerController {
                 if (idPhotoFile) farmer.idPhoto = await uploadFileToCloudinary(idPhotoFile);
                 if (signatureFile) farmer.signature = await uploadFileToCloudinary(signatureFile);
                 if (farmSelfieFile) farmer.farmSelfie = await uploadFileToCloudinary(farmSelfieFile);
+            }
+
+            // Identity Verification safeguard: a previously-"Verified"
+            // farmer whose identity-defining details just changed can no
+            // longer be trusted to still match the identity that was
+            // actually verified — automatically bounce them back to
+            // "Unverified" so the updated record goes through review
+            // again, rather than silently keeping a stale "Verified"
+            // badge. This runs regardless of who made the edit (ADMIN,
+            // INSPECTOR, or the FARMER themselves via their own profile).
+            let identityRevertRow: FarmerAuditLog | null = null;
+            if (wasVerifiedBeforeEdit) {
+                const changedIdentityFields = IDENTITY_REVERIFICATION_FIELDS.filter(
+                    (field) => (identityBefore[field as string] ?? "") !== normaliseIdentityValue((farmer as any)[field])
+                );
+                if (changedIdentityFields.length > 0) {
+                    farmer.identityStatus = "Unverified";
+                    farmer.identityVerifiedAt = null;
+                    farmer.identityVerifiedByUserId = null as any;
+                    farmer.identityVerifiedByName = null as any;
+                    farmer.identityStatusReason = `Automatically reverted to Unverified: ${changedIdentityFields.join(", ")} changed after verification.`;
+
+                    identityRevertRow = new FarmerAuditLog();
+                    identityRevertRow.farmerId = farmer.id;
+                    identityRevertRow.action = FarmerAuditAction.IDENTITY_REVERTED_TO_UNVERIFIED;
+                    identityRevertRow.fieldName = "identityStatus";
+                    identityRevertRow.previousValue = "Verified";
+                    identityRevertRow.newValue = "Unverified";
+                    identityRevertRow.notes = farmer.identityStatusReason;
+                }
             }
 
             await this.farmerRepository.save(farmer);
@@ -605,6 +675,11 @@ export class FarmerController {
                     if (requester?.name) row.performedByName = requester.name;
                     auditRows.push(row);
                 }
+            }
+            if (identityRevertRow) {
+                if (requester?.id) identityRevertRow.performedByUserId = requester.id;
+                if (requester?.name) identityRevertRow.performedByName = requester.name;
+                auditRows.push(identityRevertRow);
             }
             if (auditRows.length > 0) {
                 await this.auditLogRepository.save(auditRows);
@@ -632,6 +707,346 @@ export class FarmerController {
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error updating farmer status", [error.message], 500);
+        }
+    }
+
+    // =====================================================================
+    // Identity Verification feature
+    //
+    // This verifies the farmer's IDENTITY ONLY — it says nothing about
+    // whether their farm boundaries, land rights, or EUDR requirements
+    // have been validated (see the Data Correction Queue / RiskAssessment
+    // for those, entirely separate concerns). Kept deliberately isolated
+    // from the generic update() endpoint: identityStatus can ONLY be
+    // changed through setVerificationStatus()/bulkSetVerificationStatus()
+    // below, both gated to ADMIN by canManageVerification() so a farmer
+    // (or an inspector) can never self-verify — see routes/farmer.routes.ts.
+    //
+    // "Data readiness" (computeDataReadiness below) is a SEPARATE concept
+    // from identityStatus: it only reflects whether the record LOOKS
+    // complete enough to review (documents present, no obviously
+    // conflicting signals). A fully "Ready for Review" record can still
+    // turn out to belong to the wrong person — readiness is a triage aid
+    // for reviewers, never a verification decision by itself.
+    // =====================================================================
+
+    /**
+     * Single authorization choke point for every identity-verification
+     * action (single + bulk). ADMIN-only today, per "Who can verify?
+     * ADMIN-only initially." Kept as one function so introducing a
+     * dedicated, more granular verification permission later (instead of
+     * a full ADMIN role) is a one-line change here rather than a
+     * multi-file refactor.
+     */
+    private canManageVerification(requester: any): boolean {
+        return requester?.role === UserRole.ADMIN;
+    }
+
+    /**
+     * Read-only triage signal for the Verification Queue — NOT the
+     * identityStatus itself. Three buckets:
+     *  - "Ready for Review": every required identity document/field is
+     *    present and nothing obviously conflicting was detected. Means
+     *    "an admin can review this quickly", NOT "this identity is
+     *    verified".
+     *  - "Missing Information": at least one required field/document is
+     *    absent. `missingFields` lists exactly what, in plain language,
+     *    so a reviewer (or the inspector who needs to go fix it) knows
+     *    precisely what's missing.
+     *  - "Potential Issue": nothing is missing, but something warrants a
+     *    closer look before approving — currently: this farmer's phone
+     *    number is shared with at least one other farmer record. This is
+     *    surfaced as "needs review", NOT auto-flagged as a duplicate,
+     *    because family members legitimately share a single phone number.
+     */
+    private computeDataReadiness(farmer: Farmer, phoneNumberCounts: Map<string, number>): {
+        readiness: "Ready for Review" | "Missing Information" | "Potential Issue";
+        missingFields: string[];
+        potentialIssues: string[];
+    } {
+        const missingFields: string[] = [];
+        if (!farmer.profilePhoto) missingFields.push("Profile photo");
+        if (!farmer.idPhoto) missingFields.push("ID photo");
+        if (!farmer.signature) missingFields.push("Signature");
+        if (!farmer.nationalId) missingFields.push("National ID number");
+        if (!farmer.phoneNumber) missingFields.push("Phone number");
+        if (!farmer.consent) missingFields.push("Recorded consent");
+
+        if (missingFields.length > 0) {
+            return { readiness: "Missing Information", missingFields, potentialIssues: [] };
+        }
+
+        const potentialIssues: string[] = [];
+        const sharedPhoneCount = farmer.phoneNumber ? (phoneNumberCounts.get(farmer.phoneNumber) ?? 0) : 0;
+        if (sharedPhoneCount > 1) {
+            potentialIssues.push(`Phone number shared with ${sharedPhoneCount - 1} other farmer record(s) — may be family members, confirm before approving.`);
+        }
+
+        if (potentialIssues.length > 0) {
+            return { readiness: "Potential Issue", missingFields: [], potentialIssues };
+        }
+
+        return { readiness: "Ready for Review", missingFields: [], potentialIssues: [] };
+    }
+
+    /**
+     * Verification Queue: every farmer whose identityStatus is NOT
+     * "Verified" (i.e. "Unverified" or "Conflict"), annotated with the
+     * data-readiness triage above so a reviewer can prioritise the
+     * straightforward, complete records instead of working strictly
+     * oldest-first. ADMIN + INSPECTOR can both view (read-only) so
+     * inspectors can see what still needs fixing on records they
+     * registered; only ADMIN can act on them (see routes).
+     */
+    async getVerificationQueue(req: Request, res: Response) {
+        try {
+            const statusFilter = (req.query.status as string) || null; // 'Unverified' | 'Conflict'
+            const readinessFilter = (req.query.readiness as string) || null;
+
+            const statuses = statusFilter ? [statusFilter] : ["Unverified", "Conflict"];
+            const farmers = await this.farmerRepository
+                .createQueryBuilder("farmer")
+                .leftJoinAndSelect("farmer.farms", "farms")
+                .where("farmer.identityStatus IN (:...statuses)", { statuses })
+                .orderBy("farmer.createdAt", "ASC")
+                .getMany();
+
+            // Build phone-number frequency map across ALL farmers (not just
+            // this queue) so a shared-number signal isn't missed just
+            // because the other matching farmer happens to already be
+            // Verified.
+            const allPhoneRows = await this.farmerRepository
+                .createQueryBuilder("farmer")
+                .select("farmer.phoneNumber", "phoneNumber")
+                .addSelect("COUNT(*)", "count")
+                .where("farmer.phoneNumber IS NOT NULL")
+                .groupBy("farmer.phoneNumber")
+                .getRawMany();
+            const phoneNumberCounts = new Map<string, number>(
+                allPhoneRows.map((r: any) => [r.phoneNumber, parseInt(r.count, 10)])
+            );
+
+            let items = farmers.map((farmer) => {
+                const { readiness, missingFields, potentialIssues } = this.computeDataReadiness(farmer, phoneNumberCounts);
+                return {
+                    id: farmer.id,
+                    farmerId: farmer.farmerId,
+                    firstName: farmer.firstName,
+                    lastName: farmer.lastName,
+                    phoneNumber: farmer.phoneNumber,
+                    nationalId: farmer.nationalId,
+                    profilePhoto: farmer.profilePhoto,
+                    community: farmer.community,
+                    district: farmer.district,
+                    region: farmer.region,
+                    farmCount: farmer.farms?.length ?? 0,
+                    identityStatus: farmer.identityStatus,
+                    identityStatusReason: farmer.identityStatusReason,
+                    identityVerifiedAt: farmer.identityVerifiedAt,
+                    createdAt: farmer.createdAt,
+                    dataReadiness: readiness,
+                    missingFields,
+                    potentialIssues,
+                };
+            });
+
+            if (readinessFilter) {
+                items = items.filter((i) => i.dataReadiness === readinessFilter);
+            }
+
+            const summary = {
+                total: items.length,
+                byStatus: {
+                    Unverified: items.filter((i) => i.identityStatus === "Unverified").length,
+                    Conflict: items.filter((i) => i.identityStatus === "Conflict").length,
+                },
+                byReadiness: {
+                    "Ready for Review": items.filter((i) => i.dataReadiness === "Ready for Review").length,
+                    "Missing Information": items.filter((i) => i.dataReadiness === "Missing Information").length,
+                    "Potential Issue": items.filter((i) => i.dataReadiness === "Potential Issue").length,
+                },
+            };
+
+            return successResponse(res, { summary, farmers: items }, "Verification queue fetched successfully");
+        } catch (error: any) {
+            console.error("Error fetching verification queue:", error);
+            return errorResponse(res, "Error fetching verification queue", [error.message], 500);
+        }
+    }
+
+    /**
+     * Sets a single farmer's identityStatus. ADMIN-only (see
+     * canManageVerification). This is the ONLY place identityStatus may
+     * be changed for a single farmer (aside from the automatic revert in
+     * update() above) — never accept it from the generic update() body.
+     *
+     * Body: { status: 'Verified' | 'Conflict' | 'Unverified', reason?: string }
+     * Reason is REQUIRED when:
+     *   - status === 'Conflict' (must explain the contradictory/suspicious signal), or
+     *   - reversing an existing 'Verified' status (status !== 'Verified' while farmer.identityStatus === 'Verified').
+     */
+    async setVerificationStatus(req: Request, res: Response) {
+        try {
+            const requester = (req as any).user;
+            if (!this.canManageVerification(requester)) {
+                return errorResponse(res, "Only an administrator can change a farmer's identity verification status", [], 403);
+            }
+
+            const { id } = req.params;
+            const { status, reason } = req.body as { status?: string; reason?: string };
+
+            if (!status || !["Verified", "Unverified", "Conflict"].includes(status)) {
+                return errorResponse(res, "status must be one of: Verified, Unverified, Conflict", [], 400);
+            }
+
+            const farmer = await this.farmerRepository.findOne({ where: { id } });
+            if (!farmer) return errorResponse(res, "Farmer not found", [], 404);
+
+            const previousStatus = farmer.identityStatus;
+            const isReversingVerification = previousStatus === "Verified" && status !== "Verified";
+
+            if (status === "Conflict" && !reason?.trim()) {
+                return errorResponse(res, "A reason is required when flagging a Conflict", [], 400);
+            }
+            if (isReversingVerification && !reason?.trim()) {
+                return errorResponse(res, "A reason is required when reversing a farmer's Verified status", [], 400);
+            }
+            if (previousStatus === status) {
+                return errorResponse(res, `Farmer is already ${status}`, [], 400);
+            }
+
+            farmer.identityStatus = status;
+            farmer.identityStatusReason = reason?.trim() || null;
+            if (status === "Verified") {
+                farmer.identityVerifiedAt = new Date();
+                farmer.identityVerifiedByUserId = requester.id;
+                farmer.identityVerifiedByName = requester.name;
+            } else {
+                farmer.identityVerifiedAt = null;
+                farmer.identityVerifiedByUserId = null as any;
+                farmer.identityVerifiedByName = null as any;
+            }
+            await this.farmerRepository.save(farmer);
+
+            const action =
+                status === "Verified" ? FarmerAuditAction.IDENTITY_VERIFIED :
+                status === "Conflict" ? FarmerAuditAction.IDENTITY_CONFLICT_FLAGGED :
+                FarmerAuditAction.IDENTITY_REVERTED_TO_UNVERIFIED;
+
+            const row = new FarmerAuditLog();
+            row.farmerId = farmer.id;
+            row.action = action;
+            row.fieldName = "identityStatus";
+            row.previousValue = previousStatus;
+            row.newValue = status;
+            row.notes = (reason?.trim() || null) as any;
+            row.performedByUserId = requester.id;
+            row.performedByName = requester.name;
+            await this.auditLogRepository.save(row);
+
+            return successResponse(res, farmer, `Farmer identity status set to ${status}`);
+        } catch (error: any) {
+            console.error("Error setting farmer verification status:", error);
+            return errorResponse(res, "Error setting farmer verification status", [error.message], 500);
+        }
+    }
+
+    /**
+     * Bulk verification: requires an explicit list of farmerIds (no
+     * "verify everyone currently filtered" implicit selection) per "Bulk
+     * verification should require explicit selection". Every selected
+     * record's eligibility and the requester's permission are checked
+     * individually server-side — the client-shown "confirmation summary"
+     * is a UX convenience only, never trusted as authorization. One
+     * audit-log row is created per farmer actually changed.
+     *
+     * Body: { farmerIds: string[], status: 'Verified' | 'Conflict', reason?: string }
+     * Only 'Verified' and 'Conflict' are supported in bulk (reverting to
+     * Unverified is a single-farmer, always-reasoned action via
+     * setVerificationStatus — not something to do in bulk).
+     * `reason` is REQUIRED when status === 'Conflict', applied identically
+     * to every selected farmer in this batch.
+     */
+    async bulkSetVerificationStatus(req: Request, res: Response) {
+        try {
+            const requester = (req as any).user;
+            if (!this.canManageVerification(requester)) {
+                return errorResponse(res, "Only an administrator can change a farmer's identity verification status", [], 403);
+            }
+
+            const { farmerIds, status, reason } = req.body as { farmerIds?: string[]; status?: string; reason?: string };
+
+            if (!Array.isArray(farmerIds) || farmerIds.length === 0) {
+                return errorResponse(res, "farmerIds must be a non-empty array — bulk verification requires explicit selection", [], 400);
+            }
+            if (!status || !["Verified", "Conflict"].includes(status)) {
+                return errorResponse(res, "status must be one of: Verified, Conflict for bulk actions", [], 400);
+            }
+            if (status === "Conflict" && !reason?.trim()) {
+                return errorResponse(res, "A reason is required when flagging Conflict in bulk", [], 400);
+            }
+
+            const farmers = await this.farmerRepository.find({ where: { id: In(farmerIds) } });
+            const foundIds = new Set(farmers.map((f) => f.id));
+
+            const results: { farmerId: string; success: boolean; message: string }[] = [];
+            const auditRows: FarmerAuditLog[] = [];
+            const toSave: Farmer[] = [];
+
+            for (const requestedId of farmerIds) {
+                const farmer = farmers.find((f) => f.id === requestedId);
+                if (!farmer) {
+                    results.push({ farmerId: requestedId, success: false, message: "Farmer not found" });
+                    continue;
+                }
+                if (farmer.identityStatus === status) {
+                    results.push({ farmerId: requestedId, success: false, message: `Already ${status}` });
+                    continue;
+                }
+
+                const previousStatus = farmer.identityStatus;
+                farmer.identityStatus = status;
+                farmer.identityStatusReason = reason?.trim() || null;
+                if (status === "Verified") {
+                    farmer.identityVerifiedAt = new Date();
+                    farmer.identityVerifiedByUserId = requester.id;
+                    farmer.identityVerifiedByName = requester.name;
+                }
+                toSave.push(farmer);
+
+                const row = new FarmerAuditLog();
+                row.farmerId = farmer.id;
+                row.action = status === "Verified" ? FarmerAuditAction.IDENTITY_VERIFIED : FarmerAuditAction.IDENTITY_CONFLICT_FLAGGED;
+                row.fieldName = "identityStatus";
+                row.previousValue = previousStatus;
+                row.newValue = status;
+                row.notes = (reason?.trim() || null) as any;
+                row.performedByUserId = requester.id;
+                row.performedByName = requester.name;
+                auditRows.push(row);
+
+                results.push({ farmerId: requestedId, success: true, message: `Set to ${status}` });
+            }
+
+            if (toSave.length > 0) await this.farmerRepository.save(toSave);
+            if (auditRows.length > 0) await this.auditLogRepository.save(auditRows);
+
+            const unknownIds = farmerIds.filter((fid) => !foundIds.has(fid));
+            for (const unknownId of unknownIds) {
+                if (!results.find((r) => r.farmerId === unknownId)) {
+                    results.push({ farmerId: unknownId, success: false, message: "Farmer not found" });
+                }
+            }
+
+            const successCount = results.filter((r) => r.success).length;
+            return successResponse(
+                res,
+                { successCount, failureCount: results.length - successCount, results },
+                `${successCount} of ${farmerIds.length} farmer(s) set to ${status}`
+            );
+        } catch (error: any) {
+            console.error("Error in bulk verification status update:", error);
+            return errorResponse(res, "Error in bulk verification status update", [error.message], 500);
         }
     }
 
