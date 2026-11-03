@@ -17,6 +17,7 @@ router.post("/", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), upload.an
 router.post("/offline-sync", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.offlineSync(req, res));
 router.put("/:id", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), upload.any(), (req, res) => controller.update(req, res));
 router.patch("/:id/status", authMiddleware([UserRole.ADMIN]), (req, res) => controller.setActiveStatus(req, res));
+router.delete("/:id", authMiddleware([UserRole.ADMIN]), (req, res) => controller.delete(req, res));
 router.post("/maintenance/backfill-farmer-ids", authMiddleware([UserRole.ADMIN]), (req, res) => controller.backfillFarmerIds(req, res));
 
 export default router;

@@ -1,18 +1,25 @@
 import { Request, Response } from "express";
-import { Brackets } from "typeorm";
+import { Brackets, In } from "typeorm";
 import { AppDataSource } from "../data-source";
 import { Farmer } from "../entities/Farmer";
 import { Farm } from "../entities/Farm";
 import { Plot } from "../entities/Plot";
 import { User, UserRole } from "../entities/User";
 import { FarmerAuditLog, FarmerAuditAction } from "../entities/FarmerAuditLog";
+import { FarmDocument } from "../entities/FarmDocument";
+import { RiskAssessment } from "../entities/RiskAssessment";
+import { SatelliteAlert } from "../entities/SatelliteAlert";
+import { Inspection } from "../entities/Inspection";
+import { Transfer } from "../entities/Transfer";
+import { Batch } from "../entities/Batch";
+import { OfflineSubmission } from "../entities/OfflineSubmission";
 import QRCode from 'qrcode';
 import bcrypt from 'bcryptjs';
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary, uploadFilesToCloudinary } from "../utils/cloudUpload";
 import { getGeoIdService, GeoIdService } from "../services/GeoIdService";
 import { buildPlotsForFarm, deriveLegacyCropType, CommodityInput } from "../services/CommodityService";
-import { CommodityRole, CroppingSystem } from "../entities/PlotCommodity";
+import { CommodityRole, CroppingSystem, PlotCommodity } from "../entities/PlotCommodity";
 import { validateAndAnnotateFarm, assertGeometryNotBlocking } from "../services/FarmGeometryHelper";
 
 // Relations needed whenever a Farmer response should include each farm's
@@ -625,6 +632,205 @@ export class FarmerController {
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error updating farmer status", [error.message], 500);
+        }
+    }
+
+    /**
+     * Permanently deletes a single farmer and every record that belongs to
+     * them — their farm(s), plots/plot-commodities (cascade via DB-level
+     * FK constraints), farm documents, risk assessments, satellite alerts,
+     * farmer audit log, and their own FARMER-role login account (if any).
+     * Dependent records that are NOT owned by the farmer (Inspection,
+     * Transfer, Batch) are cleaned up WITHOUT being destroyed themselves:
+     * - Inspection.farmId is nulled (the inspection record itself is kept
+     *   as its own auditable history, same as the global reset endpoint).
+     * - Transfer rows that reference this farmer or one of their
+     *   farms/plots/plot-commodities as the SOURCE are deleted (the
+     *   transfer record only has meaning in relation to that source).
+     * - This farmer is removed from any Batch.farmers many-to-many link
+     *   (the batch itself is preserved).
+     * - Any OfflineSubmission shadow record already synced to this farmer
+     *   is deleted (it's pure historical clutter once the real farmer is
+     *   gone and is not FK-constrained to it anyway).
+     *
+     * This is a single admin-only, transactional, irreversible operation
+     * scoped to ONE farmerId — modelled directly on
+     * AdminMaintenanceController.resetFarmerFarmData()'s proven cascade
+     * pattern, but scoped down instead of wiping every farmer.
+     */
+    async delete(req: Request, res: Response) {
+        const { id } = req.params;
+
+        const queryRunner = AppDataSource.createQueryRunner();
+        await queryRunner.connect();
+        await queryRunner.startTransaction();
+
+        try {
+            const manager = queryRunner.manager;
+
+            const farmer = await manager.findOne(Farmer, {
+                where: { id },
+                relations: ["farms"],
+            });
+            if (!farmer) {
+                await queryRunner.rollbackTransaction();
+                return errorResponse(res, "Farmer not found", [], 404);
+            }
+
+            const farmIds = (farmer.farms || []).map((f) => f.id);
+            const farmsDeleted = farmIds.length;
+
+            if (farmIds.length > 0) {
+                // 1. Records that reference this farmer's Farm(s) directly
+                // (Plot/PlotCommodity cascade automatically via DB-level
+                // onDelete: "CASCADE" once the Farm rows are deleted below).
+                await manager
+                    .createQueryBuilder()
+                    .delete()
+                    .from(FarmDocument)
+                    .where("farmId IN (:...farmIds)", { farmIds })
+                    .execute();
+
+                await manager
+                    .createQueryBuilder()
+                    .delete()
+                    .from(RiskAssessment)
+                    .where("farmId IN (:...farmIds)", { farmIds })
+                    .execute();
+
+                await manager
+                    .createQueryBuilder()
+                    .delete()
+                    .from(SatelliteAlert)
+                    .where("farmId IN (:...farmIds)", { farmIds })
+                    .execute();
+
+                // Inspection.farm is nullable — clear the link rather than
+                // deleting the inspection record itself (an inspection is
+                // its own auditable record, not owned by the farm).
+                await manager
+                    .createQueryBuilder()
+                    .update(Inspection)
+                    .set({ farm: undefined as any })
+                    .where("farmId IN (:...farmIds)", { farmIds })
+                    .execute();
+
+                // Collect this farmer's plot/plot-commodity ids BEFORE the
+                // farms (and their cascaded plots) are deleted, so Transfer
+                // rows sourced from them can be cleaned up too.
+                const plots = await manager.find(Plot, { where: { farmId: In(farmIds) } });
+                const plotIds = plots.map((p) => p.id);
+                const plotCommodities = plotIds.length > 0
+                    ? await manager.find(PlotCommodity, { where: { plotId: In(plotIds) } })
+                    : [];
+                const plotCommodityIds = plotCommodities.map((pc) => pc.id);
+
+                const transferDeleteQb = manager
+                    .createQueryBuilder()
+                    .delete()
+                    .from(Transfer)
+                    .where("fromFarmerId = :farmerId", { farmerId: id })
+                    .orWhere("sourceFarmId IN (:...farmIds)", { farmIds });
+                if (plotIds.length > 0) {
+                    transferDeleteQb.orWhere("sourcePlotId IN (:...plotIds)", { plotIds });
+                }
+                if (plotCommodityIds.length > 0) {
+                    transferDeleteQb.orWhere("sourcePlotCommodityId IN (:...plotCommodityIds)", { plotCommodityIds });
+                }
+                await transferDeleteQb.execute();
+            } else {
+                // No farms, but the farmer could still be directly
+                // referenced as a Transfer source.
+                await manager
+                    .createQueryBuilder()
+                    .delete()
+                    .from(Transfer)
+                    .where("fromFarmerId = :farmerId", { farmerId: id })
+                    .execute();
+            }
+
+            // Remove this farmer from any Batch <-> Farmer many-to-many
+            // link, without deleting the batch itself.
+            const batches = await manager
+                .createQueryBuilder(Batch, "batch")
+                .innerJoin("batch.farmers", "farmer", "farmer.id = :farmerId", { farmerId: id })
+                .getMany();
+            for (const batchId of batches.map((b) => b.id)) {
+                const batch = await manager.findOne(Batch, { where: { id: batchId }, relations: ["farmers"] });
+                if (batch) {
+                    batch.farmers = (batch.farmers || []).filter((f) => f.id !== id);
+                    await manager.save(Batch, batch);
+                }
+            }
+
+            // Pure historical clutter once the real farmer is gone — not
+            // FK-constrained (syncedFarmerId is a plain string column).
+            await manager
+                .createQueryBuilder()
+                .delete()
+                .from(OfflineSubmission)
+                .where("syncedFarmerId = :farmerId", { farmerId: id })
+                .execute();
+
+            // Delete the farmer's farm(s) — Plot/PlotCommodity cascade
+            // automatically via DB-level onDelete: "CASCADE".
+            if (farmIds.length > 0) {
+                await manager
+                    .createQueryBuilder()
+                    .delete()
+                    .from(Farm)
+                    .where("id IN (:...farmIds)", { farmIds })
+                    .execute();
+            }
+
+            // FarmerAuditLog cascades automatically via DB-level
+            // onDelete: "CASCADE" on Farmer, but delete explicitly first
+            // for clarity/defensiveness regardless of constraint timing.
+            await manager
+                .createQueryBuilder()
+                .delete()
+                .from(FarmerAuditLog)
+                .where("farmerId = :farmerId", { farmerId: id })
+                .execute();
+
+            // Capture the linked User id BEFORE deleting the farmer (the FK
+            // from Farmer -> User is on the Farmer side via userId).
+            const linkedUserId = farmer.userId;
+
+            await manager
+                .createQueryBuilder()
+                .delete()
+                .from(Farmer)
+                .where("id = :id", { id })
+                .execute();
+
+            // Delete the farmer's own FARMER-role login account (never
+            // touches ADMIN/INSPECTOR/BUYER/EXPORTER accounts).
+            let userAccountDeleted = false;
+            if (linkedUserId) {
+                const result = await manager
+                    .createQueryBuilder()
+                    .delete()
+                    .from(User)
+                    .where("id = :userId", { userId: linkedUserId })
+                    .andWhere("role = :role", { role: UserRole.FARMER })
+                    .execute();
+                userAccountDeleted = (result.affected || 0) > 0;
+            }
+
+            await queryRunner.commitTransaction();
+
+            return successResponse(
+                res,
+                { deleted: true, farmsDeleted, userAccountDeleted },
+                "Farmer deleted successfully"
+            );
+        } catch (error: any) {
+            await queryRunner.rollbackTransaction();
+            console.error("Error deleting farmer:", error);
+            return errorResponse(res, "Error deleting farmer — no changes were made", [error.message], 500);
+        } finally {
+            await queryRunner.release();
         }
     }
 
