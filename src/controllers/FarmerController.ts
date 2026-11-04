@@ -1283,6 +1283,33 @@ export class FarmerController {
         }
     }
 
+    /**
+     * GET /api/public/farmers/:id — the endpoint every farmer QR code
+     * resolves to. Reachable by anyone who scans a card/QR, with NO
+     * authentication required (optionalAuthMiddleware on the route — see
+     * public.routes.ts), so this must never return sensitive PII unless
+     * the caller presents a valid staff JWT.
+     *
+     * Two response shapes, selected by whether `req.user` was populated:
+     *
+     *  - ANONYMOUS (no token / invalid-expired token): "basic verification"
+     *    view only — name, Farmer ID, identity status, general area
+     *    (community/district/region), farm name/crop/registration status,
+     *    and a privacy-reduced farm location (centroid point only, not the
+     *    full walked boundary polygon). Confirms "this Farmer ID / card is
+     *    real and belongs to this person" without exposing anything an
+     *    anonymous scanner could misuse (ID photo, signature, consent
+     *    evidence, phone, national ID, DOB, exact farm boundary, etc.).
+     *
+     *  - AUTHENTICATED STAFF (ADMIN / INSPECTOR / BUYER / EXPORTER token):
+     *    full profile, unchanged from the previous behaviour — same shape
+     *    already relied on by FarmerProfile.tsx / ExportController, so no
+     *    internal workflow breaks.
+     *
+     * Route is also wrapped in generalPublicLimiter (rate limiting) — see
+     * public.routes.ts — as a second layer of abuse protection regardless
+     * of auth status.
+     */
     async getPublicFarmer(req: Request, res: Response) {
         try {
             const { id } = req.params;
@@ -1295,7 +1322,54 @@ export class FarmerController {
                 return res.status(404).json({ message: "Farmer not found" });
             }
 
-            // Return ALL fields as requested
+            const requester = (req as any).user;
+            const isAuthorizedStaff = !!requester && [
+                UserRole.ADMIN,
+                UserRole.INSPECTOR,
+                UserRole.BUYER,
+                UserRole.EXPORTER,
+            ].includes(requester.role);
+
+            if (!isAuthorizedStaff) {
+                // ── ANONYMOUS / BASIC VERIFICATION VIEW ────────────────────────
+                // No identity-document photos, no consent evidence, no contact
+                // details, no national ID / DOB / exact address, and no precise
+                // farm boundary geometry — only what's needed to confirm the
+                // card/QR corresponds to a real, registered farmer.
+                const basicData = {
+                    id: farmer.id,
+                    farmerId: farmer.farmerId,
+                    firstName: farmer.firstName,
+                    lastName: farmer.lastName,
+                    identityStatus: farmer.identityStatus,
+                    community: farmer.community,
+                    district: farmer.district,
+                    region: farmer.region,
+                    cooperativeName: farmer.cooperativeName,
+                    // Profile photo helps a human visually match the card to the
+                    // person in front of them — treated as basic verification
+                    // info, unlike the ID-document photo/signature below.
+                    profilePhoto: farmer.profilePhoto,
+                    farms: farmer.farms.map(f => {
+                        const geometry = GeoIdService.normaliseGeometry(f.location);
+                        const centroid = geometry ? GeoIdService.centroidFromGeometry(geometry) : null;
+                        return {
+                            name: f.name,
+                            cropType: f.cropType,
+                            farmRegistrationStatus: f.farmRegistrationStatus,
+                            // Centroid point only — NOT the full walked boundary
+                            // polygon, which is precise-enough to pinpoint the
+                            // farm's exact footprint and is reserved for
+                            // authorized staff.
+                            approximateLocation: centroid,
+                        };
+                    }),
+                    _access: "basic", // lets the frontend distinguish the two shapes without guessing from field presence
+                };
+                return successResponse(res, basicData);
+            }
+
+            // ── AUTHENTICATED STAFF / FULL VIEW (unchanged) ──────────────────
             const publicData = {
                 id: farmer.id,
                 farmerId: farmer.farmerId,
@@ -1358,8 +1432,9 @@ export class FarmerController {
                             estimatedAnnualProduction: pc.estimatedAnnualProduction,
                             unitOfMeasurement: pc.unitOfMeasurement,
                         }))
-                    }))
-                }))
+                    })),
+                })),
+                _access: "full",
             };
 
             return successResponse(res, publicData);
