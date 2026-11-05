@@ -30,11 +30,14 @@ import { successResponse, errorResponse } from "../utils/response";
  *                           legacy farm.cropType column, so it works
  *                           whether or not a farm has been migrated.
  *   gender                - Farmer.gender (Male/Female/Other).
- *   complianceStatus      - "Compliant" | "Needs Review" | "High Risk"
- *                           mapped onto Farm.riskLevel + geometryStatus
- *                           using the EXACT SAME rule as compliantFarms
+ *   complianceStatus      - "Assessment Pending" | "Compliant" | "Needs Review" | "High Risk"
+ *                           mapped onto Farm.lastRiskAssessmentDate +
+ *                           riskLevel + geometryStatus using the EXACT
+ *                           SAME rule as compliantFarms/assessmentPendingFarms
  *                           below, so a filtered count always matches an
  *                           unfiltered one restricted to that bucket.
+ *                           "Compliant" here means "Assessed Low Risk,
+ *                           Valid Geometry" - see complianceStatusWhereSql().
  *   verificationStatus    - Farmer.identityStatus (Verified/Unverified/Conflict).
  */
 interface DashboardFilters {
@@ -70,20 +73,51 @@ function readFilters(req: Request): DashboardFilters {
 // SINGLE authoritative mapping used both to COUNT each bucket for the
 // dashboard's risk-distribution pie AND to FILTER farms/farmers when a
 // bucket's number or pie-slice is clicked, so the two can never disagree.
-//   Compliant:    riskLevel = Low   AND geometryStatus = Valid
-//   Needs Review: riskLevel = Medium, OR (riskLevel = Low but geometry
-//                 is not yet Valid - i.e. compliance can't be certified)
-//   High Risk:    riskLevel = High
+// IMPORTANT: `riskLevel` is a NON-NULLABLE column that defaults to "Low"
+// at the database level (see Farm entity), and FarmController never sets
+// it explicitly at creation time. That means a brand-new farm that has
+// NEVER been through RiskService.analyzeFarm() still reads riskLevel ===
+// "Low" even though no assessment has actually happened - the ONLY
+// reliable signal that a farm has completed a risk assessment is
+// `lastRiskAssessmentDate IS NOT NULL` (set exclusively, and always
+// together with riskLevel, inside RiskService.analyzeFarm()). Without
+// accounting for this, a never-assessed farm with a (coincidentally/
+// defaulted) valid geometry would be silently counted as "Compliant",
+// treating a missing assessment as a successful one.
+//
+//   Assessment Pending:               lastRiskAssessmentDate IS NULL
+//                                     (assessment not yet completed -
+//                                     riskLevel/geometryStatus are not
+//                                     meaningful for this farm yet)
+//   Compliant ("Assessed Low Risk,
+//   Valid Geometry"):                 lastRiskAssessmentDate IS NOT NULL
+//                                     AND riskLevel = Low AND
+//                                     geometryStatus = Valid
+//   Needs Review:                     lastRiskAssessmentDate IS NOT NULL
+//                                     AND (riskLevel = Medium, OR
+//                                     (riskLevel = Low but geometry is
+//                                     not yet Valid))
+//   High Risk:                        lastRiskAssessmentDate IS NOT NULL
+//                                     AND riskLevel = High
+//
+// These four buckets are mutually exclusive and exhaustive: every farm
+// falls into exactly one, so they always sum to totalFarms.
 function complianceStatusWhereSql(alias: string, status: string): { sql: string; params: Record<string, any> } {
+    if (status === "Assessment Pending") {
+        return { sql: `${alias}.lastRiskAssessmentDate IS NULL`, params: {} };
+    }
     if (status === "Compliant") {
-        return { sql: `${alias}.riskLevel = :cs_low AND ${alias}.geometryStatus = :cs_valid`, params: { cs_low: "Low", cs_valid: "Valid" } };
+        return {
+            sql: `${alias}.lastRiskAssessmentDate IS NOT NULL AND ${alias}.riskLevel = :cs_low AND ${alias}.geometryStatus = :cs_valid`,
+            params: { cs_low: "Low", cs_valid: "Valid" },
+        };
     }
     if (status === "High Risk") {
-        return { sql: `${alias}.riskLevel = :cs_high`, params: { cs_high: "High" } };
+        return { sql: `${alias}.lastRiskAssessmentDate IS NOT NULL AND ${alias}.riskLevel = :cs_high`, params: { cs_high: "High" } };
     }
     // "Needs Review" (default / anything else recognized)
     return {
-        sql: `(${alias}.riskLevel = :cs_medium OR (${alias}.riskLevel = :cs_low2 AND ${alias}.geometryStatus != :cs_valid2))`,
+        sql: `${alias}.lastRiskAssessmentDate IS NOT NULL AND (${alias}.riskLevel = :cs_medium OR (${alias}.riskLevel = :cs_low2 AND ${alias}.geometryStatus != :cs_valid2))`,
         params: { cs_medium: "Medium", cs_low2: "Low", cs_valid2: "Valid" },
     };
 }
@@ -206,19 +240,39 @@ export class ReportsController {
                 .andWhere("farm.geometryStatus IN (:...needsCorrection)", { needsCorrection: ["Invalid", "Needs Review", "Missing"] })
                 .getCount();
 
+            // "Assessment Pending": farms that have NEVER completed a risk
+            // assessment (lastRiskAssessmentDate IS NULL). Reported as its
+            // own bucket/metric - never silently folded into "Compliant" or
+            // "Needs Review".
+            const assessmentPendingFarms = await this.farmQuery(filters)
+                .andWhere("farm.lastRiskAssessmentDate IS NULL")
+                .getCount();
+            const assessedFarms = totalFarms - assessmentPendingFarms;
+
+            // "Compliant" ("Assessed Low Risk, Valid Geometry") now REQUIRES a
+            // completed assessment in addition to Low risk + Valid geometry,
+            // so a never-assessed farm can never be counted here.
             const compliantFarms = await this.farmQuery(filters)
-                .andWhere("farm.riskLevel = :low AND farm.geometryStatus = :valid2", { low: "Low", valid2: "Valid" })
+                .andWhere("farm.lastRiskAssessmentDate IS NOT NULL AND farm.riskLevel = :low AND farm.geometryStatus = :valid2", { low: "Low", valid2: "Valid" })
                 .getCount();
             const mediumRiskFarms = await this.farmQuery(filters)
-                .andWhere("(farm.riskLevel = :medium OR (farm.riskLevel = :low3 AND farm.geometryStatus != :valid3))", { medium: "Medium", low3: "Low", valid3: "Valid" })
+                .andWhere("farm.lastRiskAssessmentDate IS NOT NULL AND (farm.riskLevel = :medium OR (farm.riskLevel = :low3 AND farm.geometryStatus != :valid3))", { medium: "Medium", low3: "Low", valid3: "Valid" })
                 .getCount();
             const highRiskFarms = await this.farmQuery(filters)
-                .andWhere("farm.riskLevel = :high", { high: "High" })
+                .andWhere("farm.lastRiskAssessmentDate IS NOT NULL AND farm.riskLevel = :high", { high: "High" })
                 .getCount();
 
             // Avoid division by zero; compliance % is ALWAYS reported
             // separately from verification/geometry rates (never blended).
+            // complianceRate's denominator is ALL REGISTERED FARMS (totalFarms)
+            // - that is, it is NOT scoped to assessed farms only, so a low
+            // complianceRate can mean either "many farms failed assessment"
+            // OR "many farms haven't been assessed yet". assessmentCoverageRate
+            // (below) exists precisely to disambiguate between those two
+            // cases and MUST always be shown alongside complianceRate, never
+            // blended into it.
             const complianceRate = totalFarms > 0 ? (compliantFarms / totalFarms) * 100 : 0;
+            const assessmentCoverageRate = totalFarms > 0 ? (assessedFarms / totalFarms) * 100 : 0;
             const verifiedFarmerRate = totalFarmers > 0 ? (verifiedFarmers / totalFarmers) * 100 : 0;
             const geometryValidRate = totalFarms > 0 ? (farmsWithValidPolygons / totalFarms) * 100 : 0;
 
@@ -388,10 +442,20 @@ export class ReportsController {
                 geometryValidRate: parseFloat(geometryValidRate.toFixed(1)),
 
                 // Compliance / risk indicators (kept SEPARATE from verification/geometry rates)
+                // compliantFarms = "Assessed Low Risk, Valid Geometry": a completed
+                // assessment AND riskLevel='Low' AND geometryStatus='Valid'.
+                // complianceRate's denominator is ALL REGISTERED FARMS (totalFarms) -
+                // label it as such in the UI. assessmentPendingFarms/assessedFarms/
+                // assessmentCoverageRate are SEPARATE metrics about whether a farm
+                // has been assessed at all, regardless of the result.
                 compliantFarms,
                 mediumRiskFarms,
                 highRiskFarms,
                 complianceRate: parseFloat(complianceRate.toFixed(1)),
+                complianceDenominatorLabel: "All registered farms",
+                assessmentPendingFarms,
+                assessedFarms,
+                assessmentCoverageRate: parseFloat(assessmentCoverageRate.toFixed(1)),
 
                 // Legacy aliases (kept so any not-yet-updated caller of this
                 // endpoint doesn't break): activeRisks === highRiskFarms,
@@ -494,18 +558,41 @@ export class ReportsController {
         try {
             const filters = readFilters(req);
             const totalFarms = await this.farmQuery(filters).getCount();
+
+            // "Assessed Low Risk, Valid Geometry" now REQUIRES a completed
+            // assessment (lastRiskAssessmentDate IS NOT NULL) in addition to
+            // riskLevel='Low' AND geometryStatus='Valid'. This excludes
+            // never-assessed farms, which previously could be silently
+            // counted here due to riskLevel's non-nullable DB default of
+            // "Low".
             const compliantFarms = await this.farmQuery(filters)
-                .andWhere("farm.riskLevel = :low AND farm.geometryStatus = :valid", { low: "Low", valid: "Valid" })
+                .andWhere("farm.lastRiskAssessmentDate IS NOT NULL AND farm.riskLevel = :low AND farm.geometryStatus = :valid", { low: "Low", valid: "Valid" })
                 .getCount();
+
+            // "Assessment Pending": farms with no completed risk assessment
+            // at all - a SEPARATE metric from compliance, never blended in.
+            const assessmentPendingFarms = await this.farmQuery(filters)
+                .andWhere("farm.lastRiskAssessmentDate IS NULL")
+                .getCount();
+            const assessedFarms = totalFarms - assessmentPendingFarms;
+
             const nonCompliantFarms = totalFarms - compliantFarms;
             const complianceRate = totalFarms > 0 ? (compliantFarms / totalFarms) * 100 : 0;
+            const assessmentCoverageRate = totalFarms > 0 ? (assessedFarms / totalFarms) * 100 : 0;
 
             return successResponse(res, {
-                rule: "A farm is Compliant only if riskLevel = 'Low' AND geometryStatus = 'Valid'. Any farm with Medium/High risk, or with an Invalid/Needs Review/Missing GPS boundary, is excluded from the numerator even if its risk assessment alone shows Low.",
+                rule: "A farm is counted as 'Assessed Low Risk, Valid Geometry' only if it has (1) a COMPLETED risk assessment (lastRiskAssessmentDate is set), (2) a Low risk result, AND (3) a Valid GPS boundary (geometryStatus = 'Valid'). A farm with no completed assessment is counted separately as 'Assessment Pending' and is NEVER included in the compliant numerator, even if its (unassessed, database-defaulted) riskLevel happens to read 'Low'. Any assessed farm with Medium/High risk, or an Invalid/Needs Review/Missing GPS boundary, is also excluded from the numerator.",
                 numerator: compliantFarms,
                 denominator: totalFarms,
+                denominatorLabel: "All registered farms",
                 nonCompliantFarms,
                 complianceRate: parseFloat(complianceRate.toFixed(1)),
+                // Separate, non-blended metric: how many farms have been
+                // assessed at all (regardless of result), out of all
+                // registered farms.
+                assessmentPendingFarms,
+                assessedFarms,
+                assessmentCoverageRate: parseFloat(assessmentCoverageRate.toFixed(1)),
                 filtersApplied: filters,
             });
         } catch (error: any) {
