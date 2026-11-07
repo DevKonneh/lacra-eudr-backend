@@ -2,6 +2,7 @@ import { Router } from "express";
 import { FarmerController } from "../controllers/FarmerController";
 import { BatchController } from "../controllers/BatchController";
 import { FarmScanController } from "../controllers/FarmScanController";
+import { PermitVerificationController } from "../controllers/PermitVerificationController";
 import { optionalAuthMiddleware } from "../middleware/auth.middleware";
 import {
     farmScanLimiter,
@@ -13,6 +14,7 @@ const router = Router();
 const farmerController = new FarmerController();
 const batchController = new BatchController();
 const farmScanController = new FarmScanController();
+const permitVerificationController = new PermitVerificationController();
 
 // ── Farmer profile (QR-code / card verification target) ─────────────────────
 // This is what every farmer's QR code and printed card resolve to, and it
@@ -27,6 +29,13 @@ router.get("/farmers/:id", generalPublicLimiter, optionalAuthMiddleware(), (req,
 
 // ── Batch (public supply-chain view) ────────────────────────────────────────
 router.get("/batches/:id", generalPublicLimiter, (req, res) => batchController.getPublicBatch(req, res));
+
+// ── Local Produce Buyer permit verification (QR code resolver) ──────────────
+// This is what every Local Produce Buyer permit's printed/downloadable QR
+// code resolves to. No login required, returns only the approved field
+// whitelist (buyer name, county, permit number, issue/expiry date, live
+// status) — see PermitVerificationController + PermitVerificationService.
+router.get("/permits/verify/:token", generalPublicLimiter, (req, res) => permitVerificationController.verifyByToken(req, res));
 
 // ── Farm Scan (QR code resolver) ─────────────────────────────────────────────
 // These are the endpoints the farm QR code resolves to.

@@ -189,6 +189,7 @@ import soilRoutes from "./routes/soil.routes";
 import cooperativeRoutes from "./routes/cooperative.routes";
 import fieldEventRoutes from "./routes/fieldEvent.routes";
 import monitoringRoutes from "./routes/monitoring.routes";
+import localProduceBuyerRoutes from "./routes/localProduceBuyer.routes";
 
 app.use("/api/public", publicRoutes);
 app.use("/api/business", businessRoutes);
@@ -219,6 +220,7 @@ app.use("/api/soil", soilRoutes);
 app.use("/api/cooperatives", cooperativeRoutes);
 app.use("/api/field-events", fieldEventRoutes);
 app.use("/api/monitoring", monitoringRoutes);
+app.use("/api/local-produce-buyers", localProduceBuyerRoutes);
 
 import { errorHandler } from "./middleware/error.middleware";
 app.use(errorHandler);
