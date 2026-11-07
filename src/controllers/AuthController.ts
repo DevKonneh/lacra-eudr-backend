@@ -16,11 +16,39 @@ import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary, uploadFilesToCloudinary } from "../utils/cloudUpload";
 import QRCode from "qrcode";
 import { UserAuditLog, UserAuditAction } from "../entities/UserAuditLog";
+import { SignInAttempt, SignInOutcome } from "../entities/SignInAttempt";
+import { detectPlatform } from "../utils/platformDetector";
+import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
 
 export class AuthController {
     private userRepository = AppDataSource.getRepository(User);
     private emailService = new EmailService();
     private userAuditLogRepository = AppDataSource.getRepository(UserAuditLog);
+    private signInAttemptRepository = AppDataSource.getRepository(SignInAttempt);
+
+    // Best-effort: records one row to SignInAttempt. Never throws - a
+    // logging failure must never block or fail an actual login/login
+    // rejection, matching the existing best-effort pattern already used
+    // for the UserAuditLog LOGIN write below.
+    private async recordSignInAttempt(params: {
+        userId: string | null;
+        outcome: SignInOutcome;
+        reason: string | null;
+        platform: string | null;
+    }) {
+        try {
+            await this.signInAttemptRepository.save(
+                this.signInAttemptRepository.create({
+                    userId: params.userId,
+                    outcome: params.outcome,
+                    reason: params.reason,
+                    platform: params.platform,
+                })
+            );
+        } catch (logError) {
+            console.error("Failed to record sign-in attempt", logError);
+        }
+    }
 
     async register(req: Request, res: Response) {
         try {
@@ -49,22 +77,48 @@ export class AuthController {
 
     async login(req: Request, res: Response) {
         try {
-            const { email, password } = req.body;
+            const { email, password, platform: explicitPlatform } = req.body;
+            const platform = detectPlatform(explicitPlatform, req.headers["user-agent"]);
 
             const user = await this.userRepository.findOne({
                 where: { email },
                 relations: ["assignedRole"]
             });
             if (!user) {
+                // Unknown email: per the explicit privacy requirement, the
+                // raw email string typed is NEVER stored here (no userId to
+                // link it to, and we don't want a permanent record of
+                // whatever a stranger/typo typed).
+                await this.recordSignInAttempt({
+                    userId: null,
+                    outcome: SignInOutcome.FAILED,
+                    reason: "No account found for this email",
+                    platform,
+                });
                 return errorResponse(res, "Invalid credentials", [], 401);
             }
 
             if (user.status !== UserStatus.ACTIVE) {
+                // Account exists but cannot sign in right now (PENDING /
+                // SUSPENDED / REJECTED) - this is the "blocked" outcome,
+                // distinct from a wrong password.
+                await this.recordSignInAttempt({
+                    userId: user.id,
+                    outcome: SignInOutcome.BLOCKED,
+                    reason: `Account is ${user.status}`,
+                    platform,
+                });
                 return errorResponse(res, `Account is ${user.status}. Please contact support.`, [], 403);
             }
 
             const isMatch = await bcrypt.compare(password, user.password);
             if (!isMatch) {
+                await this.recordSignInAttempt({
+                    userId: user.id,
+                    outcome: SignInOutcome.FAILED,
+                    reason: "Incorrect password",
+                    platform,
+                });
                 return errorResponse(res, "Invalid credentials", [], 401);
             }
 
@@ -89,6 +143,12 @@ export class AuthController {
             } catch (logError) {
                 console.error("Failed to record login timestamp/audit log", logError);
             }
+            await this.recordSignInAttempt({
+                userId: user.id,
+                outcome: SignInOutcome.SUCCESS,
+                reason: null,
+                platform,
+            });
 
             const permissions = user.assignedRole?.permissions || [];
 
@@ -294,6 +354,12 @@ export class AuthController {
                 // RESIDENCE and may be captured nowhere near the farm.
                 farmLat,
                 farmLng,
+                // Timestamp the farm's own GPS point (farmLat/farmLng) was
+                // actually captured on-device - distinct from "now" (when
+                // this request reaches the server), so Monitoring's field
+                // events always use the real capture time, never a
+                // delayed-upload server-receipt time.
+                gpsCapturedAt,
                 // Farm
                 farmName,
                 crop,
@@ -350,6 +416,28 @@ export class AuthController {
                     relations: ["farms"],
                 });
                 if (existingByClientId) {
+                    // Recovery pass: same reasoning as FarmerController.
+                    // offlineSync()'s equivalent idempotency guard - a
+                    // previous attempt already saved the farmer+farms, but
+                    // this retry is another chance to write any FieldEvent
+                    // that failed to record last time. Matches farmsData[]
+                    // entries by name (array-based registration) or falls
+                    // back to the single flat farmName field.
+                    const retryFarmsData = Array.isArray(farmsData) && farmsData.length > 0
+                        ? farmsData
+                        : (body.farmName ? [{ name: body.farmName, farmLat: body.farmLat, farmLng: body.farmLng, gpsAccuracyM: body.gpsAccuracyM, gpsCapturedAt: body.gpsCapturedAt }] : []);
+                    for (const savedFarm of existingByClientId.farms || []) {
+                        const match = retryFarmsData.find((f: any) => f.name === savedFarm.name);
+                        if (!match) continue;
+                        await recordFarmCaptureFieldEvent({
+                            farmId: savedFarm.id,
+                            enumeratorId: registeredByUserId,
+                            latitude: savedFarm.farmLatitude,
+                            longitude: savedFarm.farmLongitude,
+                            gpsAccuracyM: match.gpsAccuracyM !== undefined ? parseFloat(match.gpsAccuracyM) : null,
+                            capturedAt: match.gpsCapturedAt ? new Date(match.gpsCapturedAt) : undefined,
+                        });
+                    }
                     return successResponse(
                         res,
                         { ...existingByClientId, createdFarmIds: (existingByClientId.farms || []).map(f => f.id) },
@@ -524,6 +612,27 @@ export class AuthController {
                         const savedFarm = await queryRunner.manager.save(Farm, farm);
                         createdFarmIds.push(savedFarm.id);
 
+                        // Monitoring: "Last reported location" - GPS captured
+                        // at farm record capture, for the mobile app's LIVE
+                        // (online, multipart) farmer+farms registration path.
+                        // registeredByUserId comes from the authenticated JWT
+                        // (never a client-supplied field) - this endpoint is
+                        // the mobile enumerator's primary field-registration
+                        // flow, so no additional role check is applied here
+                        // (unlike the admin-panel web path in
+                        // FarmerController.create()). Uses this farm's own
+                        // client-supplied capture timestamp (if sent) so a
+                        // delayed/retried request can never look more recent
+                        // than it actually was.
+                        await recordFarmCaptureFieldEvent({
+                            farmId: savedFarm.id,
+                            enumeratorId: registeredByUserId,
+                            latitude: savedFarm.farmLatitude,
+                            longitude: savedFarm.farmLongitude,
+                            gpsAccuracyM: f.gpsAccuracyM !== undefined ? parseFloat(f.gpsAccuracyM) : null,
+                            capturedAt: f.gpsCapturedAt ? new Date(f.gpsCapturedAt) : undefined,
+                        });
+
                         // Multi-commodity structure (replaces single cropType).
                         // Accepts `f.commodities` array, or falls back to
                         // wrapping legacy `f.cropType` into an equivalent
@@ -615,6 +724,23 @@ export class AuthController {
 
                     const savedFarm = await queryRunner.manager.save(Farm, farm);
                     createdFarmIds.push(savedFarm.id);
+
+                    // Monitoring: "Last reported location" - GPS captured at
+                    // farm record capture, for the mobile app's LIVE flat
+                    // farmName fallback registration path. Same reasoning as
+                    // the farmsData[] array loop above: registeredByUserId
+                    // comes from the authenticated JWT, and the farm's own
+                    // client-supplied gpsCapturedAt is used (never "now") so
+                    // a delayed/retried request can't look more recent than
+                    // it actually was.
+                    await recordFarmCaptureFieldEvent({
+                        farmId: savedFarm.id,
+                        enumeratorId: registeredByUserId,
+                        latitude: savedFarm.farmLatitude,
+                        longitude: savedFarm.farmLongitude,
+                        gpsAccuracyM: gpsAccuracyM !== undefined ? parseFloat(gpsAccuracyM) : null,
+                        capturedAt: gpsCapturedAt ? new Date(gpsCapturedAt) : undefined,
+                    });
 
                     if (crop) {
                         const commodityInputs: CommodityInput[] = [{ commodityName: crop, role: CommodityRole.PRIMARY, croppingSystem: CroppingSystem.MONOCROP }];

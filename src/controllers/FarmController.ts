@@ -18,6 +18,7 @@ import {
 } from "../services/CommodityService";
 import { CroppingSystem, CommodityRole, ProductionStatus } from "../entities/PlotCommodity";
 import { validateAndAnnotateFarm, assertGeometryNotBlocking } from "../services/FarmGeometryHelper";
+import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
 
 // Relations needed whenever a Farm response should include its full
 // multi-commodity structure (Plot -> PlotCommodity -> Commodity).
@@ -218,6 +219,20 @@ export class FarmController {
                 return errorResponse(res, "Either a GeoJSON 'location' polygon or lat/lng is required", [], 400);
             }
 
+            // Farm's own GPS reference point, for Monitoring's "Last
+            // reported location" (recordFarmCaptureFieldEvent below) - same
+            // semantics as the farmLat/farmLng field already used by
+            // offlineSync()/FarmerController/AuthController.registerFarmer.
+            // This endpoint only receives a plain lat/lng pair (no distinct
+            // farmLat/farmLng), so that pair doubles as the farm's
+            // reference point here.
+            if (lat !== undefined && lat !== null && lat !== '') {
+                farm.farmLatitude = parseFloat(lat);
+            }
+            if (lng !== undefined && lng !== null && lng !== '') {
+                farm.farmLongitude = parseFloat(lng);
+            }
+
             if (totalAreaHa) {
                 farm.totalAreaHa = parseFloat(totalAreaHa);
             }
@@ -256,6 +271,17 @@ export class FarmController {
 
             // ── Save farm first to get a real UUID ──────────────────────────
             await this.farmRepository.save(farm);
+
+            // Monitoring: "Last reported location" - GPS captured at farm
+            // record capture (this endpoint) counts toward it, same as a
+            // field check-in. Best-effort, never blocks the farm save.
+            await recordFarmCaptureFieldEvent({
+                farmId: farm.id,
+                enumeratorId: user.id,
+                latitude: farm.farmLatitude,
+                longitude: farm.farmLongitude,
+                gpsAccuracyM: gpsAccuracyM !== undefined ? parseFloat(gpsAccuracyM) : null,
+            });
 
             // ── Mint GeoID (non-blocking — farm is already saved) ───────────
             // We use the farm's UUID as the external_id so the GeoID API can
@@ -453,13 +479,14 @@ export class FarmController {
 
     async offlineSync(req: Request, res: Response) {
         try {
+            const enumeratorId = (req as any).user?.id;
             const {
                 farmerId, name, cropType, location, totalAreaHa,
                 ownershipType, ownershipDocument, farmRegistrationStatus,
                 numberOfTrees, yearsInCultivation, harvestSeason, averageYield,
                 buyers, useChemicals, extensionServices, farmAddress, farmNotes,
                 manualSizeInput, manualSizeUnit, commodities, gpsAccuracyM,
-                farmLat, farmLng,
+                farmLat, farmLng, capturedAt,
             } = req.body;
             // NOTE: cropType is no longer strictly required — a farm can now be
             // synced with a `commodities` array instead. At least one of the
@@ -526,6 +553,19 @@ export class FarmController {
             assertGeometryNotBlocking(geometryResult);
 
             await this.farmRepository.save(farm);
+
+            // Monitoring: "Last reported location" - uses the device's own
+            // capturedAt (if sent) so a delayed offline-sync upload doesn't
+            // look more recent than it actually was (explicit requirement:
+            // preserve original capture time for field activity).
+            await recordFarmCaptureFieldEvent({
+                farmId: farm.id,
+                enumeratorId,
+                latitude: farm.farmLatitude,
+                longitude: farm.farmLongitude,
+                gpsAccuracyM: gpsAccuracyM !== undefined ? parseFloat(gpsAccuracyM) : null,
+                capturedAt: capturedAt ? new Date(capturedAt) : undefined,
+            });
 
             // Mint GeoID best-effort for offline-synced farms too
             await mintGeoIdForFarm(this.farmRepository, farm, "offline-sync");

@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { AppDataSource } from "../data-source";
 import { OfflineSubmission, OfflineSubmissionStatus } from "../entities/OfflineSubmission";
+import { MobileSyncStatus } from "../entities/MobileSyncStatus";
 import { successResponse, errorResponse } from "../utils/response";
 import { AuthRequest } from "../middleware/auth.middleware";
 
@@ -12,6 +13,7 @@ import { AuthRequest } from "../middleware/auth.middleware";
  */
 export class OfflineSubmissionController {
     private repo = AppDataSource.getRepository(OfflineSubmission);
+    private syncStatusRepo = AppDataSource.getRepository(MobileSyncStatus);
 
     /**
      * Called by the mobile app as soon as a registration is queued locally
@@ -131,6 +133,70 @@ export class OfflineSubmissionController {
         } catch (error: any) {
             console.error("Get Offline Submissions Error", error);
             return errorResponse(res, "Error fetching offline submissions", [error.message], 500);
+        }
+    }
+
+    /**
+     * POST /api/offline-submissions/sync-status
+     * Reuses this EXISTING offline-submission reporting flow (not a new
+     * polling endpoint) for the Monitoring feature's "sync visibility"
+     * requirement. Called by the mobile app's OfflineSyncService on every
+     * sync-cycle attempt — including one FINAL call with
+     * pendingCount: 0 once the queue is fully empty, per the explicit
+     * requirement ("mobile app must explicitly report a successful cycle
+     * with zero items pending") — the mobile app must not simply stop
+     * reporting once its queue empties, since that would leave this row
+     * stuck showing the last nonzero count forever.
+     *
+     * `lastPendingReportedAt` is this SERVER's own receipt time
+     * (`new Date()` below), not a client-supplied timestamp — per the
+     * explicit instruction to "use server receipt time for sync
+     * freshness/staleness". Each call simply upserts with latest-arrival-
+     * wins semantics: because staleness here is defined purely by arrival
+     * time (not a device-side capture time, unlike FieldEvent), there is
+     * no older/newer ambiguity to protect against — whichever report
+     * reaches the server last IS, by definition, the most current known
+     * sync state for that device as of now.
+     */
+    async reportSyncStatus(req: AuthRequest, res: Response) {
+        try {
+            const userId = req.user?.id;
+            if (!userId) return errorResponse(res, "Unauthorized", [], 401);
+
+            const { pendingCount, success, syncError } = req.body;
+            if (typeof pendingCount !== "number" || pendingCount < 0) {
+                return errorResponse(res, "pendingCount (>= 0) is required", [], 400);
+            }
+
+            let status = await this.syncStatusRepo.findOne({ where: { userId } });
+            if (!status) {
+                status = this.syncStatusRepo.create({ userId });
+            }
+
+            const now = new Date();
+            status.lastPendingCount = pendingCount;
+            status.lastPendingReportedAt = now;
+
+            if (success === true || pendingCount === 0) {
+                status.lastSuccessfulSyncAt = now;
+            }
+
+            if (syncError) {
+                status.lastSyncError = String(syncError);
+                status.lastSyncErrorAt = now;
+            } else if (success === true) {
+                // A reported success clears any previously-shown error -
+                // otherwise a long-resolved error would linger forever on
+                // the Monitoring view even after the device recovered.
+                status.lastSyncError = null;
+                status.lastSyncErrorAt = null;
+            }
+
+            await this.syncStatusRepo.save(status);
+            return successResponse(res, status, "Sync status reported");
+        } catch (error: any) {
+            console.error("Report Sync Status Error", error);
+            return errorResponse(res, "Error reporting sync status", [error.message], 500);
         }
     }
 

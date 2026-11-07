@@ -11,13 +11,41 @@ export class UserController {
     private roleRepository = AppDataSource.getRepository(Role);
     private auditLogRepository = AppDataSource.getRepository(UserAuditLog);
 
+    /**
+     * Validates a proposed `supervisorId` for the Monitoring feature's
+     * supervisor assignment: the id must refer to a real, existing
+     * account whose access-control role is FIELD_SUPERVISOR (per the
+     * explicit instruction: "Validate that the selected supervisor has
+     * the correct role"). Returns the supervisor User row on success, or
+     * an error string on failure — never throws, so callers can decide
+     * how to respond.
+     */
+    private async validateSupervisor(supervisorId: string): Promise<{ supervisor?: User; error?: string }> {
+        const supervisor = await this.userRepository.findOneBy({ id: supervisorId });
+        if (!supervisor) {
+            return { error: "Selected supervisor account was not found." };
+        }
+        if (supervisor.role !== UserRole.FIELD_SUPERVISOR) {
+            return { error: "Selected supervisor must have the Field Supervisor role." };
+        }
+        return { supervisor };
+    }
+
     async create(req: Request, res: Response) {
         try {
-            const { email, password, name, phone, roleId, status, roleType } = req.body;
+            const {
+                email, password, name, phone, roleId, status, roleType,
+                supervisorId, assignedCounty, assignedDistrict,
+            } = req.body;
 
             const existingUser = await this.userRepository.findOneBy({ email });
             if (existingUser) {
                 return errorResponse(res, "User with this email already exists", [], 400);
+            }
+
+            if (supervisorId) {
+                const { error } = await this.validateSupervisor(supervisorId);
+                if (error) return errorResponse(res, error, [], 400);
             }
 
             const hashedPassword = await bcrypt.hash(password, 10);
@@ -31,6 +59,9 @@ export class UserController {
             // Fallback to inspector if roleType not provided. 
             // NOTE: In a real "User Management" system, we might want to strictly enforce roles.
             user.role = roleType || UserRole.INSPECTOR;
+            user.supervisorId = supervisorId || null;
+            user.assignedCounty = assignedCounty || null;
+            user.assignedDistrict = assignedDistrict || null;
 
             if (roleId) {
                 const assignedRole = await this.roleRepository.findOneBy({ id: roleId });
@@ -63,6 +94,24 @@ export class UserController {
         }
     }
 
+    /**
+     * Attaches a lightweight `supervisorName` (and the raw `supervisorId`
+     * already on each row) to a list of users, for display on the User
+     * Management / User Form screens without the caller needing a second
+     * round trip. supervisorId is a plain uuid column (not a TypeORM
+     * relation — see User.ts's comment on why), so this is a small extra
+     * in-memory join rather than something `relations: [...]` can fetch.
+     */
+    private async attachSupervisorNames<T extends { supervisorId: string | null }>(users: T[]): Promise<(T & { supervisorName: string | null })[]> {
+        const supervisorIds = Array.from(new Set(users.map(u => u.supervisorId).filter((id): id is string => !!id)));
+        if (supervisorIds.length === 0) {
+            return users.map(u => ({ ...u, supervisorName: null }));
+        }
+        const supervisors = await this.userRepository.findByIds(supervisorIds);
+        const nameById = new Map(supervisors.map(s => [s.id, s.name || s.email]));
+        return users.map(u => ({ ...u, supervisorName: u.supervisorId ? (nameById.get(u.supervisorId) || null) : null }));
+    }
+
     async getAll(req: Request, res: Response) {
         try {
             const users = await this.userRepository.find({
@@ -74,10 +123,31 @@ export class UserController {
                 const { password, ...rest } = u;
                 return rest;
             });
-            return successResponse(res, safeUsers);
+            const withSupervisorNames = await this.attachSupervisorNames(safeUsers);
+            return successResponse(res, withSupervisorNames);
         } catch (error: any) {
             console.error("Get Users Error", error);
             return errorResponse(res, "Error fetching users", [error.message], 500);
+        }
+    }
+
+    /**
+     * All accounts eligible to be selected as a supervisor (role ===
+     * FIELD_SUPERVISOR) — powers the "Supervisor" dropdown on the admin
+     * User Form, so it only ever offers accounts the backend will
+     * actually accept (see validateSupervisor above).
+     */
+    async getSupervisorOptions(req: Request, res: Response) {
+        try {
+            const supervisors = await this.userRepository.find({
+                where: { role: UserRole.FIELD_SUPERVISOR, status: UserStatus.ACTIVE },
+                order: { name: "ASC" },
+            });
+            const safe = supervisors.map(({ password, ...rest }) => rest);
+            return successResponse(res, safe);
+        } catch (error: any) {
+            console.error("Get Supervisor Options Error", error);
+            return errorResponse(res, "Error fetching supervisor options", [error.message], 500);
         }
     }
 
@@ -92,7 +162,8 @@ export class UserController {
                 return errorResponse(res, "User not found", [], 404);
             }
             const { password, ...rest } = user;
-            return successResponse(res, rest);
+            const [withSupervisorName] = await this.attachSupervisorNames([rest]);
+            return successResponse(res, withSupervisorName);
         } catch (error: any) {
             return errorResponse(res, "Error fetching user", [error.message], 500);
         }
@@ -101,11 +172,28 @@ export class UserController {
     async update(req: Request, res: Response) {
         try {
             const { id } = req.params;
-            const { email, name, phone, roleId, status, roleType, password } = req.body;
+            const {
+                email, name, phone, roleId, status, roleType, password,
+                supervisorId, assignedCounty, assignedDistrict,
+            } = req.body;
 
             const user = await this.userRepository.findOneBy({ id });
             if (!user) {
                 return errorResponse(res, "User not found", [], 404);
+            }
+
+            // A supervisor cannot supervise themselves - guards against an
+            // obvious data-integrity mistake on the User Form.
+            if (supervisorId && supervisorId === id) {
+                return errorResponse(res, "An account cannot be its own supervisor.", [], 400);
+            }
+
+            // Validate BEFORE any field is mutated, so a bad supervisorId
+            // rejects the whole request rather than partially applying
+            // other changes.
+            if (supervisorId !== undefined && supervisorId !== null && supervisorId !== "") {
+                const { error } = await this.validateSupervisor(supervisorId);
+                if (error) return errorResponse(res, error, [], 400);
             }
 
             const requester = (req as any).user;
@@ -139,11 +227,26 @@ export class UserController {
             // "INSPECTOR -> TECHNICAL" rather than just "something changed".
             const previousRole = user.role;
             const previousStatus = user.status;
+            const previousSupervisorId = user.supervisorId;
+            const previousAssignedCounty = user.assignedCounty;
+            const previousAssignedDistrict = user.assignedDistrict;
 
             user.name = name ?? user.name;
             user.phone = phone ?? user.phone;
             user.status = status ?? user.status;
             user.role = roleType ?? user.role;
+            if (assignedCounty !== undefined) user.assignedCounty = assignedCounty || null;
+            if (assignedDistrict !== undefined) user.assignedDistrict = assignedDistrict || null;
+            // Explicit null/"" clears the supervisor (reassignment away
+            // from an existing one); undefined leaves it untouched. This
+            // is the write that makes "the previous supervisor loses
+            // access after reassignment" true - access everywhere is
+            // computed live from this column, never cached, so the moment
+            // this save() commits, the old supervisor's queries simply no
+            // longer match this enumerator.
+            if (supervisorId !== undefined) {
+                user.supervisorId = supervisorId || null;
+            }
 
             if (roleId) {
                 const assignedRole = await this.roleRepository.findOneBy({ id: roleId });
@@ -198,12 +301,48 @@ export class UserController {
                     })
                 );
             }
+            if (supervisorId !== undefined && user.supervisorId !== previousSupervisorId) {
+                const [prevName, newName] = await Promise.all([
+                    previousSupervisorId ? this.userRepository.findOneBy({ id: previousSupervisorId }) : null,
+                    user.supervisorId ? this.userRepository.findOneBy({ id: user.supervisorId }) : null,
+                ]);
+                auditRows.push(
+                    this.auditLogRepository.create({
+                        userId: user.id,
+                        action: UserAuditAction.SUPERVISOR_CHANGED,
+                        previousValue: prevName ? (prevName.name || prevName.email) : null,
+                        newValue: newName ? (newName.name || newName.email) : null,
+                        performedByUserId: requester?.id || null,
+                        performedByName: requester?.name || null,
+                        notes: null,
+                    })
+                );
+            }
+            if (
+                (assignedCounty !== undefined && user.assignedCounty !== previousAssignedCounty) ||
+                (assignedDistrict !== undefined && user.assignedDistrict !== previousAssignedDistrict)
+            ) {
+                const fmt = (county: string | null, district: string | null) =>
+                    (county || district) ? `${county || '—'} / ${district || '—'}` : null;
+                auditRows.push(
+                    this.auditLogRepository.create({
+                        userId: user.id,
+                        action: UserAuditAction.TERRITORY_CHANGED,
+                        previousValue: fmt(previousAssignedCounty, previousAssignedDistrict),
+                        newValue: fmt(user.assignedCounty, user.assignedDistrict),
+                        performedByUserId: requester?.id || null,
+                        performedByName: requester?.name || null,
+                        notes: null,
+                    })
+                );
+            }
             if (auditRows.length > 0) {
                 await this.auditLogRepository.save(auditRows);
             }
 
             const { password: _, ...rest } = user;
-            return successResponse(res, rest);
+            const [withSupervisorName] = await this.attachSupervisorNames([rest]);
+            return successResponse(res, withSupervisorName);
         } catch (error: any) {
             return errorResponse(res, "Error updating user", [error.message], 500);
         }

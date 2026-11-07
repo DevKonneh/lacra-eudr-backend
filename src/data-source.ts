@@ -34,6 +34,10 @@ import { CooperativeFlag } from "./entities/CooperativeFlag";
 import { CooperativeChangeLog } from "./entities/CooperativeChangeLog";
 import { CooperativeImportRun } from "./entities/CooperativeImportRun";
 import { UserAuditLog } from "./entities/UserAuditLog";
+import { UserSession } from "./entities/UserSession";
+import { SignInAttempt } from "./entities/SignInAttempt";
+import { FieldEvent } from "./entities/FieldEvent";
+import { MobileSyncStatus } from "./entities/MobileSyncStatus";
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -53,6 +57,13 @@ const useSsl = process.env.DB_SSL === "true";
 const trimEnv = (value: string | undefined): string | undefined =>
     value !== undefined ? value.trim() : value;
 
+// Allows a one-off run with synchronize disabled (DB_SYNCHRONIZE=false) so
+// an explicit SQL migration file can be validated on its own, without
+// TypeORM's auto-sync silently applying (or masking the absence of) the
+// same schema changes first. Defaults to the existing "true" behavior when
+// unset, so normal dev/production runs are unaffected.
+const synchronizeSchema = trimEnv(process.env.DB_SYNCHRONIZE) !== "false";
+
 export const AppDataSource = new DataSource({
     type: "postgres",
     host: trimEnv(process.env.DB_HOST) || "localhost",
@@ -61,9 +72,9 @@ export const AppDataSource = new DataSource({
     password: trimEnv(process.env.DB_PASSWORD) || "postgis",
     database: trimEnv(process.env.DB_NAME) || "eudr_db",
     ssl: useSsl ? { rejectUnauthorized: false } : false,
-    synchronize: true,
+    synchronize: synchronizeSchema,
     logging: false,
-    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission, Application, ApplicationStatusHistory, WarehouseAssessment, Invoice, PaymentSubmission, Certificate, FarmerAuditLog, Plot, Commodity, PlotCommodity, Inspection, QualityControl, EnforcementAction, Cooperative, CooperativeFlag, CooperativeChangeLog, CooperativeImportRun, UserAuditLog],
+    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission, Application, ApplicationStatusHistory, WarehouseAssessment, Invoice, PaymentSubmission, Certificate, FarmerAuditLog, Plot, Commodity, PlotCommodity, Inspection, QualityControl, EnforcementAction, Cooperative, CooperativeFlag, CooperativeChangeLog, CooperativeImportRun, UserAuditLog, UserSession, SignInAttempt, FieldEvent, MobileSyncStatus],
     subscribers: [],
     migrations: [],
 });

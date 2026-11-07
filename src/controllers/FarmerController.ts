@@ -21,6 +21,7 @@ import { getGeoIdService, GeoIdService } from "../services/GeoIdService";
 import { buildPlotsForFarm, deriveLegacyCropType, CommodityInput } from "../services/CommodityService";
 import { CommodityRole, CroppingSystem, PlotCommodity } from "../entities/PlotCommodity";
 import { validateAndAnnotateFarm, assertGeometryNotBlocking } from "../services/FarmGeometryHelper";
+import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
 
 // Relations needed whenever a Farmer response should include each farm's
 // full multi-commodity structure (Plot -> PlotCommodity -> Commodity), used
@@ -407,6 +408,18 @@ export class FarmerController {
                         farm.useChemicals = f.useChemicals === 'true' || f.useChemicals === true;
                         farm.extensionServices = f.extensionServices === 'true' || f.extensionServices === true;
                         farm.farmAddress = f.farmAddress;
+                        // Farm's own GPS reference point, when this caller sent
+                        // one (the admin-panel's web forms normally don't - see
+                        // the Monitoring field-event gating comment below - but
+                        // this endpoint is also reachable by any future
+                        // enumerator-facing caller that does capture it, and the
+                        // field should be stored either way).
+                        if (f.farmLat !== undefined && f.farmLat !== null && f.farmLat !== '') {
+                            farm.farmLatitude = parseFloat(f.farmLat);
+                        }
+                        if (f.farmLng !== undefined && f.farmLng !== null && f.farmLng !== '') {
+                            farm.farmLongitude = parseFloat(f.farmLng);
+                        }
 
                         // Replaces the old single Crop Type field: accepts a
                         // `commodities` array (see CommodityInput) per farm.
@@ -457,6 +470,75 @@ export class FarmerController {
                 const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${savedFarmer.id}`;
                 savedFarmer.qrCode = await QRCode.toDataURL(publicProfileUrl);
                 await queryRunner.manager.save(Farmer, savedFarmer);
+
+                // Monitoring field events for this web-form create() path.
+                //
+                // This endpoint is used by two DESK/web flows (admin-panel
+                // Register.tsx self-registration, RegisterFarmer.tsx admin
+                // creation) that draw a boundary on a map rather than
+                // capturing live field GPS — `registeredByUserId` here
+                // therefore identifies WHO ENTERED THE RECORD, not
+                // necessarily an enumerator who physically visited the
+                // farm. Per the explicit Monitoring decision, a
+                // FARM_RECORD_CAPTURE field event must only be created from
+                // this path when ALL three are true for a given farm:
+                //   1. a verified enumerator - `registeredByUserId` came
+                //      from the authenticated JWT (authMiddleware already
+                //      guarantees this, never a client-supplied field), AND
+                //      that user actually holds the INSPECTOR role (an
+                //      ADMIN entering records on someone else's behalf is
+                //      NOT "the enumerator who captured this farm" and must
+                //      not be attributed a field event);
+                //   2. an original (client-supplied) capture time
+                //      (f.gpsCapturedAt) - never defaulted to "now", since
+                //      "now" is when the desk entry happened, not when any
+                //      GPS reading (if any) was actually taken;
+                //   3. real field GPS coordinates on that specific farm
+                //      (f.farmLat/f.farmLng) - the map-drawn polygon's
+                //      centroid does NOT count as a GPS reading.
+                // If any of these is missing, no field event is recorded -
+                // the normal farmer/farm audit trail below still captures
+                // who entered the record either way, so nothing is lost.
+                const enumeratorRole = (req as any).user?.role;
+                const isVerifiedEnumerator = !!registeredByUserId && enumeratorRole === UserRole.INSPECTOR;
+                for (let i = 0; i < (savedFarmer.farms || []).length; i++) {
+                    const savedFarm = savedFarmer.farms[i];
+                    const f = farmsData && farmsData[i] ? farmsData[i] : undefined;
+                    if (!isVerifiedEnumerator || !f?.gpsCapturedAt) continue;
+                    if (savedFarm.farmLatitude === undefined || savedFarm.farmLatitude === null) continue;
+                    if (savedFarm.farmLongitude === undefined || savedFarm.farmLongitude === null) continue;
+                    await recordFarmCaptureFieldEvent({
+                        farmId: savedFarm.id,
+                        enumeratorId: registeredByUserId,
+                        latitude: savedFarm.farmLatitude,
+                        longitude: savedFarm.farmLongitude,
+                        gpsAccuracyM: f.gpsAccuracyM !== undefined ? parseFloat(f.gpsAccuracyM) : null,
+                        capturedAt: new Date(f.gpsCapturedAt),
+                    });
+                }
+
+                // Audit-history entry for every farm created through this
+                // path, REGARDLESS of whether a field event was recorded
+                // above — this preserves "who entered the record" (desk
+                // admin or verified enumerator alike) in FarmerAuditLog even
+                // when the stricter field-event criteria above aren't met,
+                // per the explicit instruction to keep that action in the
+                // audit history rather than silently dropping attribution.
+                if (registeredByUserId && (savedFarmer.farms || []).length > 0) {
+                    const creationAuditRows = savedFarmer.farms.map((savedFarm) => {
+                        const row = new FarmerAuditLog();
+                        row.farmerId = savedFarmer.id;
+                        row.action = FarmerAuditAction.FARM_ADDED;
+                        row.farmId = savedFarm.id;
+                        row.performedByUserId = registeredByUserId;
+                        if (requester?.name) row.performedByName = requester.name;
+                        row.notes = isVerifiedEnumerator
+                            ? "Farm registered via web form by enumerator"
+                            : "Farm record entered via admin web form (desk entry, not a field GPS capture)";
+                        return row;
+                    });
+                    await queryRunner.manager.save(FarmerAuditLog, creationAuditRows);
+                }
 
                 // Build the multi-commodity Plot/PlotCommodity structure for
                 // each newly-created farm, now that each has a real id.
@@ -1468,6 +1550,27 @@ export class FarmerController {
                     relations: ["farms"],
                 });
                 if (existingByClientId) {
+                    // Recovery pass: the farmer+farms were already saved on
+                    // a previous attempt, but this retry gives us another
+                    // chance to write any FieldEvent that failed to record
+                    // last time (e.g. a crash between the farm save and the
+                    // event write). recordFarmCaptureFieldEvent's eventId is
+                    // derived from the farm's own (already-persisted,
+                    // unchanged) id, so this is always safe to re-attempt —
+                    // if the event already exists, the insert is a no-op; if
+                    // it's missing, this is what recovers it.
+                    for (const savedFarm of existingByClientId.farms || []) {
+                        const match = (farmsData || []).find((f: any) => f.name === savedFarm.name);
+                        if (!match) continue;
+                        await recordFarmCaptureFieldEvent({
+                            farmId: savedFarm.id,
+                            enumeratorId: existingByClientId.registeredByUserId,
+                            latitude: savedFarm.farmLatitude,
+                            longitude: savedFarm.farmLongitude,
+                            gpsAccuracyM: match.gpsAccuracyM !== undefined ? parseFloat(match.gpsAccuracyM) : null,
+                            capturedAt: match.gpsCapturedAt ? new Date(match.gpsCapturedAt) : undefined,
+                        });
+                    }
                     return successResponse(
                         res,
                         { ...existingByClientId, geometryValidation: {}, rejectedFarms: [] },
@@ -1583,6 +1686,20 @@ export class FarmerController {
                 geometryResultsByFarmName[f.name] = geometryResult;
 
                 const savedFarm = await this.farmRepository.save(farm);
+
+                // Monitoring: "Last reported location" - GPS captured at
+                // farm record capture, for the mobile app's offline
+                // farmer+farm sync path. Uses the farm's own capturedAt (if
+                // the client sent one) so a delayed upload cannot look more
+                // recent than it actually was.
+                await recordFarmCaptureFieldEvent({
+                    farmId: savedFarm.id,
+                    enumeratorId: farmer.registeredByUserId,
+                    latitude: savedFarm.farmLatitude,
+                    longitude: savedFarm.farmLongitude,
+                    gpsAccuracyM: f.gpsAccuracyM !== undefined ? parseFloat(f.gpsAccuracyM) : null,
+                    capturedAt: f.gpsCapturedAt ? new Date(f.gpsCapturedAt) : undefined,
+                });
 
                 // Mint GeoID best-effort for offline-synced farms
                 await mintGeoIdForFarm(this.farmRepository, savedFarm, "offline farmer sync");

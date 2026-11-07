@@ -21,4 +21,10 @@ router.post("/report", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (re
 // discarded locally), so the shadow record doesn't linger.
 router.post("/:clientId/resolve", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.resolve(req, res));
 
+// Mobile app calls this on every sync-cycle attempt (including one final
+// call with pendingCount: 0 once the queue is fully empty) - backs the
+// Monitoring feature's "sync visibility" requirement. See
+// OfflineSubmissionController.reportSyncStatus() for the full contract.
+router.post("/sync-status", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.reportSyncStatus(req, res));
+
 export default router;

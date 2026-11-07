@@ -17,6 +17,15 @@ export enum UserAuditAction {
     APPROVED = "APPROVED",
     REJECTED = "REJECTED",
     LOGIN = "LOGIN",
+    // Added for the CMIS Monitoring feature's supervisor/territory
+    // management on the User form. SUPERVISOR_CHANGED covers both
+    // assigning a first supervisor and reassigning/clearing an existing
+    // one (previousValue/newValue hold the supervisor's name, or null for
+    // "no supervisor"); TERRITORY_CHANGED covers assignedCounty/
+    // assignedDistrict edits (previousValue/newValue hold a combined
+    // "County / District" string).
+    SUPERVISOR_CHANGED = "SUPERVISOR_CHANGED",
+    TERRITORY_CHANGED = "TERRITORY_CHANGED",
 }
 
 @Entity()

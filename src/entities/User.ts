@@ -29,7 +29,17 @@ export enum UserRole {
     // the separate role that prints/issues the final certificate after
     // final DG approval.
     FINANCE = "FINANCE",
-    IT = "IT"
+    IT = "IT",
+    // Added for the CMIS Monitoring feature (User Activity + Enumerator
+    // Monitoring). A field supervisor oversees a set of enumerators
+    // (INSPECTOR accounts whose `supervisorId` points at them — see
+    // below) and, per the Monitoring access rule, can only see
+    // monitoring data for enumerators assigned directly to them. Kept as
+    // a plain string value in this existing flat enum (role is a
+    // `simple-enum` column — see note on that column below — so adding a
+    // value here requires no schema/enum migration, just a new allowed
+    // string).
+    FIELD_SUPERVISOR = "FIELD_SUPERVISOR"
 }
 
 export enum UserStatus {
@@ -57,7 +67,23 @@ export class User {
     password!: string;
 
     @Column({
-        type: "simple-enum", // Use simple-enum to avoid Postgres enum type synchronization issues in MVP
+        // NOTE: despite the name, TypeORM's Postgres driver maps
+        // "simple-enum" to a REAL native Postgres enum type (same as
+        // type: "enum") - it is NOT a plain varchar. Verified against this
+        // project's actual schema: `\d "user"` shows role's udt_name as
+        // user_role_enum, and `synchronize: true` silently ran
+        // `ALTER TYPE user_role_enum ADD VALUE 'FIELD_SUPERVISOR'` here in
+        // dev when this value was added below. In other words, adding a
+        // new UserRole value is NOT schema-migration-free the way an
+        // earlier comment on this column claimed - it still requires an
+        // explicit `ALTER TYPE ... ADD VALUE IF NOT EXISTS` in any
+        // migration file for this release (see
+        // migrations/2027_monitoring/up.sql), the same as UserAuditAction
+        // below. "simple-enum" only differs from "enum" in how TypeORM
+        // NAMES the generated Postgres type (simple-enum derives the name
+        // from the entity+column; "enum" lets you set `enumName`) - not in
+        // whether a real Postgres enum type is created.
+        type: "simple-enum",
         enum: UserRole,
         default: UserRole.INSPECTOR
     })
@@ -94,6 +120,55 @@ export class User {
     // used accounts at a glance, instead of every row looking identical.
     @Column({ nullable: true })
     lastLoginAt!: Date;
+
+    // --- CMIS Monitoring: supervisor + declared territory ------------------
+    // One enumerator has at most one DIRECT supervisor in this release (no
+    // multi-level hierarchy, no many-to-many). Self-referencing, nullable
+    // FK on "user" itself rather than a separate join table, since the
+    // relationship is simple and 1:1-per-enumerator. Nullable so every
+    // existing account (and any enumerator never assigned a supervisor)
+    // remains valid and simply has no supervisor — per the explicit
+    // instruction, such an enumerator "remains visible to authorized
+    // admins" (i.e. absence of a supervisor is a normal, supported state,
+    // not an error).
+    //
+    // IMPORTANT: this column is intentionally typed as a plain nullable
+    // uuid column (NOT a TypeORM @ManyToOne/@JoinColumn relation) — a
+    // self-referencing @ManyToOne(() => User) would make `synchronize:
+    // true` want to rename this to a relation id column and could also
+    // complicate the plain `userRepository.find()` calls already used
+    // everywhere in UserController/AuthController (which do not expect a
+    // circular "supervisor" relation to come back unless explicitly
+    // requested). MonitoringController/UserController resolve the actual
+    // supervisor User row with an explicit extra query instead.
+    @Column({ type: "uuid", nullable: true })
+    supervisorId!: string | null;
+
+    // Declared/assigned territory for this account (set by an admin on the
+    // User form) — DISTINCT from "reported field area" (the
+    // county/district/community actually observed on this enumerator's own
+    // captured Farmer/Farm/FieldEvent records). See Farmer.region/district/
+    // community for the matching per-record geography naming. Primarily
+    // used today for Enumerator Monitoring table filters and the "Assigned
+    // area" display; per the explicit instruction, formal assignment
+    // targets/completion-percentage logic is deferred until CMIS has real
+    // assignment records.
+    // Explicit `type: "varchar"` is REQUIRED here (not just `nullable:
+    // true`) - reflect-metadata cannot represent a `string | null` union
+    // type at runtime, so TypeORM sees the design:type as plain `Object`
+    // and fails entity-metadata validation ("Data type Object ... is not
+    // supported") unless the column type is given explicitly. Confirmed by
+    // reproducing the failure with `DataSource.initialize()` before adding
+    // this. Every other nullable `string | null` column in this codebase
+    // (e.g. FarmerAuditLog.fieldName) is typed as a bare `string`, not
+    // `string | null`, which is why this bug didn't already exist
+    // elsewhere - keep that convention for any FUTURE nullable string
+    // column, or always set `type` explicitly as done here.
+    @Column({ type: "varchar", nullable: true })
+    assignedCounty!: string | null;
+
+    @Column({ type: "varchar", nullable: true })
+    assignedDistrict!: string | null;
 
     @CreateDateColumn()
     createdAt!: Date;

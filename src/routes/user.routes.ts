@@ -16,6 +16,7 @@ router.get("/", (req, res) => userController.getAll(req, res));
 // IMPORTANT: specific sub-routes must be registered before the generic
 // "/:id" route below, otherwise Express would match "/:id/audit-log" as
 // ":id" = "someId/audit-log" and never reach this handler.
+router.get("/supervisors/options", (req, res) => userController.getSupervisorOptions(req, res));
 router.get("/:id/audit-log", (req, res) => userController.getAuditLog(req, res));
 router.patch("/:id/status", (req, res) => userController.setStatus(req, res));
 router.get("/:id", (req, res) => userController.getOne(req, res));
