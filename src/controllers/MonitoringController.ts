@@ -225,6 +225,59 @@ export class MonitoringController {
      * explicit requirement that scoping/derivation never diverge between
      * a list view and a detail view).
      */
+    /**
+     * Review-progress breakdown for one enumerator: how many of the
+     * farmers/farms THEY registered currently sit in each identity/
+     * geometry review state. Previously deferred — now implemented as a
+     * simple per-enumerator count breakdown, intentionally NOT a
+     * cross-enumerator queue/worklist (that would be a much larger
+     * "Data Correction Queue"-style feature) and NOT blended into any
+     * single compliance percentage, matching this codebase's existing
+     * rule (see ReportsController) that verification/geometry/compliance
+     * numbers are always reported independently, never combined.
+     *
+     * Farmer identity status values: Verified / Unverified / Conflict
+     * (Farmer.identityStatus). Farm geometry status values: Valid /
+     * Needs Review / Invalid / Missing (Farm.geometryStatus). Both use
+     * simple COUNT(*) ... GROUP BY queries scoped to
+     * registeredByUserId = enumerator.id (farmer) / farmer.
+     * registeredByUserId = enumerator.id (farm, via join) — the same
+     * scoping already used for recordCounts above, so these numbers are
+     * always a subset of recordCounts.farmers/farms.
+     */
+    private async buildReviewProgress(enumeratorId: string) {
+        const identityRaw = await this.farmerRepository
+            .createQueryBuilder("farmer")
+            .select("farmer.identityStatus", "status")
+            .addSelect("COUNT(*)", "count")
+            .where("farmer.registeredByUserId = :id", { id: enumeratorId })
+            .groupBy("farmer.identityStatus")
+            .getRawMany();
+
+        const identityStatus = { Verified: 0, Unverified: 0, Conflict: 0 } as Record<string, number>;
+        for (const row of identityRaw) {
+            const key = row.status || "Unverified";
+            identityStatus[key] = (identityStatus[key] || 0) + parseInt(row.count, 10);
+        }
+
+        const geometryRaw = await this.farmRepository
+            .createQueryBuilder("farm")
+            .innerJoin("farm.farmer", "farmer")
+            .select("farm.geometryStatus", "status")
+            .addSelect("COUNT(*)", "count")
+            .where("farmer.registeredByUserId = :id", { id: enumeratorId })
+            .groupBy("farm.geometryStatus")
+            .getRawMany();
+
+        const geometryStatus = { Valid: 0, "Needs Review": 0, Invalid: 0, Missing: 0 } as Record<string, number>;
+        for (const row of geometryRaw) {
+            const key = row.status || "Missing";
+            geometryStatus[key] = (geometryStatus[key] || 0) + parseInt(row.count, 10);
+        }
+
+        return { identityStatus, geometryStatus };
+    }
+
     private async buildEnumeratorSummary(enumerator: User) {
         const events = await this.fieldEventRepository.find({ where: { enumeratorId: enumerator.id } });
         // Order by capturedAt (device clock), NEVER receivedAt (server
@@ -254,13 +307,14 @@ export class MonitoringController {
         // still counting toward fieldStatus above).
         const lastLocationEvent = events.find((e) => e.latitude !== null && e.longitude !== null);
 
-        const [farmerCount, farmCount] = await Promise.all([
+        const [farmerCount, farmCount, reviewProgress] = await Promise.all([
             this.farmerRepository.count({ where: { registeredByUserId: enumerator.id } }),
             this.farmRepository
                 .createQueryBuilder("farm")
                 .innerJoin("farm.farmer", "farmer")
                 .where("farmer.registeredByUserId = :id", { id: enumerator.id })
                 .getCount(),
+            this.buildReviewProgress(enumerator.id),
         ]);
 
         const syncStatus = await this.syncStatusRepository.findOne({ where: { userId: enumerator.id } });
@@ -282,6 +336,7 @@ export class MonitoringController {
                   }
                 : null,
             recordCounts: { farmers: farmerCount, farms: farmCount },
+            reviewProgress,
             syncStatus: syncStatus
                 ? {
                       lastSuccessfulSyncAt: syncStatus.lastSuccessfulSyncAt,

@@ -264,6 +264,6 @@ The backfill is **idempotent** — farms that already have a `geoId` are skipped
 | `POST` | `/api/monitoring/heartbeat` | Any authenticated | Per-tab presence heartbeat; requires migration `2027_monitoring` |
 | `GET` | `/api/monitoring/user-activity` | ADMIN | Staff-wide Online/Idle/Offline presence; requires migration `2027_monitoring` |
 | `GET` | `/api/monitoring/users/:id/sign-in-history` | ADMIN | Sign-in attempt history for one user; requires migration `2027_monitoring` |
-| `GET` | `/api/monitoring/enumerators` | ADMIN, FIELD_SUPERVISOR | Enumerators visible to the caller (all for admin, direct reports only for a supervisor); requires migration `2027_monitoring` |
-| `GET` | `/api/monitoring/enumerators/:id` | ADMIN, FIELD_SUPERVISOR | Single enumerator summary + field activity timeline; 403 if not visible to the caller; requires migration `2027_monitoring` |
+| `GET` | `/api/monitoring/enumerators` | ADMIN, FIELD_SUPERVISOR | Enumerators visible to the caller (all for admin, direct reports only for a supervisor), including a `reviewProgress` farmer-identity/farm-geometry status breakdown scoped to that enumerator's own records; requires migration `2027_monitoring` (no schema change for `reviewProgress` itself — reuses existing `Farmer.identityStatus`/`Farm.geometryStatus` columns) |
+| `GET` | `/api/monitoring/enumerators/:id` | ADMIN, FIELD_SUPERVISOR | Single enumerator summary + field activity timeline + `reviewProgress` breakdown; 403 if not visible to the caller; requires migration `2027_monitoring` |
 | `POST` | `/api/offline-submissions/sync-status` | ADMIN, INSPECTOR | Mobile app reports its offline-sync cycle result (pending count / success / error); requires migration `2027_monitoring` |
