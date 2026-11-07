@@ -10,6 +10,9 @@ import { User, UserRole } from "../entities/User";
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary } from "../utils/cloudUpload";
 import { NotificationService } from "../services/NotificationService";
+import { LocalProduceBuyerNumberService } from "../services/LocalProduceBuyerNumberService";
+import { computePublicStatus, hasIssuedPermitNumber } from "../services/PermitVerificationService";
+import * as crypto from "crypto";
 
 // Required-document keys per application category, kept in sync with the
 // admin panel's pages/apply/documentRequirements.ts (the single source of
@@ -1784,10 +1787,21 @@ export class ApplicationController {
             const { validityMonths } = req.body || {};
             const application = await this.loadApplicationOr404(id, res);
             if (!application) return;
-            if (!this.requireStatus(application, [ApplicationStatus.AWAITING_IT_CERTIFICATE_PRINTING], res)) return;
 
-            const certificate = await this.certificateRepository.findOne({ where: { applicationId: application.id } });
-            if (!certificate) {
+            // Idempotent retry short-circuit: if this application's
+            // certificate was already printed (certificateNumber already
+            // set), a repeated/retried printCertificate() call — e.g. a
+            // network timeout causing the IT Officer's client to resend
+            // the same request — must return the SAME certificate rather
+            // than erroring on the now-stale status check or (worse)
+            // allocating a second permit number for one application.
+            const existingCertificate = await this.certificateRepository.findOne({ where: { applicationId: application.id } });
+            if (existingCertificate?.certificateNumber && application.status !== ApplicationStatus.AWAITING_IT_CERTIFICATE_PRINTING) {
+                return successResponse(res, { application, certificate: existingCertificate }, "Certificate already printed");
+            }
+
+            if (!this.requireStatus(application, [ApplicationStatus.AWAITING_IT_CERTIFICATE_PRINTING], res)) return;
+            if (!existingCertificate) {
                 return errorResponse(res, "No certificate record found for this application", [], 409);
             }
 
@@ -1795,18 +1809,65 @@ export class ApplicationController {
             const now = new Date();
             const expiry = new Date(now);
             expiry.setMonth(expiry.getMonth() + months);
+            const isLocalBuyer = application.category === ApplicationCategory.LOCAL_BUYER;
 
-            certificate.certificateNumber = certificate.certificateNumber || await this.nextSequentialNumber("CERT", this.certificateRepository);
-            certificate.issueDate = now;
-            certificate.expiryDate = expiry;
-            certificate.printedByUserId = req.user?.id;
-            certificate.printedByName = req.user?.name;
-            certificate.printedAt = now;
-            await this.certificateRepository.save(certificate);
+            // Everything from here down runs in one transaction so the
+            // Local Produce Buyer number allocation (which takes a
+            // pessimistic row lock — see LocalProduceBuyerNumberService)
+            // and the certificate/application writes commit together.
+            // This closes the race where two concurrent printCertificate()
+            // calls for two DIFFERENT applications could otherwise read the
+            // same "not yet printed" certificate state and allocate the
+            // same permit number before either had written back.
+            const { certificate, previousStatus } = await AppDataSource.transaction(async (manager) => {
+                const certRepo = manager.getRepository(Certificate);
+                const appRepo = manager.getRepository(Application);
 
-            const previousStatus = application.status;
-            application.status = ApplicationStatus.CERTIFICATE_PRINTED;
-            await this.applicationRepository.save(application);
+                // Re-fetch the certificate WITH a row lock inside the
+                // transaction — the unlocked read above was only for the
+                // fast idempotent-retry short-circuit; the authoritative
+                // check-and-allocate must happen under lock.
+                const lockedCertificate = await certRepo
+                    .createQueryBuilder("cert")
+                    .setLock("pessimistic_write")
+                    .where("cert.applicationId = :applicationId", { applicationId: application.id })
+                    .getOne();
+                if (!lockedCertificate) {
+                    throw new Error("No certificate record found for this application");
+                }
+
+                // Re-check under lock: another concurrent request may have
+                // completed the print between our unlocked read above and
+                // acquiring this lock.
+                if (lockedCertificate.certificateNumber) {
+                    return { certificate: lockedCertificate, previousStatus: application.status, alreadyPrinted: true };
+                }
+
+                if (isLocalBuyer) {
+                    lockedCertificate.certificateNumber = await LocalProduceBuyerNumberService.allocateNext(manager);
+                    lockedCertificate.verificationToken = crypto.randomUUID();
+                    lockedCertificate.buyerDisplayName = extractApplicantName(application.category, application.data) || null;
+                    lockedCertificate.county = application.data?.buyer?.county || null;
+                } else {
+                    lockedCertificate.certificateNumber = await this.nextSequentialNumber("CERT", certRepo);
+                }
+                lockedCertificate.issueDate = now;
+                lockedCertificate.expiryDate = expiry;
+                lockedCertificate.printedByUserId = req.user?.id;
+                lockedCertificate.printedByName = req.user?.name;
+                lockedCertificate.printedAt = now;
+                await certRepo.save(lockedCertificate);
+
+                const prevStatus = application.status;
+                application.status = ApplicationStatus.CERTIFICATE_PRINTED;
+                await appRepo.save(application);
+
+                return { certificate: lockedCertificate, previousStatus: prevStatus, alreadyPrinted: false };
+            });
+
+            if ((certificate as any).alreadyPrinted) {
+                return successResponse(res, { application, certificate }, "Certificate already printed");
+            }
 
             await this.recordHistory({
                 applicationId: application.id,
@@ -1876,10 +1937,25 @@ export class ApplicationController {
             if (!certificate) {
                 return errorResponse(res, "Certificate not found. This certificate number could not be verified.", [], 404);
             }
+
+            // A held record (shared permit number / disputed issuance
+            // date pending staff resolution) must not be retrievable
+            // through THIS route either — only the opaque-token route AND
+            // this certificateNumber route are both public-facing, so
+            // both must enforce the same block. This deliberately returns
+            // the identical 404 shape as "not found" rather than a
+            // distinct "blocked" response, so a blocked record's existence
+            // is not revealed to an unauthenticated caller.
+            if (certificate.isPubliclyBlocked || !hasIssuedPermitNumber(certificate)) {
+                return errorResponse(res, "Certificate not found. This certificate number could not be verified.", [], 404);
+            }
+
             const application = await this.applicationRepository.findOne({ where: { id: certificate.applicationId } });
             if (!application) {
                 return errorResponse(res, "Certificate not found. This certificate number could not be verified.", [], 404);
             }
+
+            const status = computePublicStatus(certificate, application);
 
             return successResponse(res, {
                 certificateNumber: certificate.certificateNumber,
@@ -1887,7 +1963,7 @@ export class ApplicationController {
                 issueDate: certificate.issueDate,
                 expiryDate: certificate.expiryDate,
                 status: application.status,
-                valid: application.status === ApplicationStatus.ISSUED && !!certificate.expiryDate && new Date(certificate.expiryDate) > new Date(),
+                valid: status === "VALID",
                 applicantName: extractApplicantName(application.category, application.data),
                 applicationNumber: application.applicationNumber,
                 commodity: application.commodity,
