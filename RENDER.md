@@ -84,6 +84,7 @@ corresponding application code.**
 | Feature | Migration | Notes |
 |---|---|---|
 | Identity Verification | `migrations/2026_identity_verification/up.sql` | See `migrations/2026_identity_verification/README.md` for the migration rationale/rollback, and `migrations/2026_identity_verification/DEPLOYMENT_PLAN.md` for the full ordered live deployment runbook (backup → migrate → verify → deploy code → post-deploy checks). Adds 4 nullable `farmer` columns + 3 `farmer_audit_log_action_enum` values. Tested idempotent against a full schema clone. |
+| CMIS Monitoring (supervisor model, field check-in/out, presence, sync status) | `migrations/2027_monitoring/up.sql` | See `migrations/2027_monitoring/README.md` for the full deployment procedure (backup → `psql "$DATABASE_URL" -f migrations/2027_monitoring/up.sql` → verify schema with `DB_SYNCHRONIZE=false` → confirm pre-existing `user`/`farmer`/`farm` row counts unchanged → deploy app code). Adds `FIELD_SUPERVISOR` to `user_role_enum`, `SUPERVISOR_CHANGED`/`TERRITORY_CHANGED` to `user_audit_log_action_enum`, 3 nullable `"user"` columns (`supervisorId`, `assignedCounty`, `assignedDistrict`), and 4 new tables (`field_event`, `mobile_sync_status`, `sign_in_attempt`, `user_session`). Purely additive. Tested idempotent against a disposable clone (`eudr_monitoring_test`) with pre-existing data confirmed unaffected — **has NOT yet been run against the real production database as of this writing; do not deploy the Monitoring application code (commit `0eebcb3` and later) until this migration has been applied to the live `DATABASE_URL`.** |
 
 ---
 
@@ -260,3 +261,9 @@ The backfill is **idempotent** — farms that already have a `geoId` are skipped
 | `GET` | `/api/public/farm-scan/geoid/:geoid` | None | Resolve by GeoID |
 | `GET` | `/api/public/farm-scan/whimo/commodities` | None | Commodity map + live validation |
 | `POST` | `/api/farms/backfill-geoids` | ADMIN | One-time backfill |
+| `POST` | `/api/monitoring/heartbeat` | Any authenticated | Per-tab presence heartbeat; requires migration `2027_monitoring` |
+| `GET` | `/api/monitoring/user-activity` | ADMIN | Staff-wide Online/Idle/Offline presence; requires migration `2027_monitoring` |
+| `GET` | `/api/monitoring/users/:id/sign-in-history` | ADMIN | Sign-in attempt history for one user; requires migration `2027_monitoring` |
+| `GET` | `/api/monitoring/enumerators` | ADMIN, FIELD_SUPERVISOR | Enumerators visible to the caller (all for admin, direct reports only for a supervisor); requires migration `2027_monitoring` |
+| `GET` | `/api/monitoring/enumerators/:id` | ADMIN, FIELD_SUPERVISOR | Single enumerator summary + field activity timeline; 403 if not visible to the caller; requires migration `2027_monitoring` |
+| `POST` | `/api/offline-submissions/sync-status` | ADMIN, INSPECTOR | Mobile app reports its offline-sync cycle result (pending count / success / error); requires migration `2027_monitoring` |
