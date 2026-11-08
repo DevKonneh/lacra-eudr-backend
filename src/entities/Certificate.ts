@@ -176,6 +176,27 @@ export class Certificate {
     @Column({ type: "jsonb", nullable: true })
     importRawData!: Record<string, any> | null;
 
+    // -----------------------------------------------------------------
+    // Agency Register support. Additive, only ever populated for
+    // permitOrLicenceType === "AGENCY" certificates; every other category
+    // leaves them null/false and is entirely unaffected. See
+    // AgencyStaffingService for how these are computed/maintained.
+    // -----------------------------------------------------------------
+
+    // True while this Agency does not currently meet the staffing
+    // requirement (>= 3 distinct active Agents AND exactly 1 active
+    // Clerk) — set/cleared by AgencyStaffingService.
+    // computeAndRefreshStaffingFlag(), never implies isPubliclyBlocked and
+    // never changes the underlying Application's status: an already-
+    // issued Agency permit stays issued and publicly verifiable while
+    // flagged, per the explicit "flag for review without automatically
+    // changing the status of previously issued permits" decision.
+    @Column({ default: false })
+    staffingFlagged!: boolean;
+
+    @Column({ type: "text", nullable: true })
+    staffingFlagReason!: string | null;
+
     @CreateDateColumn()
     createdAt!: Date;
 

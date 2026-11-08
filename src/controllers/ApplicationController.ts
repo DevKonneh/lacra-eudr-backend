@@ -12,6 +12,8 @@ import { uploadFileToCloudinary } from "../utils/cloudUpload";
 import { NotificationService } from "../services/NotificationService";
 import { LocalProduceBuyerNumberService } from "../services/LocalProduceBuyerNumberService";
 import { computePublicStatus, hasIssuedPermitNumber } from "../services/PermitVerificationService";
+import { AgentPersonnel, AgentPersonnelRole, AgentPersonnelStatus } from "../entities/AgentPersonnel";
+import { assertWizardStaffingMet, AgencyStaffingRequirementError, computeAndRefreshStaffingFlag } from "../services/AgencyStaffingService";
 import * as crypto from "crypto";
 
 // Required-document keys per application category, kept in sync with the
@@ -69,6 +71,7 @@ export class ApplicationController {
     private paymentRepository = AppDataSource.getRepository(PaymentSubmission);
     private certificateRepository = AppDataSource.getRepository(Certificate);
     private userRepository = AppDataSource.getRepository(User);
+    private agentPersonnelRepository = AppDataSource.getRepository(AgentPersonnel);
 
     // Records one immutable audit row. Called on every state-changing
     // action across the whole workflow (submission today; verification/
@@ -1687,6 +1690,25 @@ export class ApplicationController {
             if (!application) return;
             if (!this.requireStatus(application, [ApplicationStatus.AWAITING_FINAL_DG_APPROVAL], res)) return;
 
+            // Server-side staffing enforcement for Agency applications —
+            // per spec, the staffing requirement (>= 3 distinct active
+            // Agents + exactly 1 active Clerk) must be enforced "before
+            // approving, issuing, or renewing" an Agency permit. This is
+            // the approval gate; printCertificate() below is the issuance
+            // gate. The frontend wizard's own Step3OwnersPersonnel.tsx
+            // validation is only a UX convenience and must never be the
+            // sole guard, exactly like REQUIRED_DOCUMENT_KEYS above.
+            if (application.category === ApplicationCategory.AGENCY) {
+                try {
+                    assertWizardStaffingMet(application.data?.personnel);
+                } catch (err) {
+                    if (err instanceof AgencyStaffingRequirementError) {
+                        return errorResponse(res, err.message, [], 409);
+                    }
+                    throw err;
+                }
+            }
+
             let previousStatus: ApplicationStatus = application.status;
             application.status = ApplicationStatus.APPROVED_FOR_ISSUANCE;
             await this.applicationRepository.save(application);
@@ -1805,11 +1827,29 @@ export class ApplicationController {
                 return errorResponse(res, "No certificate record found for this application", [], 409);
             }
 
+            // Re-check the Agency staffing requirement at the issuance gate
+            // too — not just at DG approval — since staffing is read
+            // straight from Application.data.personnel and nothing
+            // prevents time from passing (or, in principle, a correction)
+            // between approval and printing. Per spec: "before approving,
+            // issuing, or renewing".
+            if (application.category === ApplicationCategory.AGENCY) {
+                try {
+                    assertWizardStaffingMet(application.data?.personnel);
+                } catch (err) {
+                    if (err instanceof AgencyStaffingRequirementError) {
+                        return errorResponse(res, err.message, [], 409);
+                    }
+                    throw err;
+                }
+            }
+
             const months = Number(validityMonths) > 0 ? Number(validityMonths) : 12;
             const now = new Date();
             const expiry = new Date(now);
             expiry.setMonth(expiry.getMonth() + months);
             const isLocalBuyer = application.category === ApplicationCategory.LOCAL_BUYER;
+            const isAgency = application.category === ApplicationCategory.AGENCY;
 
             // Everything from here down runs in one transaction so the
             // Local Produce Buyer number allocation (which takes a
@@ -1848,6 +1888,11 @@ export class ApplicationController {
                     lockedCertificate.verificationToken = crypto.randomUUID();
                     lockedCertificate.buyerDisplayName = extractApplicantName(application.category, application.data) || null;
                     lockedCertificate.county = application.data?.buyer?.county || null;
+                } else if (isAgency) {
+                    lockedCertificate.certificateNumber = await this.nextSequentialNumber("CERT", certRepo);
+                    lockedCertificate.verificationToken = crypto.randomUUID();
+                    lockedCertificate.buyerDisplayName = extractApplicantName(application.category, application.data) || null;
+                    lockedCertificate.county = application.data?.agency?.county || null;
                 } else {
                     lockedCertificate.certificateNumber = await this.nextSequentialNumber("CERT", certRepo);
                 }
@@ -1867,6 +1912,52 @@ export class ApplicationController {
 
             if ((certificate as any).alreadyPrinted) {
                 return successResponse(res, { application, certificate }, "Certificate already printed");
+            }
+
+            // For a live (non-historical) Agency application, materialize
+            // the wizard's draft PersonnelRecord[] roster into real,
+            // individually-identified AgentPersonnel rows now that the
+            // Agency has an actual permit number — every Agent is given
+            // this certificate's just-allocated certificateNumber (per
+            // spec: "Every Agent carries the same permit number as their
+            // parent Agency"), and gets its own fresh verification token
+            // so each resolves to a distinct person even though several
+            // share the same printed number. The Clerk gets no permit
+            // number and no token (internal staffing only). Skipped
+            // entirely for every other category.
+            if (isAgency) {
+                const personnelDraft: Array<{ role?: string; fullName?: string; nationalId?: string; phone?: string; county?: string; status?: string }> =
+                    Array.isArray(application.data?.personnel) ? application.data.personnel : [];
+                for (const p of personnelDraft) {
+                    if (!p.fullName || (!!p.status && p.status !== "ACTIVE")) continue;
+                    const isClerk = p.role === "Clerk";
+                    const isAgentRole = p.role === "Agent";
+                    if (!isClerk && !isAgentRole) continue;
+                    const person = this.agentPersonnelRepository.create({
+                        agencyCertificateId: certificate.id,
+                        role: isClerk ? AgentPersonnelRole.CLERK : AgentPersonnelRole.AGENT,
+                        fullName: p.fullName,
+                        permitNumber: isClerk ? null : certificate.certificateNumber,
+                        county: p.county || null,
+                        nationalId: p.nationalId || null,
+                        phone: p.phone || null,
+                        status: AgentPersonnelStatus.ACTIVE,
+                        appointedAt: now,
+                        verificationToken: isClerk ? null : crypto.randomUUID(),
+                        isPubliclyBlocked: false,
+                        requiresAgencyConfirmation: false,
+                        historyLog: [{ action: "APPOINTED", date: now.toISOString(), note: "Appointed at Agency certificate issuance.", performedByName: req.user?.name || "IT Officer" }],
+                    });
+                    await this.agentPersonnelRepository.save(person);
+                }
+                // Recompute the staffing flag now that the real
+                // AgentPersonnel rows exist (expected to show as fully
+                // met immediately after issuance, since issuance itself
+                // is already gated on the wizard roster satisfying the
+                // requirement — this call exists mainly so the Agency
+                // profile's staffing summary is backed by real persisted
+                // records from day one, not just the gate check above).
+                await computeAndRefreshStaffingFlag(AppDataSource, certificate.id);
             }
 
             await this.recordHistory({

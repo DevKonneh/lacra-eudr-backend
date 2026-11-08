@@ -40,6 +40,8 @@ import { FieldEvent } from "./entities/FieldEvent";
 import { MobileSyncStatus } from "./entities/MobileSyncStatus";
 import { LocalProduceBuyerSequence } from "./entities/LocalProduceBuyerSequence";
 import { LocalProduceBuyerImportRun } from "./entities/LocalProduceBuyerImportRun";
+import { AgentPersonnel } from "./entities/AgentPersonnel";
+import { AgencyImportRun } from "./entities/AgencyImportRun";
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -76,7 +78,7 @@ export const AppDataSource = new DataSource({
     ssl: useSsl ? { rejectUnauthorized: false } : false,
     synchronize: synchronizeSchema,
     logging: false,
-    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission, Application, ApplicationStatusHistory, WarehouseAssessment, Invoice, PaymentSubmission, Certificate, FarmerAuditLog, Plot, Commodity, PlotCommodity, Inspection, QualityControl, EnforcementAction, Cooperative, CooperativeFlag, CooperativeChangeLog, CooperativeImportRun, UserAuditLog, UserSession, SignInAttempt, FieldEvent, MobileSyncStatus, LocalProduceBuyerSequence, LocalProduceBuyerImportRun],
+    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission, Application, ApplicationStatusHistory, WarehouseAssessment, Invoice, PaymentSubmission, Certificate, FarmerAuditLog, Plot, Commodity, PlotCommodity, Inspection, QualityControl, EnforcementAction, Cooperative, CooperativeFlag, CooperativeChangeLog, CooperativeImportRun, UserAuditLog, UserSession, SignInAttempt, FieldEvent, MobileSyncStatus, LocalProduceBuyerSequence, LocalProduceBuyerImportRun, AgentPersonnel, AgencyImportRun],
     subscribers: [],
     migrations: [],
 });

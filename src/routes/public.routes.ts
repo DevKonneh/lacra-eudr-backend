@@ -37,6 +37,16 @@ router.get("/batches/:id", generalPublicLimiter, (req, res) => batchController.g
 // status) — see PermitVerificationController + PermitVerificationService.
 router.get("/permits/verify/:token", generalPublicLimiter, (req, res) => permitVerificationController.verifyByToken(req, res));
 
+// ── Agency / Agent permit verification (QR code resolvers) ──────────────────
+// Agencies get their own token (resolved the same way as a Local Produce
+// Buyer permit); each authorized Agent additionally gets their OWN,
+// separate token so a scanner can verify the specific individual even
+// when several Agents under one Agency share that Agency's printed permit
+// number. See PermitVerificationController.verifyAgencyToken /
+// verifyAgentToken + PermitVerificationService's Agent-specific helpers.
+router.get("/agencies/verify/:token", generalPublicLimiter, (req, res) => permitVerificationController.verifyAgencyToken(req, res));
+router.get("/agents/verify/:token", generalPublicLimiter, (req, res) => permitVerificationController.verifyAgentToken(req, res));
+
 // ── Farm Scan (QR code resolver) ─────────────────────────────────────────────
 // These are the endpoints the farm QR code resolves to.
 //
