@@ -105,6 +105,11 @@ export interface PublicPermitView {
     issueDate: Date | null;
     expiryDate: Date | null;
     status: PublicPermitStatus;
+    // Agency's own logo (Certificate.logoUrl) — null for every
+    // non-Agency permit category and for an Agency that hasn't uploaded
+    // one yet. Included here (rather than a separate endpoint) since the
+    // public verify page is the only place this needs to be shown.
+    logoUrl: string | null;
 }
 
 // ---------------------------------------------------------------------
@@ -134,6 +139,14 @@ export interface PublicAgentView {
     agencyName: string;
     agencyStatus: PublicPermitStatus;
     status: PublicAgentStatus;
+    // This Agent's own photo (AgentPersonnel.photoUrl) — null until one
+    // is uploaded via POST /api/agencies/:id/personnel/:personnelId/photo.
+    photoUrl: string | null;
+    // Parent Agency's logo (Certificate.logoUrl), shown alongside the
+    // Agent's own photo on the public Agent verification page so a
+    // scanner can visually cross-check both the person and the Agency
+    // they claim to represent.
+    agencyLogoUrl: string | null;
 }
 
 /**
@@ -169,6 +182,8 @@ export function toPublicAgentView(agent: AgentPersonnel, agencyCertificate: Cert
         agencyName: agencyCertificate.buyerDisplayName || "",
         agencyStatus,
         status: computeAgentPublicStatus(agent, agencyCertificate, agencyApplication, now),
+        photoUrl: agent.photoUrl || null,
+        agencyLogoUrl: agencyCertificate.logoUrl || null,
     };
 }
 
@@ -188,5 +203,6 @@ export function toPublicPermitView(certificate: Certificate, application: Applic
         issueDate: certificate.issueDate,
         expiryDate: certificate.expiryDate,
         status: computePublicStatus(certificate, application, now),
+        logoUrl: certificate.logoUrl || null,
     };
 }

@@ -197,6 +197,15 @@ export class Certificate {
     @Column({ type: "text", nullable: true })
     staffingFlagReason!: string | null;
 
+    // Agency's own logo image (Cloudinary secure_url), set via
+    // POST /api/agencies/:id/logo. Additive, only ever populated for
+    // permitOrLicenceType === "AGENCY" certificates — every other
+    // category leaves this null. Shown on the admin Agency profile header
+    // and on the public Agency verification page
+    // (PermitVerificationService.toPublicPermitView()).
+    @Column({ type: "varchar", nullable: true })
+    logoUrl!: string | null;
+
     @CreateDateColumn()
     createdAt!: Date;
 

@@ -25,6 +25,7 @@ import { successResponse, errorResponse } from "../utils/response";
 import { computePublicStatus } from "../services/PermitVerificationService";
 import { computeAgencyStaffing, computeAndRefreshStaffingFlag } from "../services/AgencyStaffingService";
 import { AgencyImportService, AgencyImportIntegrityError } from "../services/AgencyImportService";
+import { uploadFileToCloudinary } from "../utils/cloudUpload";
 
 function agencyVerificationUrl(token: string): string {
     const base = process.env.FRONTEND_URL || "http://localhost:5173";
@@ -124,6 +125,7 @@ export class AgencyController {
                     isHistoricalImport: cert.isHistoricalImport,
                     hasVerificationToken: !!cert.verificationToken,
                     applicationId: cert.applicationId,
+                    logoUrl: cert.logoUrl || null,
                     staffing: {
                         activeAgents: staffingSummary.activeAgents,
                         activeClerks: staffingSummary.activeClerks,
@@ -193,6 +195,7 @@ export class AgencyController {
                 isHistoricalImport: certificate.isHistoricalImport,
                 hasVerificationToken: !!certificate.verificationToken,
                 applicationId: certificate.applicationId,
+                logoUrl: certificate.logoUrl || null,
                 staffing: {
                     activeAgents: staffingSummary.activeAgents,
                     activeClerks: staffingSummary.activeClerks,
@@ -253,6 +256,67 @@ export class AgencyController {
             return res.send(pngBuffer);
         } catch (error: any) {
             return errorResponse(res, "Error generating QR code", [error.message], 500);
+        }
+    }
+
+    /**
+     * POST /api/agencies/:id/logo — upload/replace this Agency's own logo
+     * image. Multipart form field name: "file" (same convention as
+     * ApplicationController.uploadDocument and Farmer/Farm photo uploads).
+     * Stored on Cloudinary (never on Render's ephemeral disk) via the
+     * shared uploadFileToCloudinary() helper; the returned secure_url is
+     * persisted on Certificate.logoUrl and immediately reflected in both
+     * the register listing, the Agency profile, and the public Agency
+     * verification page.
+     */
+    async uploadAgencyLogo(req: any, res: Response) {
+        try {
+            const { id } = req.params;
+            const file = req.file as Express.Multer.File | undefined;
+            if (!file) {
+                return errorResponse(res, "No file provided (expected a 'file' field)", [], 400);
+            }
+
+            const certificate = await this.certificateRepository.findOne({ where: { id, permitOrLicenceType: ApplicationCategory.AGENCY } });
+            if (!certificate) return errorResponse(res, "Agency not found", [], 404);
+
+            const logoUrl = await uploadFileToCloudinary(file);
+            certificate.logoUrl = logoUrl;
+            await this.certificateRepository.save(certificate);
+
+            return successResponse(res, { logoUrl }, "Agency logo uploaded successfully");
+        } catch (error: any) {
+            return errorResponse(res, "Error uploading Agency logo", [error.message], 500);
+        }
+    }
+
+    /**
+     * POST /api/agencies/:id/personnel/:personnelId/photo — upload/replace
+     * an Agent's or Clerk's own photo. Same multipart convention and
+     * Cloudinary storage as uploadAgencyLogo() above. Available for
+     * either role: a Clerk's photo is only ever shown on the internal
+     * Agency profile roster (Clerks have no public verification page),
+     * while an Agent's photo also appears on their public verification
+     * page (toPublicAgentView().photoUrl).
+     */
+    async uploadPersonnelPhoto(req: any, res: Response) {
+        try {
+            const { id, personnelId } = req.params;
+            const file = req.file as Express.Multer.File | undefined;
+            if (!file) {
+                return errorResponse(res, "No file provided (expected a 'file' field)", [], 400);
+            }
+
+            const person = await this.personnelRepository.findOne({ where: { id: personnelId, agencyCertificateId: id } });
+            if (!person) return errorResponse(res, "Personnel record not found", [], 404);
+
+            const photoUrl = await uploadFileToCloudinary(file);
+            person.photoUrl = photoUrl;
+            await this.personnelRepository.save(person);
+
+            return successResponse(res, { photoUrl }, `${person.role === AgentPersonnelRole.AGENT ? "Agent" : "Clerk"} photo uploaded successfully`);
+        } catch (error: any) {
+            return errorResponse(res, "Error uploading personnel photo", [error.message], 500);
         }
     }
 

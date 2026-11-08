@@ -2,6 +2,7 @@ import { Router } from "express";
 import { AgencyController } from "../controllers/AgencyController";
 import { authMiddleware } from "../middleware/auth.middleware";
 import { UserRole } from "../entities/User";
+import { upload } from "../middleware/upload.middleware";
 
 const router = Router();
 const controller = new AgencyController();
@@ -25,6 +26,13 @@ router.get("/import/runs", authMiddleware([UserRole.ADMIN]), (req, res) => contr
 router.get("/:id", authMiddleware(), (req, res) => controller.getOne(req, res));
 router.get("/:id/qr-code", authMiddleware(), (req, res) => controller.downloadQrCode(req, res));
 router.get("/:id/personnel/:personnelId/qr-code", authMiddleware(), (req, res) => controller.downloadPersonnelQrCode(req, res));
+
+// Logo/photo uploads — any authenticated staff member (consistent with
+// the roster-management routes below), multipart field name "file",
+// stored on Cloudinary via the same upload.middleware/cloudUpload
+// pipeline already used for Farmer/Farm/Application document uploads.
+router.post("/:id/logo", authMiddleware(), upload.single("file"), (req, res) => controller.uploadAgencyLogo(req, res));
+router.post("/:id/personnel/:personnelId/photo", authMiddleware(), upload.single("file"), (req, res) => controller.uploadPersonnelPhoto(req, res));
 
 // Staffing roster management — any authenticated staff member (consistent
 // with the register's own read access); conflict resolution and

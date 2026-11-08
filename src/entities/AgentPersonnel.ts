@@ -81,6 +81,16 @@ export class AgentPersonnel {
     @Column({ type: "varchar", nullable: true })
     phone!: string | null;
 
+    // This person's own photo (Cloudinary secure_url), set via
+    // POST /api/agencies/:agencyId/personnel/:personnelId/photo. Set for
+    // either role (Agent or Clerk) — a Clerk still has no public
+    // verification page, but their photo is useful on the internal Agency
+    // profile roster view. Shown on the admin Agency profile's
+    // Agents/Clerk tables and, for Agents only, on the public Agent
+    // verification page (PermitVerificationService.toPublicAgentView()).
+    @Column({ type: "varchar", nullable: true })
+    photoUrl!: string | null;
+
     @Column({ type: "simple-enum", enum: AgentPersonnelStatus, default: AgentPersonnelStatus.ACTIVE })
     status!: AgentPersonnelStatus;
 
