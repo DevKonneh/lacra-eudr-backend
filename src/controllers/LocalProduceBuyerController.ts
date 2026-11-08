@@ -18,6 +18,7 @@ import { Application, ApplicationCategory } from "../entities/Application";
 import { successResponse, errorResponse } from "../utils/response";
 import { computePublicStatus, liberiaToday } from "../services/PermitVerificationService";
 import { LocalProduceBuyerImportService, LocalProduceBuyerImportIntegrityError } from "../services/LocalProduceBuyerImportService";
+import { uploadFileToCloudinary } from "../utils/cloudUpload";
 
 // Base URL the printed/downloaded QR encodes. Mirrors the existing
 // FRONTEND_URL-based pattern used for farmer/farm QR codes
@@ -105,6 +106,7 @@ export class LocalProduceBuyerController {
                 agencyCertificateId: cert.agencyCertificateId,
                 hasVerificationToken: !!cert.verificationToken,
                 applicationId: cert.applicationId,
+                photoUrl: cert.logoUrl || null,
             }));
 
             return successResponse(res, { records: data, total, page, pageSize });
@@ -274,6 +276,38 @@ export class LocalProduceBuyerController {
             return successResponse(res, certificate, "Buyer linked to agency as Agent");
         } catch (error: any) {
             return errorResponse(res, "Error linking buyer to agency", [error.message], 500);
+        }
+    }
+
+    /**
+     * POST /api/local-produce-buyers/:id/photo — upload/replace a Local
+     * Produce Buyer's own profile photo. Reuses Certificate.logoUrl (the
+     * same column Agency certificates use for their logo) rather than
+     * adding a parallel column — the field is generic ("this certificate's
+     * own representative image"), only its UI label differs per register.
+     * Same multipart convention and Cloudinary storage as
+     * AgencyController.uploadAgencyLogo(). Shown on the admin register's
+     * avatar column and on the public QR verification page
+     * (PermitVerificationService.toPublicPermitView().logoUrl).
+     */
+    async uploadBuyerPhoto(req: any, res: Response) {
+        try {
+            const { id } = req.params;
+            const file = req.file as Express.Multer.File | undefined;
+            if (!file) {
+                return errorResponse(res, "No file provided (expected a 'file' field)", [], 400);
+            }
+
+            const certificate = await this.certificateRepository.findOne({ where: { id, permitOrLicenceType: "LOCAL_BUYER" } });
+            if (!certificate) return errorResponse(res, "Local Produce Buyer not found", [], 404);
+
+            const photoUrl = await uploadFileToCloudinary(file);
+            certificate.logoUrl = photoUrl;
+            await this.certificateRepository.save(certificate);
+
+            return successResponse(res, { photoUrl }, "Photo uploaded successfully");
+        } catch (error: any) {
+            return errorResponse(res, "Error uploading photo", [error.message], 500);
         }
     }
 }

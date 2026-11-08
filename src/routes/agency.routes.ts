@@ -1,11 +1,13 @@
 import { Router } from "express";
 import { AgencyController } from "../controllers/AgencyController";
+import { ComplianceActionController } from "../controllers/ComplianceActionController";
 import { authMiddleware } from "../middleware/auth.middleware";
 import { UserRole } from "../entities/User";
 import { upload } from "../middleware/upload.middleware";
 
 const router = Router();
 const controller = new AgencyController();
+const complianceController = new ComplianceActionController();
 
 // Register listing/filters/profile — any authenticated staff member with
 // access to Licensing & Permits can view, consistent with the Local
@@ -44,5 +46,14 @@ router.patch("/:id/personnel/:personnelId/deactivate", authMiddleware(), (req, r
 router.post("/:id/personnel/:personnelId/link", authMiddleware([UserRole.ADMIN]), (req, res) => controller.linkPersonnelToAgency(req, res));
 
 router.patch("/:id/resolve-conflict", authMiddleware([UserRole.ADMIN]), (req, res) => controller.resolveConflict(req, res));
+
+// Compliance actions (Warning / Fine / Suspend / Revoke / Reinstate) —
+// create is ADMIN-only (matches resolve-conflict/link-personnel gating);
+// history is viewable by any authenticated staff member, same as the
+// register/profile itself.
+router.get("/:id/compliance-actions", authMiddleware(), (req, res) => complianceController.listForCertificate(req, res));
+router.post("/:id/compliance-actions", authMiddleware([UserRole.ADMIN]), (req, res) => complianceController.createForCertificate(req, res));
+router.get("/:agencyId/personnel/:personnelId/compliance-actions", authMiddleware(), (req, res) => complianceController.listForPersonnel(req, res));
+router.post("/:agencyId/personnel/:personnelId/compliance-actions", authMiddleware([UserRole.ADMIN]), (req, res) => complianceController.createForPersonnel(req, res));
 
 export default router;
