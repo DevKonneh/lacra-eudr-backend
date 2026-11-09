@@ -27,20 +27,33 @@ import * as crypto from "crypto";
 // already required to provide.
 const REQUIRED_DOCUMENT_KEYS: Record<string, string[]> = {
     LOCAL_BUYER: ["nationalIdOrPassport", "businessRegistration", "passportPhoto"],
-    AGENCY: ["ownerIdOrPassport", "citizenshipProof", "businessRegistration", "bankStatement", "personnelIds", "warehouseDocs"],
+    // Matches LACRA's official Agency checklist exactly (8 required items)
+    // \u2014 dropped the previous warehouseDocs/personnelIds items (not part
+    // of the official regulation's document list; see
+    // documentRequirements.ts's AGENCY entry for the full reasoning) in
+    // favor of the exact items the regulation names: proof all owners are
+    // Liberian, owners' Liberian ID/passport, business registration, bank
+    // statement ($5,000 min), the 4-linked-persons registration record,
+    // and 3 separate passport-photo items (agency head / 3 buyers / clerk).
+    AGENCY: [
+        "ownersLiberianProof", "ownersIds", "businessRegistration", "bankStatement",
+        "personnelRegistration", "agencyHeadPhoto", "buyersPhotos", "clerkPhoto",
+    ],
+    // Mirrors Agency's structure applied to Cooperative's own official
+    // regulation requirements (see documentRequirements.ts's COOPERATIVE
+    // entry) \u2014 dropped the previous standalone warehouseDocs item.
     COOPERATIVE: [
         "cdaCertificate", "businessRegistration", "taxClearance", "articlesOfIncorporation", "bylaws",
         "constitution", "bankStatement", "leadershipList", "farmerMemberList", "leadershipIds",
-        "personnelIds", "warehouseDocs",
+        "personnelRegistration", "leadershipPhotos", "buyersPhotos", "clerkPhoto",
     ],
-    LOCAL_EXPORTER: [
-        "businessRegistration", "taxClearance", "bankConfirmation", "ownersIds", "citizenshipProof",
-        "warehouseDocs", "qualityControlDocs", "supplierInfo",
-    ],
-    FOREIGN_EXPORTER: [
-        "businessRegistration", "taxClearance", "bankConfirmation", "ownersIds",
-        "warehouseDocs", "qualityControlDocs", "supplierInfo",
-    ],
+    // Mirrors Agency's removal of warehouseDocs/qualityControlDocs/
+    // supplierInfo (not part of LACRA's official Exporter document list;
+    // see documentRequirements.ts's LOCAL_EXPORTER/FOREIGN_EXPORTER
+    // entries). sbaAcknowledgement stays intentionally absent from this
+    // REQUIRED list (it's optional, per the standing SBA decision).
+    LOCAL_EXPORTER: ["businessRegistration", "taxClearance", "bankStatement", "ownersIds", "citizenshipProof"],
+    FOREIGN_EXPORTER: ["businessRegistration", "taxClearance", "bankStatement", "ownersIds"],
 };
 
 // Pulls a human-readable applicant/business name out of the category-

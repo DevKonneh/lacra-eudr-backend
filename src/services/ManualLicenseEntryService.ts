@@ -119,6 +119,19 @@ export interface ManualLicenseEntryInput {
     validityMonths?: number;
     documents?: ManualLicenseEntryDocument[];
     notes?: string;
+
+    // Exporter-only, OPTIONAL — Standard Basic Agreement (SBA) execution
+    // status. Per LACRA's regulation, an Exporter applicant must execute
+    // an SBA "before operational commencement where required as part of
+    // issuance/control" — but this is a NEW tracking field being added
+    // going forward, and historical paper-issued records being backfilled
+    // through this form were never asked for it. Deliberately left
+    // optional (not required, unlike every Section A/B/C field above) so
+    // staff can record what they actually know today (checked, left
+    // blank/unknown, or a free-text note on status) without blocking
+    // entry of old records. Ignored for every non-EXPORTER category.
+    sbaExecuted?: boolean;
+    sbaNotes?: string;
 }
 
 export class ManualLicenseEntryValidationError extends Error {
@@ -273,6 +286,12 @@ export class ManualLicenseEntryService {
             expectedAreasOfOperation: rawInput.expectedAreasOfOperation.trim(),
             documents: rawInput.documents || [],
             notes: rawInput.notes?.trim() || null,
+            // Exporter-only, optional (see ManualLicenseEntryInput's doc
+            // comment on sbaExecuted) — stored as null for every other
+            // category regardless of what was sent, since SBA tracking
+            // has no meaning outside EXPORTER.
+            sbaExecuted: rawInput.category === "EXPORTER" ? !!rawInput.sbaExecuted : null,
+            sbaNotes: rawInput.category === "EXPORTER" ? (rawInput.sbaNotes?.trim() || null) : null,
         };
 
         const { application, certificate } = await AppDataSource.transaction(async (manager) => {
