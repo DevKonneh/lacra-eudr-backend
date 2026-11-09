@@ -192,6 +192,8 @@ import monitoringRoutes from "./routes/monitoring.routes";
 import localProduceBuyerRoutes from "./routes/localProduceBuyer.routes";
 import agencyRoutes from "./routes/agency.routes";
 import exporterRoutes from "./routes/exporter.routes";
+import cooperativePermitRoutes from "./routes/cooperativePermit.routes";
+import manualLicenseEntryRoutes from "./routes/manualLicenseEntry.routes";
 
 app.use("/api/public", publicRoutes);
 app.use("/api/business", businessRoutes);
@@ -225,6 +227,15 @@ app.use("/api/monitoring", monitoringRoutes);
 app.use("/api/local-produce-buyers", localProduceBuyerRoutes);
 app.use("/api/agencies", agencyRoutes);
 app.use("/api/exporters", exporterRoutes);
+// New Cooperative CERTIFICATE/permit register — deliberately NOT
+// /api/cooperatives, which is already taken by the unrelated CDA
+// Cooperative directory (membership/location reference data, mounted
+// above). See CooperativePermitController.ts's doc comment.
+app.use("/api/cooperative-permits", cooperativePermitRoutes);
+// Manual historical license-entry endpoint backing the new "License
+// Registry -> Apply for New License" staff form (see
+// ManualLicenseEntryService.ts).
+app.use("/api/manual-license-entries", manualLicenseEntryRoutes);
 
 import { errorHandler } from "./middleware/error.middleware";
 app.use(errorHandler);

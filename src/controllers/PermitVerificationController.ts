@@ -22,6 +22,7 @@ import { Certificate } from "../entities/Certificate";
 import { Application } from "../entities/Application";
 import { AgentPersonnel } from "../entities/AgentPersonnel";
 import { toPublicPermitView, hasIssuedPermitNumber, toPublicAgentView, hasIssuedAgentPermitNumber } from "../services/PermitVerificationService";
+import { COOPERATIVE_PERMIT_TYPE } from "../services/ManualLicenseEntryService";
 
 export class PermitVerificationController {
     private certificateRepository = AppDataSource.getRepository(Certificate);
@@ -156,6 +157,49 @@ export class PermitVerificationController {
             return res.status(200).json({ success: true, data: view });
         } catch (error: any) {
             return res.status(500).json({ success: false, message: "Error verifying export license", errors: [error.message] });
+        }
+    }
+
+    /**
+     * GET /api/public/cooperatives/verify/:token
+     *
+     * What a Cooperative's own printed/downloadable QR code resolves to.
+     * Certificate.verificationToken is already a single unique column
+     * across every permitOrLicenceType, so this is functionally
+     * equivalent to verifyByToken() above — kept as its own named method
+     * (mirrors verifyAgencyToken()/verifyExporterToken()) so the
+     * public-facing URL and response shape are allowed to diverge for
+     * Cooperatives in the future without touching any other register's
+     * route contract. Identical 404 for unknown/blocked/no-permit-number
+     * tokens, matching every other register's existence-hiding behavior.
+     */
+    async verifyCooperativeToken(req: Request, res: Response) {
+        try {
+            const { token } = req.params;
+            if (!token) {
+                return res.status(400).json({ success: false, message: "Missing verification token" });
+            }
+
+            const certificate = await this.certificateRepository.findOne({ where: { verificationToken: token, permitOrLicenceType: COOPERATIVE_PERMIT_TYPE } });
+            if (!certificate || certificate.isPubliclyBlocked || !hasIssuedPermitNumber(certificate)) {
+                return res.status(404).json({
+                    success: false,
+                    message: "This permit could not be verified. The QR code may be invalid or the record is not yet published.",
+                });
+            }
+
+            const application = await this.applicationRepository.findOne({ where: { id: certificate.applicationId } });
+            if (!application) {
+                return res.status(404).json({
+                    success: false,
+                    message: "This permit could not be verified. The QR code may be invalid or the record is not yet published.",
+                });
+            }
+
+            const view = toPublicPermitView(certificate, application);
+            return res.status(200).json({ success: true, data: view });
+        } catch (error: any) {
+            return res.status(500).json({ success: false, message: "Error verifying cooperative permit", errors: [error.message] });
         }
     }
 

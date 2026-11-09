@@ -53,6 +53,12 @@ router.get("/agents/verify/:token", generalPublicLimiter, (req, res) => permitVe
 // PermitVerificationController.verifyExporterToken.
 router.get("/exporters/verify/:token", generalPublicLimiter, (req, res) => permitVerificationController.verifyExporterToken(req, res));
 
+// ── Cooperative permit verification (QR code resolver) ──────────────────────
+// Each eligible issued Cooperative permit gets its own stable token
+// (resolved the same way as every other register's permit). See
+// PermitVerificationController.verifyCooperativeToken.
+router.get("/cooperatives/verify/:token", generalPublicLimiter, (req, res) => permitVerificationController.verifyCooperativeToken(req, res));
+
 // ── Farm Scan (QR code resolver) ─────────────────────────────────────────────
 // These are the endpoints the farm QR code resolves to.
 //
