@@ -206,6 +206,28 @@ export class Certificate {
     @Column({ type: "varchar", nullable: true })
     logoUrl!: string | null;
 
+    // -----------------------------------------------------------------
+    // Exporter Register support. Additive, only ever populated for
+    // permitOrLicenceType === "LOCAL_EXPORTER" or "FOREIGN_EXPORTER"
+    // certificates; every other category leaves this null. Every other
+    // field the Exporter Register needs (county, isPubliclyBlocked,
+    // publicBlockReason, stagedPermitNumber, sourceRecordId,
+    // isHistoricalImport, importRawData, verificationToken,
+    // buyerDisplayName as the company name) is already generic enough on
+    // this entity and is reused as-is, exactly like the Agency Register
+    // reused the Local Produce Buyer block before it.
+    // -----------------------------------------------------------------
+
+    // Holds the SECOND, disputed county value for a record under staff
+    // review (e.g. Meridian Commodity Inc. — the historical overview says
+    // Montserrado, the company's own historical QR says Nimba). The
+    // primary/first-recorded value stays in `county` above; this field
+    // exists purely so neither candidate value is ever discarded while
+    // the record is held for review. Null for every normal (non-disputed)
+    // Exporter certificate and for every non-Exporter certificate.
+    @Column({ type: "varchar", nullable: true })
+    disputedCounty!: string | null;
+
     @CreateDateColumn()
     createdAt!: Date;
 

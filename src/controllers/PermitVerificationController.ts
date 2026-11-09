@@ -116,6 +116,50 @@ export class PermitVerificationController {
     }
 
     /**
+     * GET /api/public/exporters/verify/:token
+     *
+     * What an Exporter's own printed/downloadable QR code resolves to.
+     * Certificate.verificationToken is already a single unique column
+     * across every permitOrLicenceType, so this is functionally
+     * equivalent to verifyByToken() above — kept as its own named method
+     * (mirrors verifyAgencyToken()) so the public-facing URL and response
+     * shape are allowed to diverge for Exporters in the future without
+     * touching any other register's route contract. A held/blocked record
+     * (e.g. Meridian Commodity Inc., pending county confirmation) and a
+     * genuinely nonexistent token return the exact same 404, matching
+     * every other register's existence-hiding behavior.
+     */
+    async verifyExporterToken(req: Request, res: Response) {
+        try {
+            const { token } = req.params;
+            if (!token) {
+                return res.status(400).json({ success: false, message: "Missing verification token" });
+            }
+
+            const certificate = await this.certificateRepository.findOne({ where: { verificationToken: token, permitOrLicenceType: "EXPORTER" } });
+            if (!certificate || certificate.isPubliclyBlocked || !hasIssuedPermitNumber(certificate)) {
+                return res.status(404).json({
+                    success: false,
+                    message: "This export license could not be verified. The QR code may be invalid or the record is not yet published.",
+                });
+            }
+
+            const application = await this.applicationRepository.findOne({ where: { id: certificate.applicationId } });
+            if (!application) {
+                return res.status(404).json({
+                    success: false,
+                    message: "This export license could not be verified. The QR code may be invalid or the record is not yet published.",
+                });
+            }
+
+            const view = toPublicPermitView(certificate, application);
+            return res.status(200).json({ success: true, data: view });
+        } catch (error: any) {
+            return res.status(500).json({ success: false, message: "Error verifying export license", errors: [error.message] });
+        }
+    }
+
+    /**
      * GET /api/public/agents/verify/:token
      *
      * What an individual Agent's own printed/downloadable QR code resolves

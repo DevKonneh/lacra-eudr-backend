@@ -14,6 +14,7 @@ import { LocalProduceBuyerNumberService } from "../services/LocalProduceBuyerNum
 import { computePublicStatus, hasIssuedPermitNumber } from "../services/PermitVerificationService";
 import { AgentPersonnel, AgentPersonnelRole, AgentPersonnelStatus } from "../entities/AgentPersonnel";
 import { assertWizardStaffingMet, AgencyStaffingRequirementError, computeAndRefreshStaffingFlag } from "../services/AgencyStaffingService";
+import { EXPORTER_PERMIT_TYPE } from "../services/ExporterImportService";
 import * as crypto from "crypto";
 
 // Required-document keys per application category, kept in sync with the
@@ -1729,9 +1730,20 @@ export class ApplicationController {
             // creating it implicitly inside printCertificate().
             const existing = await this.certificateRepository.findOne({ where: { applicationId: application.id } });
             if (!existing) {
+                // Exporter applications (LOCAL_EXPORTER / FOREIGN_EXPORTER)
+                // use the unified "EXPORTER" permitOrLicenceType so live
+                // issuances land in the same Exporter Register as the
+                // historical import batch, which has no Local/Foreign
+                // column of its own — see ExporterImportService.ts's doc
+                // comment and migrations/2032_exporter_register/README.md
+                // for the full rationale. Every other category keeps using
+                // its own Application.category value as before.
+                const isExporterCategory =
+                    application.category === ApplicationCategory.LOCAL_EXPORTER ||
+                    application.category === ApplicationCategory.FOREIGN_EXPORTER;
                 const certificate = this.certificateRepository.create({
                     applicationId: application.id,
-                    permitOrLicenceType: application.category,
+                    permitOrLicenceType: isExporterCategory ? EXPORTER_PERMIT_TYPE : application.category,
                 });
                 await this.certificateRepository.save(certificate);
             }
@@ -1850,6 +1862,9 @@ export class ApplicationController {
             expiry.setMonth(expiry.getMonth() + months);
             const isLocalBuyer = application.category === ApplicationCategory.LOCAL_BUYER;
             const isAgency = application.category === ApplicationCategory.AGENCY;
+            const isExporter =
+                application.category === ApplicationCategory.LOCAL_EXPORTER ||
+                application.category === ApplicationCategory.FOREIGN_EXPORTER;
 
             // Everything from here down runs in one transaction so the
             // Local Produce Buyer number allocation (which takes a
@@ -1893,6 +1908,22 @@ export class ApplicationController {
                     lockedCertificate.verificationToken = crypto.randomUUID();
                     lockedCertificate.buyerDisplayName = extractApplicantName(application.category, application.data) || null;
                     lockedCertificate.county = application.data?.agency?.county || null;
+                } else if (isExporter) {
+                    // Live (non-historical) Exporter issuance — mirrors the
+                    // Agency branch above so newly issued export licenses
+                    // appear in the Exporter Register and resolve on the
+                    // public QR verification page exactly like the
+                    // historical-import batch does. permitOrLicenceType was
+                    // already set to the unified EXPORTER_PERMIT_TYPE
+                    // constant back in dgApproveFinal(); it is re-asserted
+                    // here defensively in case an older certificate row
+                    // (created before this change) still holds the raw
+                    // LOCAL_EXPORTER/FOREIGN_EXPORTER category value.
+                    lockedCertificate.permitOrLicenceType = EXPORTER_PERMIT_TYPE;
+                    lockedCertificate.certificateNumber = await this.nextSequentialNumber("CERT", certRepo);
+                    lockedCertificate.verificationToken = crypto.randomUUID();
+                    lockedCertificate.buyerDisplayName = extractApplicantName(application.category, application.data) || null;
+                    lockedCertificate.county = application.data?.exporter?.county || null;
                 } else {
                     lockedCertificate.certificateNumber = await this.nextSequentialNumber("CERT", certRepo);
                 }

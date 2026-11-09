@@ -47,6 +47,12 @@ router.get("/permits/verify/:token", generalPublicLimiter, (req, res) => permitV
 router.get("/agencies/verify/:token", generalPublicLimiter, (req, res) => permitVerificationController.verifyAgencyToken(req, res));
 router.get("/agents/verify/:token", generalPublicLimiter, (req, res) => permitVerificationController.verifyAgentToken(req, res));
 
+// ── Exporter licence verification (QR code resolver) ────────────────────────
+// Each eligible issued Exporter license gets its own stable token (resolved
+// the same way as every other register's permit). See
+// PermitVerificationController.verifyExporterToken.
+router.get("/exporters/verify/:token", generalPublicLimiter, (req, res) => permitVerificationController.verifyExporterToken(req, res));
+
 // ── Farm Scan (QR code resolver) ─────────────────────────────────────────────
 // These are the endpoints the farm QR code resolves to.
 //
