@@ -1367,26 +1367,31 @@ export class FarmerController {
 
     /**
      * GET /api/public/farmers/:id — the endpoint every farmer QR code
-     * resolves to. Reachable by anyone who scans a card/QR, with NO
-     * authentication required (optionalAuthMiddleware on the route — see
-     * public.routes.ts), so this must never return sensitive PII unless
-     * the caller presents a valid staff JWT.
+     * (printed on the farmer's physical ID card) resolves to. Reachable by
+     * anyone who scans a card/QR, with NO authentication required
+     * (optionalAuthMiddleware on the route — see public.routes.ts), so this
+     * must never return sensitive PII unless the caller presents a valid
+     * staff JWT.
      *
      * Two response shapes, selected by whether `req.user` was populated:
      *
-     *  - ANONYMOUS (no token / invalid-expired token): "basic verification"
-     *    view only — name, Farmer ID, identity status, general area
-     *    (community/district/region), farm name/crop/registration status,
-     *    and a privacy-reduced farm location (centroid point only, not the
-     *    full walked boundary polygon). Confirms "this Farmer ID / card is
-     *    real and belongs to this person" without exposing anything an
-     *    anonymous scanner could misuse (ID photo, signature, consent
-     *    evidence, phone, national ID, DOB, exact farm boundary, etc.).
+     *  - ANONYMOUS (no token / invalid-expired token) — e.g. WHIMO or LACRA
+     *    Trace scanning the farmer's card in the field: "geo" view only.
+     *    Per the FAO OpenForis GeoID spec (https://www.openforis.org/geoid/),
+     *    GeoID converts a plot's location geometry into a fixed-size,
+     *    anonymous, attribute-less identifier so a plot's identity can be
+     *    exchanged along the traceability chain WITHOUT exposing the raw
+     *    geolocation or the farmer's PII. WHIMO/LACRA Trace only ever need
+     *    GeoID + geometry here (same geo-only shape already used by
+     *    FarmScanController's farm-QR scan — kept consistent on purpose),
+     *    never the farmer's name, photo, contact details, or any other
+     *    identity attribute.
      *
-     *  - AUTHENTICATED STAFF (ADMIN / INSPECTOR / BUYER / EXPORTER token):
-     *    full profile, unchanged from the previous behaviour — same shape
-     *    already relied on by FarmerProfile.tsx / ExportController, so no
-     *    internal workflow breaks.
+     *  - AUTHENTICATED STAFF (ADMIN / INSPECTOR / BUYER / EXPORTER token) —
+     *    i.e. LACRA's own Farm Mapping Tools app/admin panel scanning the
+     *    SAME card: full profile, unchanged from the previous behaviour —
+     *    same shape already relied on by FarmerProfile.tsx / ExportController,
+     *    so no internal workflow breaks.
      *
      * Route is also wrapped in generalPublicLimiter (rate limiting) — see
      * public.routes.ts — as a second layer of abuse protection regardless
@@ -1413,42 +1418,61 @@ export class FarmerController {
             ].includes(requester.role);
 
             if (!isAuthorizedStaff) {
-                // ── ANONYMOUS / BASIC VERIFICATION VIEW ────────────────────────
-                // No identity-document photos, no consent evidence, no contact
-                // details, no national ID / DOB / exact address, and no precise
-                // farm boundary geometry — only what's needed to confirm the
-                // card/QR corresponds to a real, registered farmer.
-                const basicData = {
+                // ── ANONYMOUS / GEO-ONLY VIEW (WHIMO / LACRA Trace / any
+                // external scanner) ───────────────────────────────────────────
+                // Zero farmer PII — no name, no photo, no contact info, no
+                // identity-document data. Only each registered farm's GeoID
+                // (an anonymous, geometry-derived identifier — see GeoIdService)
+                // plus the geometry/compliance attributes WHIMO/LACRA Trace
+                // actually need to pre-fill a transaction's location, mirroring
+                // FarmScanController.scan()'s geo payload field-for-field so
+                // downstream integrations only need to understand one shape.
+                //
+                // `farmerId` (the human-readable "LACRA-XXXXXXXX" code) is kept
+                // because it is already printed in plaintext on the physical
+                // card itself — it is a reference code, not PII, and lets an
+                // external system correlate the scan back to the printed card
+                // without exposing anything private.
+                const geoData = {
                     id: farmer.id,
                     farmerId: farmer.farmerId,
-                    firstName: farmer.firstName,
-                    lastName: farmer.lastName,
-                    identityStatus: farmer.identityStatus,
-                    community: farmer.community,
-                    district: farmer.district,
-                    region: farmer.region,
-                    cooperativeName: farmer.cooperativeName,
-                    // Profile photo helps a human visually match the card to the
-                    // person in front of them — treated as basic verification
-                    // info, unlike the ID-document photo/signature below.
-                    profilePhoto: farmer.profilePhoto,
                     farms: farmer.farms.map(f => {
                         const geometry = GeoIdService.normaliseGeometry(f.location);
                         const centroid = geometry ? GeoIdService.centroidFromGeometry(geometry) : null;
                         return {
-                            name: f.name,
+                            farmId: f.id,
+                            geoId: f.geoId ?? null,
+                            geoIdUri: f.geoIdUri ?? null,
+                            // Centroid + full polygon are part of what GeoID
+                            // resolves to (same as FarmScanController) — the
+                            // anonymity GeoID provides is over the farmer's
+                            // IDENTITY, not the geometry itself, which is what
+                            // WHIMO/Whisp need for the compliance/traceability
+                            // chain.
+                            centroid: centroid ? { lat: centroid.lat, lng: centroid.lng } : null,
+                            geojson: geometry
+                                ? {
+                                    type: "Feature",
+                                    id: f.geoId ?? f.id,
+                                    geometry,
+                                    properties: {
+                                        farmId: f.id,
+                                        geoId: f.geoId ?? null,
+                                        cropType: f.cropType,
+                                        totalAreaHa: f.totalAreaHa ?? null,
+                                        riskLevel: f.riskLevel,
+                                    },
+                                }
+                                : null,
                             cropType: f.cropType,
-                            farmRegistrationStatus: f.farmRegistrationStatus,
-                            // Centroid point only — NOT the full walked boundary
-                            // polygon, which is precise-enough to pinpoint the
-                            // farm's exact footprint and is reserved for
-                            // authorized staff.
-                            approximateLocation: centroid,
+                            totalAreaHa: f.totalAreaHa ?? null,
+                            riskLevel: f.riskLevel,
+                            farmRegistrationStatus: f.farmRegistrationStatus ?? null,
                         };
                     }),
-                    _access: "basic", // lets the frontend distinguish the two shapes without guessing from field presence
+                    _access: "geo", // lets the frontend distinguish the two shapes without guessing from field presence
                 };
-                return successResponse(res, basicData);
+                return successResponse(res, geoData);
             }
 
             // ── AUTHENTICATED STAFF / FULL VIEW (unchanged) ──────────────────

@@ -16,15 +16,20 @@ const batchController = new BatchController();
 const farmScanController = new FarmScanController();
 const permitVerificationController = new PermitVerificationController();
 
-// ── Farmer profile (QR-code / card verification target) ─────────────────────
+// ── Farmer profile (QR-code / card scan target — WHIMO / LACRA Trace / our
+// own Farm Mapping Tools app) ────────────────────────────────────────────────
 // This is what every farmer's QR code and printed card resolve to, and it
 // must stay reachable with NO login (that's the whole point of a scannable
-// card). optionalAuthMiddleware decodes a Bearer token WHEN ONE IS SENT but
-// never rejects the request for lacking one — getPublicFarmer() then uses
-// req.user (if populated) to decide which of two response shapes to return:
-// a redacted "basic verification" view for anonymous scanners, or the full
-// profile for an authenticated ADMIN/INSPECTOR/BUYER/EXPORTER session (see
-// getPublicFarmer() for the exact field-level split).
+// card — WHIMO and LACRA Trace scan it anonymously). optionalAuthMiddleware
+// decodes a Bearer token WHEN ONE IS SENT but never rejects the request for
+// lacking one — getPublicFarmer() then uses req.user (if populated) to
+// decide which of two response shapes to return:
+//   - anonymous (WHIMO / LACRA Trace / any outside scanner): GeoID + farm
+//     geometry only, zero farmer PII, per the FAO OpenForis GeoID spec
+//     (https://www.openforis.org/geoid/).
+//   - authenticated ADMIN/INSPECTOR/BUYER/EXPORTER (our own app/admin panel):
+//     full farmer + farm profile, unchanged.
+// See getPublicFarmer() for the exact field-level split.
 router.get("/farmers/:id", generalPublicLimiter, optionalAuthMiddleware(), (req, res) => farmerController.getPublicFarmer(req, res));
 
 // ── Batch (public supply-chain view) ────────────────────────────────────────
