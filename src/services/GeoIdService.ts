@@ -20,6 +20,7 @@
 
 import axios, { AxiosInstance } from 'axios';
 import * as turf from '@turf/turf';
+import QRCode from 'qrcode';
 
 // ─── Types mirrored from the FAO openapi.json ────────────────────────────────
 
@@ -251,14 +252,201 @@ export class GeoIdService {
     }
 
     /**
-     * Build the public farm-scan URL that gets encoded into the farm QR code.
-     * This URL is what WHIMO (and LACRA internal app) scan.
+     * Build the public farm-scan URL. Still used by LACRA's own tooling
+     * (admin panel "Add Farm to Existing Farmer" lookups, CSV exports) to
+     * cross-reference a farm back to our own system — but NOTE this URL is
+     * no longer what gets encoded into Farm.farmQrCode (see
+     * buildFarmGeoJsonFeature below). WHIMO's own open-source scanner
+     * (EuropeanForestInstitute/whimo-android, QrScanViewModel.kt) reads the
+     * raw QR text and runs it straight through a GeoJSON parser — it never
+     * makes an HTTP request against a scanned URL at all, and rejects
+     * anything that isn't itself valid GeoJSON with "QR code must contain
+     * GeoJSON data" (FAO GeoID resolution is not implemented on their side
+     * yet). A URL-only QR will always fail that check, regardless of what
+     * our backend would have returned if it had been fetched.
      */
     static farmScanUrl(farmId: string): string {
         const base = (process.env.API_BASE_URL ?? process.env.FRONTEND_URL ?? 'http://localhost:3000')
             .trim()
             .replace(/\/$/, '');
         return `${base}/api/public/farm-scan/${farmId}`;
+    }
+
+    /**
+     * Build the single-farm GeoJSON Feature that gets encoded (as raw JSON
+     * text, not a URL) into Farm.farmQrCode — this is what WHIMO's QR
+     * scanner (see farmScanUrl's note above) actually needs: a Feature
+     * whose `geometry` it can hand straight to its GeoJsonParser, with our
+     * GeoID + compliance attributes riding along in `properties` (WHIMO's
+     * parser tolerates and ignores extra/unknown fields — confirmed from
+     * its own unit tests). No farmer PII anywhere in this payload.
+     */
+    static buildFarmGeoJsonFeature(farm: {
+        id: string;
+        geoId?: string | null;
+        cropType?: string | null;
+        totalAreaHa?: number | null;
+        riskLevel?: string | null;
+        location: unknown;
+    }): Record<string, unknown> | null {
+        const geometry = GeoIdService.normaliseGeometry(farm.location);
+        if (!geometry) return null;
+        return {
+            type: 'Feature',
+            id: farm.geoId ?? farm.id,
+            geometry,
+            properties: {
+                farmId: farm.id,
+                geoId: farm.geoId ?? null,
+                cropType: farm.cropType ?? null,
+                totalAreaHa: farm.totalAreaHa ?? null,
+                riskLevel: farm.riskLevel ?? null,
+            },
+        };
+    }
+
+    /**
+     * Build the GeoJSON FeatureCollection that gets encoded into
+     * Farmer.qrCode (the ID-card QR) — one Feature per registered farm, so
+     * WHIMO's scanner (see farmScanUrl's note above) finds real GeoJSON
+     * the moment it reads the card, regardless of which of the farmer's
+     * farms a trader is actually transacting against. `farmerId` and
+     * `profileUrl` ride at the collection root purely for LACRA's own
+     * tooling (search-by-QR, internal app routing) — WHIMO's parser
+     * ignores unrecognised root fields.
+     */
+    static buildFarmerGeoJsonFeatureCollection(farmer: {
+        id: string;
+        farmerId?: string | null;
+        farms: Array<{
+            id: string;
+            geoId?: string | null;
+            cropType?: string | null;
+            totalAreaHa?: number | null;
+            riskLevel?: string | null;
+            location: unknown;
+        }>;
+    }, profileUrl: string): Record<string, unknown> {
+        const features = (farmer.farms || [])
+            .map((f) => GeoIdService.buildFarmGeoJsonFeature(f))
+            .filter((f): f is Record<string, unknown> => f !== null);
+        return {
+            type: 'FeatureCollection',
+            farmerId: farmer.farmerId ?? null,
+            profileUrl,
+            features,
+        };
+    }
+
+    /**
+     * Render a QR data-URL for a GeoJSON payload, with a graceful,
+     * multi-tier fallback for farmers/farms whose geometry (or sheer number
+     * of farms) is too large to fit in a scannable QR code:
+     *   1. Full geometry, as given.
+     *   2. `simplify()` — each farm's geometry collapsed to its centroid
+     *      Point (still valid, still parseable GeoJSON, just lower
+     *      precision).
+     *   3. If that STILL doesn't fit (e.g. a farmer with a large number of
+     *      farms, even at centroid resolution — confirmed possible via
+     *      direct testing of the `qrcode` library's ~2953-byte hard cap at
+     *      error-correction level L), and the payload is a
+     *      FeatureCollection, progressively drop the last feature(s) from
+     *      the array (keeping type/farmerId/profileUrl intact) until it
+     *      fits. A farmer's ID-card QR always encodes AT LEAST one of
+     *      their farms this way rather than failing outright; the farmer's
+     *      full farm list remains available via profileUrl/farmerId for
+     *      LACRA's own tooling regardless of how many features the QR
+     *      itself could fit.
+     */
+    static async encodeGeoJsonQr(
+        geojson: Record<string, unknown>,
+        simplify: () => Record<string, unknown>,
+    ): Promise<string> {
+        try {
+            return await QRCode.toDataURL(JSON.stringify(geojson), { errorCorrectionLevel: 'L' });
+        } catch (err: any) {
+            console.warn(`[GeoID] Full-resolution QR too large, falling back to centroid-only: ${err.message}`);
+            const simplified = simplify();
+            try {
+                return await QRCode.toDataURL(JSON.stringify(simplified), { errorCorrectionLevel: 'L' });
+            } catch (err2: any) {
+                const features = (simplified as any)?.features;
+                if (simplified.type !== 'FeatureCollection' || !Array.isArray(features) || features.length === 0) {
+                    throw err2;
+                }
+                console.warn(`[GeoID] Centroid-only QR still too large (${features.length} features), truncating: ${err2.message}`);
+                let truncated = { ...simplified, features: [...features] } as { features: unknown[] } & Record<string, unknown>;
+                while (truncated.features.length > 1) {
+                    truncated = { ...truncated, features: truncated.features.slice(0, -1) };
+                    try {
+                        return await QRCode.toDataURL(JSON.stringify(truncated), { errorCorrectionLevel: 'L' });
+                    } catch {
+                        // keep truncating
+                    }
+                }
+                // Last resort: a single feature plus the collection root fields.
+                return QRCode.toDataURL(JSON.stringify(truncated), { errorCorrectionLevel: 'L' });
+            }
+        }
+    }
+
+    /**
+     * Centroid-only fallback for a single farm Feature (Point geometry
+     * instead of the full Polygon) — used by encodeGeoJsonQr when the
+     * full-resolution payload doesn't fit in a QR code.
+     */
+    static buildFarmGeoJsonFeatureCentroidOnly(farm: {
+        id: string;
+        geoId?: string | null;
+        cropType?: string | null;
+        totalAreaHa?: number | null;
+        riskLevel?: string | null;
+        location: unknown;
+    }): Record<string, unknown> | null {
+        const geometry = GeoIdService.normaliseGeometry(farm.location);
+        const centroid = geometry ? GeoIdService.centroidFromGeometry(geometry) : null;
+        if (!centroid) return null;
+        return {
+            type: 'Feature',
+            id: farm.geoId ?? farm.id,
+            geometry: { type: 'Point', coordinates: [centroid.lng, centroid.lat] },
+            properties: {
+                farmId: farm.id,
+                geoId: farm.geoId ?? null,
+                cropType: farm.cropType ?? null,
+                totalAreaHa: farm.totalAreaHa ?? null,
+                riskLevel: farm.riskLevel ?? null,
+                simplified: true,
+            },
+        };
+    }
+
+    /**
+     * Centroid-only fallback FeatureCollection for a farmer's ID card QR —
+     * used by encodeGeoJsonQr when the full-resolution FeatureCollection
+     * doesn't fit in a QR code.
+     */
+    static buildFarmerGeoJsonFeatureCollectionCentroidOnly(farmer: {
+        id: string;
+        farmerId?: string | null;
+        farms: Array<{
+            id: string;
+            geoId?: string | null;
+            cropType?: string | null;
+            totalAreaHa?: number | null;
+            riskLevel?: string | null;
+            location: unknown;
+        }>;
+    }, profileUrl: string): Record<string, unknown> {
+        const features = (farmer.farms || [])
+            .map((f) => GeoIdService.buildFarmGeoJsonFeatureCentroidOnly(f))
+            .filter((f): f is Record<string, unknown> => f !== null);
+        return {
+            type: 'FeatureCollection',
+            farmerId: farmer.farmerId ?? null,
+            profileUrl,
+            features,
+        };
     }
 
     /**

@@ -8,7 +8,6 @@ import { FarmerAuditLog, FarmerAuditAction } from "../entities/FarmerAuditLog";
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFilesToCloudinary, uploadFileToCloudinary } from "../utils/cloudUpload";
 import { getGeoIdService, GeoIdService } from "../services/GeoIdService";
-import QRCode from "qrcode";
 import {
     buildPlotsForFarm,
     resolveCommodity,
@@ -50,6 +49,14 @@ function parseCommodities(raw: any): CommodityInput[] {
  * has a saved UUID. Never throws — a GeoID/network hiccup must NOT block
  * farm creation/sync; the `/farms/backfill-geoids` endpoint can recover
  * any farm that ends up without one. Mutates and persists `farm` in place.
+ *
+ * farmQrCode is ALWAYS (re)generated here, not only when missing: it
+ * encodes a GeoJSON Feature built from the farm's current geometry + GeoID
+ * (see GeoIdService.buildFarmGeoJsonFeature) — WHIMO's own QR scanner
+ * (EuropeanForestInstitute/whimo-android) parses the raw QR text directly
+ * as GeoJSON with no HTTP fetch involved, so the QR must be regenerated
+ * whenever the geometry/GeoID it encodes could have changed (e.g. a
+ * boundary-evidence update), or a trader would scan stale coordinates.
  */
 async function mintGeoIdForFarm(farmRepository: ReturnType<typeof AppDataSource.getRepository<Farm>>, farm: Farm, context: string) {
     try {
@@ -59,9 +66,12 @@ async function mintGeoIdForFarm(farmRepository: ReturnType<typeof AppDataSource.
             const result = await geoIdSvc.mintGeoId(geometry, farm.id);
             farm.geoId = result.geoid;
             farm.geoIdUri = result.uri;
-            if (!farm.farmQrCode) {
-                const scanUrl = GeoIdService.farmScanUrl(farm.id);
-                farm.farmQrCode = await QRCode.toDataURL(scanUrl);
+            const feature = GeoIdService.buildFarmGeoJsonFeature(farm);
+            if (feature) {
+                farm.farmQrCode = await GeoIdService.encodeGeoJsonQr(
+                    feature,
+                    () => GeoIdService.buildFarmGeoJsonFeatureCentroidOnly(farm) ?? feature,
+                );
             }
             await farmRepository.save(farm);
             console.log(`[GeoID] Minted ${result.geoid} for farm ${farm.id} (${context})`);
@@ -980,9 +990,18 @@ export class FarmController {
                     farm.geoId = result.geoid;
                     farm.geoIdUri = result.uri;
 
-                    if (!farm.farmQrCode) {
-                        const scanUrl = GeoIdService.farmScanUrl(farm.id);
-                        farm.farmQrCode = await QRCode.toDataURL(scanUrl);
+                    // Always (re)generate the farm QR now that geoId is
+                    // known, so an old URL-only QR (or one minted before
+                    // this farm had a geoId) gets replaced with real
+                    // WHIMO-readable GeoJSON — see mintGeoIdForFarm's
+                    // comment above for why this isn't gated on
+                    // `!farm.farmQrCode`.
+                    const feature = GeoIdService.buildFarmGeoJsonFeature(farm);
+                    if (feature) {
+                        farm.farmQrCode = await GeoIdService.encodeGeoJsonQr(
+                            feature,
+                            () => GeoIdService.buildFarmGeoJsonFeatureCentroidOnly(farm) ?? feature,
+                        );
                     }
 
                     await this.farmRepository.save(farm);

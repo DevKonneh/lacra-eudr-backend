@@ -34,5 +34,10 @@ router.patch("/:id/status", authMiddleware([UserRole.ADMIN]), (req, res) => cont
 router.patch("/:id/verification", authMiddleware([UserRole.ADMIN]), (req, res) => controller.setVerificationStatus(req, res));
 router.delete("/:id", authMiddleware([UserRole.ADMIN]), (req, res) => controller.delete(req, res));
 router.post("/maintenance/backfill-farmer-ids", authMiddleware([UserRole.ADMIN]), (req, res) => controller.backfillFarmerIds(req, res));
+// One-time maintenance: unconditionally regenerates every farmer's and
+// farm's QR code as GeoJSON (see FarmerController.regenerateQrCodes doc
+// comment). Run AFTER POST /farms/backfill-geoids so geoIds are populated
+// first. ADMIN-only, safe to re-run.
+router.post("/maintenance/regenerate-qr-codes", authMiddleware([UserRole.ADMIN]), (req, res) => controller.regenerateQrCodes(req, res));
 
 export default router;

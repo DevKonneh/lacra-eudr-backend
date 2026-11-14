@@ -13,7 +13,6 @@ import { Inspection } from "../entities/Inspection";
 import { Transfer } from "../entities/Transfer";
 import { Batch } from "../entities/Batch";
 import { OfflineSubmission } from "../entities/OfflineSubmission";
-import QRCode from 'qrcode';
 import bcrypt from 'bcryptjs';
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary, uploadFilesToCloudinary } from "../utils/cloudUpload";
@@ -56,6 +55,12 @@ const AUDITABLE_CONTACT_FIELDS: (keyof Farmer)[] = [
  * has a saved UUID. Never throws — a GeoID/network hiccup must NOT block
  * farmer/farm registration; the `/farms/backfill-geoids` endpoint can
  * recover any farm that ends up without one.
+ *
+ * farmQrCode encodes a GeoJSON Feature (see
+ * GeoIdService.buildFarmGeoJsonFeature), always regenerated here (not only
+ * when missing) since WHIMO's QR scanner reads the raw QR text as GeoJSON
+ * directly — no HTTP fetch — so it must reflect this farm's current
+ * geometry/GeoID whenever those could have changed.
  */
 async function mintGeoIdForFarm(farmRepository: ReturnType<typeof AppDataSource.getRepository<Farm>>, farm: Farm, context: string) {
     try {
@@ -65,9 +70,12 @@ async function mintGeoIdForFarm(farmRepository: ReturnType<typeof AppDataSource.
             const result = await geoIdSvc.mintGeoId(geometry, farm.id);
             farm.geoId = result.geoid;
             farm.geoIdUri = result.uri;
-            if (!farm.farmQrCode) {
-                const scanUrl = GeoIdService.farmScanUrl(farm.id);
-                farm.farmQrCode = await QRCode.toDataURL(scanUrl);
+            const feature = GeoIdService.buildFarmGeoJsonFeature(farm);
+            if (feature) {
+                farm.farmQrCode = await GeoIdService.encodeGeoJsonQr(
+                    feature,
+                    () => GeoIdService.buildFarmGeoJsonFeatureCentroidOnly(farm) ?? feature,
+                );
             }
             await farmRepository.save(farm);
             console.log(`[GeoID] Minted ${result.geoid} for farm ${farm.id} (${context})`);
@@ -177,12 +185,30 @@ export class FarmerController {
                 .leftJoinAndSelect("farmer.farms", "farms");
 
             if (qr) {
-                // A scanned QR encodes the public-profile URL
-                // (".../public/farmers/<uuid>"), but be tolerant of a bare
-                // UUID or farmerId being scanned/pasted too.
-                const idMatch = qr.match(/farmers\/([a-f0-9-]{36})/i);
+                // The farmer ID-card QR now encodes a GeoJSON FeatureCollection
+                // (see GeoIdService.buildFarmerGeoJsonFeatureCollection) - its
+                // root carries farmerId/profileUrl specifically so LACRA's own
+                // tooling (this search endpoint) can still resolve a farmer
+                // from a scan, even though WHIMO's scanner only reads the
+                // geometry. Try that first; fall back to the legacy
+                // "QR encodes the public-profile URL" format (and bare
+                // UUID/farmerId) for any already-printed old-style card.
+                let qrLookupValue = qr;
+                try {
+                    const parsed = JSON.parse(qr);
+                    if (parsed && typeof parsed === 'object') {
+                        if (typeof parsed.farmerId === 'string' && parsed.farmerId) {
+                            qrLookupValue = parsed.farmerId;
+                        } else if (typeof parsed.profileUrl === 'string' && parsed.profileUrl) {
+                            qrLookupValue = parsed.profileUrl;
+                        }
+                    }
+                } catch {
+                    // Not JSON - treat as the legacy URL/UUID/farmerId text as before.
+                }
+                const idMatch = qrLookupValue.match(/farmers\/([a-f0-9-]{36})/i);
                 const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-                const extractedId = idMatch ? idMatch[1] : qr;
+                const extractedId = idMatch ? idMatch[1] : qrLookupValue;
                 // Postgres type-checks a `uuid` column comparison even inside an
                 // OR branch that won't ultimately match, so only include the
                 // `farmer.id = :extractedId` clause when extractedId actually
@@ -193,9 +219,9 @@ export class FarmerController {
                 qb.andWhere(new Brackets((sub) => {
                     if (uuidRegex.test(extractedId)) {
                         sub.where("farmer.id = :extractedId", { extractedId });
-                        sub.orWhere("farmer.farmerId = :qr", { qr });
+                        sub.orWhere("farmer.farmerId = :qrLookupValue", { qrLookupValue });
                     } else {
-                        sub.where("farmer.farmerId = :qr", { qr });
+                        sub.where("farmer.farmerId = :qrLookupValue", { qrLookupValue });
                     }
                 }));
             } else {
@@ -464,11 +490,15 @@ export class FarmerController {
 
                 const savedFarmer = await queryRunner.manager.save(Farmer, farmer);
 
-                // Generate a human-readable Farmer ID + QR code (data URL) now that we have a real id
+                // Generate a human-readable Farmer ID now that we have a real id.
+                // NOTE: the ID-card QR itself (savedFarmer.qrCode) is generated
+                // further below, AFTER the GeoID-minting loop — it now encodes a
+                // GeoJSON FeatureCollection of this farmer's farms (see
+                // GeoIdService.buildFarmerGeoJsonFeatureCollection), so it must
+                // wait until each farm's geoId is actually known, or every
+                // Feature would be minted with geoId: null.
                 const shortId = savedFarmer.id.split('-')[0].toUpperCase();
                 savedFarmer.farmerId = `LACRA-${shortId}`;
-                const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${savedFarmer.id}`;
-                savedFarmer.qrCode = await QRCode.toDataURL(publicProfileUrl);
                 await queryRunner.manager.save(Farmer, savedFarmer);
 
                 // Monitoring field events for this web-form create() path.
@@ -573,9 +603,12 @@ export class FarmerController {
                                 const result = await geoIdSvc.mintGeoId(geometry, farm.id);
                                 farm.geoId = result.geoid;
                                 farm.geoIdUri = result.uri;
-                                if (!farm.farmQrCode) {
-                                    const scanUrl = GeoIdService.farmScanUrl(farm.id);
-                                    farm.farmQrCode = await QRCode.toDataURL(scanUrl);
+                                const feature = GeoIdService.buildFarmGeoJsonFeature(farm);
+                                if (feature) {
+                                    farm.farmQrCode = await GeoIdService.encodeGeoJsonQr(
+                                        feature,
+                                        () => GeoIdService.buildFarmGeoJsonFeatureCentroidOnly(farm) ?? feature,
+                                    );
                                 }
                                 await queryRunner.manager.save(Farm, farm);
                                 console.log(`[GeoID] Minted ${result.geoid} for farm ${farm.id} (farmer reg)`);
@@ -584,6 +617,26 @@ export class FarmerController {
                             console.warn(`[GeoID] Mint failed for farm ${farm.id} (non-fatal): ${geoErr.message}`);
                         }
                     }
+                }
+
+                // Generate the farmer's ID-card QR now that every farm above
+                // has had a chance to mint its GeoID — encodes a GeoJSON
+                // FeatureCollection (one Feature per farm) so WHIMO's scanner
+                // (raw-text GeoJSON parse, no HTTP fetch - see
+                // GeoIdService.farmScanUrl's comment) finds real geometry the
+                // moment the card is scanned, with farmerId/profileUrl along
+                // for LACRA's own tooling. Best-effort, same as GeoID minting
+                // above: a QR-render hiccup must not abort registration.
+                try {
+                    const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${savedFarmer.id}`;
+                    const featureCollection = GeoIdService.buildFarmerGeoJsonFeatureCollection(savedFarmer, publicProfileUrl);
+                    savedFarmer.qrCode = await GeoIdService.encodeGeoJsonQr(
+                        featureCollection,
+                        () => GeoIdService.buildFarmerGeoJsonFeatureCollectionCentroidOnly(savedFarmer, publicProfileUrl),
+                    );
+                    await queryRunner.manager.save(Farmer, savedFarmer);
+                } catch (qrErr: any) {
+                    console.warn(`[GeoID] Farmer QR generation failed for ${savedFarmer.id} (non-fatal): ${qrErr.message}`);
                 }
 
                 await queryRunner.commitTransaction();
@@ -1653,11 +1706,14 @@ export class FarmerController {
 
             const savedFarmer = await this.farmerRepository.save(farmer);
 
-            // Generate human-readable Farmer ID + QR code now that we have a real id
+            // Generate human-readable Farmer ID now that we have a real id. The
+            // farmer's ID-card QR (savedFarmer.qrCode) is intentionally NOT
+            // generated here - it's generated further below, after every farm in
+            // this offline-sync batch has had a chance to mint its GeoID via
+            // mintGeoIdForFarm(), so the embedded GeoJSON FeatureCollection's
+            // Features carry real geoId values instead of null.
             const shortId = savedFarmer.id.split('-')[0].toUpperCase();
             savedFarmer.farmerId = `LACRA-${shortId}`;
-            const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${savedFarmer.id}`;
-            savedFarmer.qrCode = await QRCode.toDataURL(publicProfileUrl);
             await this.farmerRepository.save(savedFarmer);
 
             // Farms rejected for invalid geometry are NOT silently discarded —
@@ -1666,6 +1722,10 @@ export class FarmerController {
             // correction and can retry, rather than data quietly vanishing.
             const rejectedFarms: { name: string; errors: string[] }[] = [];
             const geometryResultsByFarmName: Record<string, any> = {};
+            // Saved farms from this batch, used below to rebuild the farmer's
+            // ID-card QR (GeoJSON FeatureCollection) once every farm has had a
+            // chance to mint its GeoID via mintGeoIdForFarm().
+            const createdFarms: Farm[] = [];
 
             for (const f of farmsData) {
                 // cropType (legacy) OR commodities (new) must identify at
@@ -1710,6 +1770,7 @@ export class FarmerController {
                 geometryResultsByFarmName[f.name] = geometryResult;
 
                 const savedFarm = await this.farmRepository.save(farm);
+                createdFarms.push(savedFarm);
 
                 // Monitoring: "Last reported location" - GPS captured at
                 // farm record capture, for the mobile app's offline
@@ -1742,6 +1803,29 @@ export class FarmerController {
                     savedFarm.cropType = deriveLegacyCropType(savedPlots);
                     await this.farmRepository.save(savedFarm);
                 }
+            }
+
+            // Generate the farmer's ID-card QR now that every farm in this batch
+            // has had a chance to mint its GeoID (via mintGeoIdForFarm above) -
+            // encodes a GeoJSON FeatureCollection (one Feature per farm), same
+            // reasoning as FarmerController.create() and AuthController.registerFarmer.
+            // Best-effort: a QR-render hiccup must not fail the whole sync.
+            try {
+                const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${savedFarmer.id}`;
+                const featureCollection = GeoIdService.buildFarmerGeoJsonFeatureCollection(
+                    { id: savedFarmer.id, farmerId: savedFarmer.farmerId, farms: createdFarms },
+                    publicProfileUrl,
+                );
+                savedFarmer.qrCode = await GeoIdService.encodeGeoJsonQr(
+                    featureCollection,
+                    () => GeoIdService.buildFarmerGeoJsonFeatureCollectionCentroidOnly(
+                        { id: savedFarmer.id, farmerId: savedFarmer.farmerId, farms: createdFarms },
+                        publicProfileUrl,
+                    ),
+                );
+                await this.farmerRepository.save(savedFarmer);
+            } catch (qrErr: any) {
+                console.warn(`[GeoID] Farmer QR generation failed for ${savedFarmer.id} (non-fatal): ${qrErr.message}`);
             }
 
             return successResponse(
@@ -1778,8 +1862,25 @@ export class FarmerController {
                 const shortId = farmer.id.split('-')[0].toUpperCase();
                 farmer.farmerId = `LACRA-${shortId}`;
                 if (!farmer.qrCode) {
+                    // GeoJSON FeatureCollection QR (same format as every other
+                    // registration path) - load this farmer's farms since the
+                    // query above doesn't eagerly fetch them.
+                    const withFarms = await this.farmerRepository.findOne({
+                        where: { id: farmer.id },
+                        relations: ["farms"],
+                    });
                     const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${farmer.id}`;
-                    farmer.qrCode = await QRCode.toDataURL(publicProfileUrl);
+                    const featureCollection = GeoIdService.buildFarmerGeoJsonFeatureCollection(
+                        { id: farmer.id, farmerId: farmer.farmerId, farms: withFarms?.farms || [] },
+                        publicProfileUrl,
+                    );
+                    farmer.qrCode = await GeoIdService.encodeGeoJsonQr(
+                        featureCollection,
+                        () => GeoIdService.buildFarmerGeoJsonFeatureCollectionCentroidOnly(
+                            { id: farmer.id, farmerId: farmer.farmerId, farms: withFarms?.farms || [] },
+                            publicProfileUrl,
+                        ),
+                    );
                 }
                 await this.farmerRepository.save(farmer);
                 updated++;
@@ -1789,6 +1890,94 @@ export class FarmerController {
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error backfilling farmer IDs", [error.message], 500);
+        }
+    }
+
+    /**
+     * One-time maintenance endpoint: UNCONDITIONALLY regenerates every farmer's
+     * ID-card QR code (farmer.qrCode) and every one of their farms' QR codes
+     * (farm.farmQrCode) as GeoJSON (Feature / FeatureCollection - see
+     * GeoIdService), replacing any stale URL-only QR that was generated before
+     * this format existed. Unlike backfillFarmerIds() above (which only fills
+     * in a MISSING qrCode), this endpoint always overwrites, since a farmer
+     * registered before this rework already has a non-null but WRONG-FORMAT
+     * qrCode that would otherwise never be touched again.
+     *
+     * Safe to call repeatedly - every run produces the same content for
+     * unchanged data (GeoID minting is content-addressed/idempotent, and QR
+     * rendering is deterministic for the same input).
+     *
+     * This does NOT mint missing GeoIDs itself - run POST /farms/backfill-geoids
+     * first so every farm's geoId is populated before regenerating QRs here,
+     * otherwise farms without a geoId will still get a QR, just with
+     * properties.geoId: null.
+     */
+    async regenerateQrCodes(req: Request, res: Response) {
+        try {
+            const farmers = await this.farmerRepository.find({ relations: ["farms"] });
+
+            let farmersUpdated = 0;
+            let farmsUpdated = 0;
+            let farmsSkippedNoGeometry = 0;
+            const errors: string[] = [];
+
+            for (const farmer of farmers) {
+                try {
+                    // Regenerate each of this farmer's farm QRs first, so the
+                    // FeatureCollection built right after reflects their
+                    // current (possibly just-updated) farmQrCode/geoId.
+                    for (const farm of farmer.farms || []) {
+                        const geometry = GeoIdService.normaliseGeometry(farm.location);
+                        if (!geometry) {
+                            farmsSkippedNoGeometry++;
+                            continue;
+                        }
+                        const feature = GeoIdService.buildFarmGeoJsonFeature(farm);
+                        if (feature) {
+                            farm.farmQrCode = await GeoIdService.encodeGeoJsonQr(
+                                feature,
+                                () => GeoIdService.buildFarmGeoJsonFeatureCentroidOnly(farm) ?? feature,
+                            );
+                            await this.farmRepository.save(farm);
+                            farmsUpdated++;
+                        }
+                    }
+
+                    const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${farmer.id}`;
+                    const featureCollection = GeoIdService.buildFarmerGeoJsonFeatureCollection(
+                        { id: farmer.id, farmerId: farmer.farmerId, farms: farmer.farms || [] },
+                        publicProfileUrl,
+                    );
+                    farmer.qrCode = await GeoIdService.encodeGeoJsonQr(
+                        featureCollection,
+                        () => GeoIdService.buildFarmerGeoJsonFeatureCollectionCentroidOnly(
+                            { id: farmer.id, farmerId: farmer.farmerId, farms: farmer.farms || [] },
+                            publicProfileUrl,
+                        ),
+                    );
+                    await this.farmerRepository.save(farmer);
+                    farmersUpdated++;
+                } catch (err: any) {
+                    const msg = err?.message ?? String(err);
+                    errors.push(`Farmer ${farmer.id}: ${msg}`);
+                    console.warn(`[QR regen] Failed for farmer ${farmer.id} (non-fatal): ${msg}`);
+                }
+            }
+
+            return successResponse(
+                res,
+                {
+                    totalFarmers: farmers.length,
+                    farmersUpdated,
+                    farmsUpdated,
+                    farmsSkippedNoGeometry,
+                    errors: errors.length > 0 ? errors : undefined,
+                },
+                `Regenerated ${farmersUpdated} farmer QR(s) and ${farmsUpdated} farm QR(s)`
+            );
+        } catch (error: any) {
+            console.error("Error regenerating QR codes:", error);
+            return errorResponse(res, "Error regenerating QR codes", [error.message], 500);
         }
     }
 }

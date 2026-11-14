@@ -14,7 +14,7 @@ import { JWT_SECRET } from "../middleware/auth.middleware";
 import { EmailService } from "../services/EmailService";
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFileToCloudinary, uploadFilesToCloudinary } from "../utils/cloudUpload";
-import QRCode from "qrcode";
+import { getGeoIdService, GeoIdService } from "../services/GeoIdService";
 import { UserAuditLog, UserAuditAction } from "../entities/UserAuditLog";
 import { SignInAttempt, SignInOutcome } from "../entities/SignInAttempt";
 import { detectPlatform } from "../utils/platformDetector";
@@ -549,21 +549,30 @@ export class AuthController {
 
                 await queryRunner.manager.save(Farmer, farmer);
 
-                // Generate a human-readable Farmer ID + QR code (data URL) now that we have a
+                // Generate a human-readable Farmer ID (LACRA-XXXXXXXX) now that we have a
                 // real database id to derive it from. Without this step, farmer.farmerId stays
                 // NULL forever and the admin panel's Farmers Directory shows "N/A" under every
                 // single farmer's name - this is the mobile-app registration path (used by the
                 // Flutter inspector app), which was missing the same logic already present in
                 // FarmerController.ts's web-form registration path.
+                //
+                // NOTE: farmer.qrCode (the ID-card QR) is intentionally NOT generated here
+                // anymore - it's generated further below, AFTER every farm created in this
+                // request has had a chance to mint its GeoID, so the embedded GeoJSON
+                // FeatureCollection's Features carry real geoId values instead of null (see
+                // the "Mint a GeoID + farm QR" block below, mirroring FarmerController.create()).
                 const shortId = farmer.id.split('-')[0].toUpperCase();
                 farmer.farmerId = `LACRA-${shortId}`;
-                const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${farmer.id}`;
-                farmer.qrCode = await QRCode.toDataURL(publicProfileUrl);
                 await queryRunner.manager.save(Farmer, farmer);
 
                 // Track created farm ids so the caller can follow up with
                 // PUT /farms/:id/boundary-evidence (per-point geotagged photos)
                 const createdFarmIds: string[] = [];
+                // Also keep the actual saved Farm entities (both branches below)
+                // so we can mint a GeoID + farm QR for each one once farm
+                // creation finishes, mirroring FarmerController.create()'s
+                // equivalent GeoID-minting block.
+                const createdFarms: Farm[] = [];
 
                 // Create Farm if details provided
                 if (farmsData && Array.isArray(farmsData) && farmsData.length > 0) {
@@ -611,6 +620,7 @@ export class AuthController {
 
                         const savedFarm = await queryRunner.manager.save(Farm, farm);
                         createdFarmIds.push(savedFarm.id);
+                        createdFarms.push(savedFarm);
 
                         // Monitoring: "Last reported location" - GPS captured
                         // at farm record capture, for the mobile app's LIVE
@@ -724,6 +734,7 @@ export class AuthController {
 
                     const savedFarm = await queryRunner.manager.save(Farm, farm);
                     createdFarmIds.push(savedFarm.id);
+                    createdFarms.push(savedFarm);
 
                     // Monitoring: "Last reported location" - GPS captured at
                     // farm record capture, for the mobile app's LIVE flat
@@ -801,6 +812,64 @@ export class AuthController {
                             await queryRunner.manager.save(FarmDocument, doc);
                         }
                     }
+                }
+
+                // ── Mint a GeoID + farm QR for every farm registered in this request ──
+                // Best-effort: GeoID failure does NOT abort farmer registration. Each
+                // farm gets its own GeoID (derived from its geometry) and its own
+                // farm-scan QR code (for WHIMO / trader scanning). Mirrors the
+                // equivalent block in FarmerController.create() - this mobile-app
+                // registration path (POST /auth/register-farmer) previously had NO
+                // GeoID-minting logic at all, meaning farms registered via the
+                // Flutter inspector app never got a GeoID.
+                if (createdFarms.length > 0) {
+                    const geoIdSvc = getGeoIdService();
+                    for (const savedFarm of createdFarms) {
+                        try {
+                            const geometry = GeoIdService.normaliseGeometry(savedFarm.location);
+                            if (geometry) {
+                                const result = await geoIdSvc.mintGeoId(geometry, savedFarm.id);
+                                savedFarm.geoId = result.geoid;
+                                savedFarm.geoIdUri = result.uri;
+                                const feature = GeoIdService.buildFarmGeoJsonFeature(savedFarm);
+                                if (feature) {
+                                    savedFarm.farmQrCode = await GeoIdService.encodeGeoJsonQr(
+                                        feature,
+                                        () => GeoIdService.buildFarmGeoJsonFeatureCentroidOnly(savedFarm) ?? feature,
+                                    );
+                                }
+                                await queryRunner.manager.save(Farm, savedFarm);
+                                console.log(`[GeoID] Minted ${result.geoid} for farm ${savedFarm.id} (mobile farmer reg)`);
+                            }
+                        } catch (geoErr: any) {
+                            console.warn(`[GeoID] Mint failed for farm ${savedFarm.id} (non-fatal): ${geoErr.message}`);
+                        }
+                    }
+                }
+
+                // Generate the farmer's ID-card QR now that every farm above has had
+                // a chance to mint its GeoID — encodes a GeoJSON FeatureCollection
+                // (one Feature per farm) so WHIMO's scanner (raw-text GeoJSON parse,
+                // no HTTP fetch - see GeoIdService.farmScanUrl's comment) finds real
+                // geometry the moment the card is scanned, with farmerId/profileUrl
+                // along for LACRA's own tooling. Best-effort, same as GeoID minting
+                // above: a QR-render hiccup must not abort registration.
+                try {
+                    const publicProfileUrl = `${process.env.FRONTEND_URL || 'http://localhost:5173'}/public/farmers/${farmer.id}`;
+                    const featureCollection = GeoIdService.buildFarmerGeoJsonFeatureCollection(
+                        { id: farmer.id, farmerId: farmer.farmerId, farms: createdFarms },
+                        publicProfileUrl,
+                    );
+                    farmer.qrCode = await GeoIdService.encodeGeoJsonQr(
+                        featureCollection,
+                        () => GeoIdService.buildFarmerGeoJsonFeatureCollectionCentroidOnly(
+                            { id: farmer.id, farmerId: farmer.farmerId, farms: createdFarms },
+                            publicProfileUrl,
+                        ),
+                    );
+                    await queryRunner.manager.save(Farmer, farmer);
+                } catch (qrErr: any) {
+                    console.warn(`[GeoID] Farmer QR generation failed for ${farmer.id} (non-fatal): ${qrErr.message}`);
                 }
 
                 await queryRunner.commitTransaction();

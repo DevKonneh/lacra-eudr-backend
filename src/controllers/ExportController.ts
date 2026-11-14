@@ -209,10 +209,16 @@ export class ExportController {
                 // The stored `qrCode` column holds a rendered base64 PNG data
                 // URL (the QR image itself), not the value encoded inside it
                 // — that would bloat the CSV with huge base64 blobs and
-                // isn't human-readable. Instead export the actual public
-                // profile URL that was encoded into the QR at registration
-                // time (see FarmerController.create), i.e. the real
-                // "qr_code_value".
+                // isn't human-readable either way. NOTE: since the QR-format
+                // rework, the physical QR image's actual payload is a GeoJSON
+                // FeatureCollection (see GeoIdService.buildFarmerGeoJsonFeatureCollection),
+                // not this URL — WHIMO's scanner reads that raw GeoJSON text
+                // directly, with no HTTP fetch involved. This column still
+                // exports the farmer's public profile URL (which also rides
+                // along at the FeatureCollection's `profileUrl` root field)
+                // purely because it's the one human-readable, clickable
+                // reference CSV consumers can actually use; it is NOT a
+                // faithful dump of what the QR image itself encodes.
                 const qrCodeValue = farmer.qrCode
                     ? `${process.env.FRONTEND_URL || "http://localhost:5173"}/public/farmers/${farmer.id}`
                     : "";
