@@ -16,6 +16,13 @@ const controller = new FarmController();
 router.get("/geometry/data-correction-queue", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.getDataCorrectionQueue(req, res));
 router.post("/geometry/revalidate-all", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.revalidateAllGeometry(req, res));
 
+// Admin-only: attempt to auto-repair a self-intersecting ("bowtie")
+// polygon by reordering its existing points — dry-run by default, pass
+// ?apply=true to persist. See FarmController.repairGeometry() for the
+// full safety rationale (never invents/moves a coordinate, only fixes
+// connection order, and verifies the result before saving anything).
+router.post("/:id/geometry/repair", authMiddleware([UserRole.ADMIN]), (req, res) => controller.repairGeometry(req, res));
+
 // ── GeoID admin operations ───────────────────────────────────────────────────
 // POST /farms/backfill-geoids
 //   One-time maintenance: mint GeoIDs for all existing farms that don't have

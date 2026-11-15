@@ -16,7 +16,7 @@ import {
     CommodityInput,
 } from "../services/CommodityService";
 import { CroppingSystem, CommodityRole, ProductionStatus } from "../entities/PlotCommodity";
-import { validateAndAnnotateFarm, assertGeometryNotBlocking } from "../services/FarmGeometryHelper";
+import { validateAndAnnotateFarm, assertGeometryNotBlocking, attemptBowtieRepair } from "../services/FarmGeometryHelper";
 import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
 
 // Relations needed whenever a Farm response should include its full
@@ -878,6 +878,89 @@ export class FarmController {
         } catch (error: any) {
             console.error("Error re-validating farm geometry:", error);
             return errorResponse(res, "Error re-validating farm geometry", [error.message], 500);
+        }
+    }
+
+    /**
+     * ADMIN-only: attempts to repair a self-intersecting ("bowtie") polygon
+     * by reordering its EXISTING boundary points by angle around their
+     * centroid — see attemptBowtieRepair() for the full safety rationale
+     * (never invents/drops/moves a coordinate, only fixes connection
+     * order, and refuses anything it cannot verify is now simple).
+     *
+     * SAFE-BY-DEFAULT: without `?apply=true`, this is a dry run — it
+     * reports whether a repair is possible and what the corrected geometry
+     * would look like, but does NOT touch the farm record. Pass
+     * `?apply=true` to actually persist the corrected `location`,
+     * re-validate it via the standard GeometryValidationService pipeline,
+     * and (best-effort) mint a GeoID / regenerate the farm's QR code now
+     * that the boundary is valid.
+     */
+    async repairGeometry(req: Request, res: Response) {
+        try {
+            const { id } = req.params;
+            const apply = req.query.apply === "true" || req.query.apply === "1";
+
+            const farm = await this.farmRepository.findOne({ where: { id } });
+            if (!farm) return errorResponse(res, "Farm not found", [], 404);
+
+            const repair = attemptBowtieRepair(farm.location);
+
+            if (!repair.repaired) {
+                return successResponse(
+                    res,
+                    { farmId: farm.id, applied: false, repaired: false, reason: repair.reason, originalGeometry: farm.location },
+                    "No automated repair was applied"
+                );
+            }
+
+            if (!apply) {
+                return successResponse(
+                    res,
+                    {
+                        farmId: farm.id,
+                        applied: false,
+                        repaired: true,
+                        reason: repair.reason,
+                        originalGeometry: farm.location,
+                        proposedGeometry: repair.geometry,
+                    },
+                    "Dry run: a repair is possible. Re-call with ?apply=true to persist it."
+                );
+            }
+
+            // Persist the corrected geometry, then run it through the SAME
+            // validation pipeline every other farm boundary goes through —
+            // never trust our own repair blindly.
+            const originalGeometry = farm.location;
+            farm.location = repair.geometry;
+            const geometryResult = await validateAndAnnotateFarm(farm, { excludeFarmId: farm.id });
+            await this.farmRepository.save(farm);
+
+            // Best-effort: now that the boundary is valid, try to mint a
+            // GeoID / regenerate the farm QR (never blocks this response —
+            // backfill-geoids can pick this farm up later if it fails).
+            await mintGeoIdForFarm(this.farmRepository, farm, "geometry repair");
+
+            const savedFarm = await this.farmRepository.findOne({ where: { id: farm.id } });
+
+            return successResponse(
+                res,
+                {
+                    farmId: farm.id,
+                    applied: true,
+                    repaired: true,
+                    reason: repair.reason,
+                    originalGeometry,
+                    newGeometry: repair.geometry,
+                    geometryValidation: geometryResult,
+                    geoId: savedFarm?.geoId ?? null,
+                },
+                "Geometry repaired and saved successfully"
+            );
+        } catch (error: any) {
+            console.error("Error repairing farm geometry:", error);
+            return errorResponse(res, "Error repairing farm geometry", [error.message], 500);
         }
     }
 
