@@ -64,14 +64,99 @@ Go to **Render Dashboard → lacra-eudr-backend → Environment** and set every 
 | `RATE_LIMIT_WHIMO_PAYLOAD_MAX` | `30` | Max WHIMO-payload requests per IP per window |
 | `RATE_LIMIT_PUBLIC_MAX` | `60` | Max general public requests per IP per window |
 
-### Email / SMTP (optional)
+### Email / SMTP
 
-| Variable | Example |
-|---|---|
-| `SMTP_HOST` | `smtp.sendgrid.net` |
-| `SMTP_PORT` | `587` |
-| `SMTP_USER` | `apikey` |
-| `SMTP_PASS` | *(SendGrid API key)* |
+CMIS sends under its own domain, **lacracmis.com** — not the government's
+`lacra.gov.lr`, which the project owner does not control and whose DNS
+changes go through the government and take a long time. `lacracmis.com`'s
+DNS and mail hosting is already live on **InterServer** (nameservers
+`cdns1/2/3.interserver.net`; the mail server is `mail.lacracmis.com`,
+currently `162.35.161.241`, running Exim 4.100.1). This same hosting
+account's control panel (cPanel, reachable at `https://162.35.161.241:2083`
+or `https://webmail.lacracmis.com`) is where the `no-reply@lacracmis.com`
+mailbox and its DKIM key are created/managed.
+
+**Confirmed by direct connection test from the deployment sandbox (Nov
+2026):**
+- Port **587** (STARTTLS) — open, EHLO succeeds, STARTTLS negotiates
+  cleanly, and the TLS certificate validates correctly **when connecting
+  via the hostname `mail.lacracmis.com`** (not the bare IP — the
+  certificate is issued for the hostname, so connecting by IP address
+  fails certificate verification).
+- Port **465** (implicit TLS) — also open and works correctly via
+  `mail.lacracmis.com`.
+- Port **25** — open but **not usable from Render**: Render blocks
+  outbound traffic to SMTP ports 25/465/587 on **free-tier** web services
+  (see Render's Sept 2025 changelog); if the backend service is on a paid
+  instance type this restriction does not apply. Port 25 is also simply
+  the wrong port for authenticated application sending in general — use
+  587 or 465 regardless of Render's tier.
+- **SPF, DKIM, and DMARC are all live and confirmed resolving on public
+  DNS** (verified Nov 2026 via `https://dns.google/resolve`) — see the
+  exact published values below. The `no-reply@lacracmis.com` mailbox has
+  also been created and its SMTP credentials verified to authenticate
+  successfully against `mail.lacracmis.com:465`, and a real send-then-IMAP-
+  verify round trip confirmed mail genuinely lands in the mailbox (not just
+  an "accepted" SMTP response).
+
+**Environment variables set in Render (`lacra-eudr-backend` →
+Environment) — confirmed live:**
+
+| Variable | Value | Notes |
+|---|---|---|
+| `SMTP_HOST` | `mail.lacracmis.com` | Must be this hostname, not the bare IP (TLS cert is issued for the hostname) |
+| `SMTP_PORT` | `465` | Implicit TLS. `EmailService.ts` derives `secure: true` automatically from this port number — see the port-465 TLS fix note below if this is ever changed back to 587 |
+| `SMTP_USER` | `no-reply@lacracmis.com` | The full mailbox address, as its cPanel/mail-hosting login |
+| `SMTP_PASS` | *(the mailbox's real password)* | Entered directly in Render's dashboard — never commit this |
+| `SMTP_FROM_NAME` | `LACRA CMIS Support` | Optional — display name shown to recipients. Falls back to this same value if unset |
+| `SMTP_FROM_EMAIL` | `no-reply@lacracmis.com` | Optional — the sender address. Falls back to this same value if unset. Change here (not in code) if the sender address ever needs to move |
+
+**Fixed bug — port-465 TLS mismatch (resolved):** `EmailService.ts`
+previously hardcoded `secure: false` in its nodemailer transport config
+regardless of the configured port. Port 465 requires *implicit* TLS
+(`secure: true`, encrypted from the first byte); port 587/25 use STARTTLS
+(`secure: false`, negotiated in plaintext after `EHLO`). With `SMTP_PORT=465`
+and the hardcoded `secure: false`, the TLS handshake never completed
+correctly — the send would hang for ~30s against a real server before
+failing, while `AuthController.forgotPassword()` discarded
+`sendVerificationEmail()`'s return value entirely and always responded
+`"Verification code sent."` regardless of whether anything was actually
+sent. Both are now fixed: `secure` is derived from the port
+(`secure: port === 465`), and `forgotPassword()` checks the result and
+returns a real `502` error when the send genuinely fails (while still
+responding with the existing generic/enumeration-safe success message for
+an unknown email or for an unconfigured-SMTP environment). A 15-second
+connection/greeting/socket timeout was also added to `EmailService`'s
+transport so a slow/unreachable SMTP server fails fast with a clear error
+instead of stalling the whole request for 30+ seconds.
+
+`EmailService.ts` reads `SMTP_FROM_NAME`/`SMTP_FROM_EMAIL` to build the
+`From:` header, so the sender identity can be changed without a code
+deploy — see `.env.example`'s "Email" section for local-dev defaults.
+
+**DNS records at `lacracmis.com` — all three confirmed live (Nov 2026,
+added via InterServer's "Advanced DNS Editor" for SPF/DMARC, and via
+cPanel's Email Deliverability tool for DKIM; the existing NS/A/MX/
+`mail.lacracmis.com` records were left untouched):**
+
+| Type | Host/Name | Value | Purpose |
+|---|---|---|---|
+| TXT | `lacracmis.com` (root) | `v=spf1 a mx ip4:162.35.161.241 ~all` | **SPF** — authorizes `mail.lacracmis.com` (`162.35.161.241`) to send mail for this domain. `~all` (soft-fail) is a safe starting point and can be tightened to `-all` once delivery is confirmed stable over time |
+| TXT | `default._domainkey.lacracmis.com` | `v=DKIM1; k=rsa; p=...` (the real RSA public key generated by cPanel's Email Deliverability tool for this domain/mailbox — do not reuse this value for any other domain) | **DKIM** — cPanel's "Manage the Domain" DKIM page explicitly warns that *it* does not control this domain's authoritative DNS (InterServer's separate DNS panel does), so its own "Install The Suggested Record" button has no effect here; the generated value must be copied into InterServer's DNS zone editor manually, which is what was done |
+| TXT | `_dmarc.lacracmis.com` | `v=DMARC1; p=none; rua=mailto:dmarc-reports@lacracmis.com` | **DMARC** — `p=none` (monitor-only) is the current, intentionally conservative policy; tighten to `p=quarantine`/`p=reject` later once real-world delivery is confirmed stable. Note the `rua` report address (`dmarc-reports@lacracmis.com`) does not itself exist as a mailbox yet — DMARC still functions without it existing, it just means aggregate reports from receiving mail providers have nowhere to land; create that mailbox (or repoint `rua` at `no-reply@lacracmis.com`) if those reports become useful |
+
+Verify any of the three at any time with:
+```
+curl -s 'https://dns.google/resolve?name=lacracmis.com&type=TXT'
+curl -s 'https://dns.google/resolve?name=default._domainkey.lacracmis.com&type=TXT'
+curl -s 'https://dns.google/resolve?name=_dmarc.lacracmis.com&type=TXT'
+```
+
+**Verification performed (Nov 2026):**
+1. SMTP authentication confirmed directly against `mail.lacracmis.com:465` with the real `no-reply@lacracmis.com` credentials.
+2. A real email was sent via SMTP and then independently confirmed present in the mailbox via IMAP (`mail.lacracmis.com:993`) — a genuine send-and-receive round trip, not just an "accepted" SMTP response.
+3. The live `/api/auth/forget-password` endpoint was called against a real external email address once the Render env vars above were set, and returned `"Verification code sent."` — see the port-465 TLS fix above for why this response alone was previously NOT trustworthy proof of actual delivery, and why `forgotPassword()`'s result-checking fix matters here.
+4. Remaining/ongoing: confirming real-world inbox placement (not spam) for external providers (Gmail, Yahoo, etc.) over time, now that SPF+DKIM+DMARC are all live.
 
 ---
 
