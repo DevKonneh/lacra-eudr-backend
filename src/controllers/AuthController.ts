@@ -198,8 +198,24 @@ export class AuthController {
             user.verificationCodeExpires = expires;
             await this.userRepository.save(user);
 
-            // Send Email
-            await this.emailService.sendVerificationEmail(email, code);
+            // Send Email. The result is checked (not just awaited and
+            // discarded) so a real SMTP failure is reported back to the
+            // caller instead of the API claiming "Verification code sent"
+            // when nothing was actually emailed — this previously masked a
+            // production bug where the email silently failed every time
+            // (see EmailService's port-465 TLS fix) while the mobile app
+            // showed a generic success message with no code ever arriving.
+            const emailResult = await this.emailService.sendVerificationEmail(email, code);
+            if (emailResult.mocked) {
+                // SMTP isn't configured at all in this environment. Still
+                // logged server-side only (never exposed to the caller, to
+                // avoid account enumeration) — see emailResult.mocked's
+                // doc comment on EmailService.sendVerificationEmail.
+                console.warn(`[AuthController.forgotPassword] SMTP not configured — verification code for ${email} was NOT emailed, only logged.`);
+            } else if (!emailResult.delivered) {
+                console.error(`[AuthController.forgotPassword] SMTP send FAILED for ${email}.`);
+                return errorResponse(res, "Unable to send verification code right now. Please try again in a few minutes.", [], 502);
+            }
 
             return successResponse(res, null, "Verification code sent.");
         } catch (error: any) {
