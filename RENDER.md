@@ -64,14 +64,70 @@ Go to **Render Dashboard → lacra-eudr-backend → Environment** and set every 
 | `RATE_LIMIT_WHIMO_PAYLOAD_MAX` | `30` | Max WHIMO-payload requests per IP per window |
 | `RATE_LIMIT_PUBLIC_MAX` | `60` | Max general public requests per IP per window |
 
-### Email / SMTP (optional)
+### Email / SMTP
 
-| Variable | Example |
-|---|---|
-| `SMTP_HOST` | `smtp.sendgrid.net` |
-| `SMTP_PORT` | `587` |
-| `SMTP_USER` | `apikey` |
-| `SMTP_PASS` | *(SendGrid API key)* |
+CMIS sends under its own domain, **lacracmis.com** — not the government's
+`lacra.gov.lr`, which the project owner does not control and whose DNS
+changes go through the government and take a long time. `lacracmis.com`'s
+DNS and mail hosting is already live on **InterServer** (nameservers
+`cdns1/2/3.interserver.net`; the mail server is `mail.lacracmis.com`,
+currently `162.35.161.241`, running Exim 4.100.1). This same hosting
+account's control panel (cPanel, reachable at `https://162.35.161.241:2083`
+or `https://webmail.lacracmis.com`) is where the `no-reply@lacracmis.com`
+mailbox and its DKIM key are created/managed.
+
+**Confirmed by direct connection test from the deployment sandbox (Nov
+2026):**
+- Port **587** (STARTTLS) — open, EHLO succeeds, STARTTLS negotiates
+  cleanly, and the TLS certificate validates correctly **when connecting
+  via the hostname `mail.lacracmis.com`** (not the bare IP — the
+  certificate is issued for the hostname, so connecting by IP address
+  fails certificate verification).
+- Port **465** (implicit TLS) — also open and works correctly via
+  `mail.lacracmis.com`.
+- Port **25** — open but **not usable from Render**: Render blocks
+  outbound traffic to SMTP ports 25/465/587 on **free-tier** web services
+  (see Render's Sept 2025 changelog); if the backend service is on a paid
+  instance type this restriction does not apply. Port 25 is also simply
+  the wrong port for authenticated application sending in general — use
+  587 or 465 regardless of Render's tier.
+- No SPF TXT record and no DKIM key currently published for
+  `lacracmis.com` (checked via public DNS, Nov 2026) — **both must be
+  added before this will reliably land in inboxes instead of spam/being
+  rejected** (see DNS records below).
+
+**Environment variables to set in Render (`lacra-eudr-backend` →
+Environment):**
+
+| Variable | Value | Notes |
+|---|---|---|
+| `SMTP_HOST` | `mail.lacracmis.com` | Must be this hostname, not the bare IP (TLS cert is issued for the hostname) |
+| `SMTP_PORT` | `587` | STARTTLS; use `465` instead only if 587 is ever blocked somewhere — both are confirmed working |
+| `SMTP_USER` | `no-reply@lacracmis.com` | The full mailbox address, as its cPanel/mail-hosting login |
+| `SMTP_PASS` | *(the mailbox's real password)* | Enter directly in Render's dashboard — never commit this |
+| `SMTP_FROM_NAME` | `LACRA CMIS Support` | Optional — display name shown to recipients. Falls back to this same value if unset |
+| `SMTP_FROM_EMAIL` | `no-reply@lacracmis.com` | Optional — the sender address. Falls back to this same value if unset. Change here (not in code) if the sender address ever needs to move |
+
+`EmailService.ts` reads `SMTP_FROM_NAME`/`SMTP_FROM_EMAIL` to build the
+`From:` header, so the sender identity can be changed without a code
+deploy — see `.env.example`'s "Email" section for local-dev defaults.
+
+**DNS records required at `lacracmis.com` (add via InterServer's DNS
+zone editor, alongside the existing records — do not remove the existing
+NS/A/MX/`mail.lacracmis.com` records):**
+
+| Type | Host/Name | Value | Purpose |
+|---|---|---|---|
+| TXT | `lacracmis.com` (root) | `v=spf1 a mx ip4:162.35.161.241 ~all` | **SPF** — authorizes `mail.lacracmis.com` (`162.35.161.241`) to send mail for this domain. Adjust the `ip4` value if the mail server's IP ever changes; `~all` (soft-fail) is a safe starting point and can be tightened to `-all` once delivery is confirmed stable |
+| TXT | `default._domainkey.lacracmis.com` | *(the exact value shown by cPanel's "Email Deliverability"/DKIM page for this domain)* | **DKIM** — cPanel generates the actual public key; do not fabricate this value. Log into `https://webmail.lacracmis.com:2083` (or ask InterServer support) → **Email → Email Deliverability** → select `lacracmis.com` → it will show the exact selector name (commonly `default`) and TXT value to add, and can usually install it automatically if InterServer also manages the domain's DNS (which it does here, per the NS records) |
+| TXT | `_dmarc.lacracmis.com` | `v=DMARC1; p=none; rua=mailto:dmarc-reports@lacracmis.com` | **DMARC** — not strictly required for sending, but recommended once SPF+DKIM are live; `p=none` (monitor-only) is a safe starting point, tighten to `p=quarantine`/`p=reject` later once reports confirm no legitimate mail is failing |
+
+**Recommended order of operations:**
+1. In cPanel, open **Email → Email Deliverability**, select `lacracmis.com`, and let it install/confirm the SPF, DKIM, and (if offered) DMARC records automatically — InterServer manages this domain's DNS already (same account), so the "Auto-install" option should work directly rather than needing manual copy/paste.
+2. If auto-install isn't available, manually add the three TXT records above via InterServer's DNS zone editor, using the **exact** DKIM value cPanel displays (never a placeholder).
+3. Wait for DNS propagation (usually minutes with InterServer's short TTLs, up to ~24h worst case), then re-check with `https://dns.google/resolve?name=lacracmis.com&type=TXT` and `https://dns.google/resolve?name=default._domainkey.lacracmis.com&type=TXT`.
+4. Set `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASS` in Render as above and redeploy.
+5. Confirm via `AdminMaintenanceController`'s integration-health endpoint (reports `EmailService.isConfigured()`) and by triggering a real `/api/auth/forget-password` request to an inbox you control, checking it both arrives and lands outside spam.
 
 ---
 

@@ -19,11 +19,12 @@
 // instead of silently claiming success.
 
 const sendMailMock = jest.fn();
+const createTransportMock = jest.fn((_options: any) => ({
+    sendMail: sendMailMock,
+}));
 
 jest.mock("nodemailer", () => ({
-    createTransport: jest.fn(() => ({
-        sendMail: sendMailMock,
-    })),
+    createTransport: (options: any) => createTransportMock(options),
 }));
 
 describe("EmailService.sendVerificationEmail", () => {
@@ -97,5 +98,79 @@ describe("EmailService.sendVerificationEmail", () => {
         process.env.SMTP_HOST = "smtp.sendgrid.net";
         ({ EmailService } = require("../EmailService"));
         expect(new EmailService().isConfigured()).toBe(true);
+    });
+
+    // CMIS sends under lacracmis.com (its own domain), not the government's
+    // lacra.gov.lr — see RENDER.md's "Email / SMTP" section. The sender
+    // identity must be configurable via env vars rather than hardcoded, so
+    // it can change without a code deploy.
+    describe("configurable sender address (SMTP_FROM_NAME / SMTP_FROM_EMAIL)", () => {
+        beforeEach(() => {
+            process.env.SMTP_HOST = "mail.lacracmis.com";
+            process.env.SMTP_USER = "no-reply@lacracmis.com";
+            process.env.SMTP_PASS = "pass";
+            sendMailMock.mockResolvedValueOnce({ messageId: "abc-123" });
+        });
+
+        it("defaults the From header to LACRA CMIS Support <no-reply@lacracmis.com> when unset", async () => {
+            delete process.env.SMTP_FROM_NAME;
+            delete process.env.SMTP_FROM_EMAIL;
+            const { EmailService } = require("../EmailService");
+            const service = new EmailService();
+
+            await service.sendVerificationEmail("user@example.com", "123456");
+
+            expect(sendMailMock.mock.calls[0][0].from).toBe('"LACRA CMIS Support" <no-reply@lacracmis.com>');
+        });
+
+        it("uses SMTP_FROM_NAME / SMTP_FROM_EMAIL when both are set", async () => {
+            process.env.SMTP_FROM_NAME = "LACRA Password Reset";
+            process.env.SMTP_FROM_EMAIL = "reset@lacracmis.com";
+            const { EmailService } = require("../EmailService");
+            const service = new EmailService();
+
+            await service.sendVerificationEmail("user@example.com", "123456");
+
+            expect(sendMailMock.mock.calls[0][0].from).toBe('"LACRA Password Reset" <reset@lacracmis.com>');
+        });
+    });
+
+    // Port 465 requires implicit TLS (`secure: true`) from the first byte;
+    // every other port (587, 25) uses STARTTLS instead (`secure: false`,
+    // negotiated after EHLO). Hardcoding `secure: false` regardless of port
+    // broke sending on lacracmis.com's mail server when configured for 465.
+    describe("nodemailer `secure` flag is derived from SMTP_PORT", () => {
+        it("sets secure:true for port 465 (implicit TLS)", () => {
+            process.env.SMTP_HOST = "mail.lacracmis.com";
+            process.env.SMTP_PORT = "465";
+            const { EmailService } = require("../EmailService");
+            new EmailService();
+
+            expect(createTransportMock).toHaveBeenCalledWith(
+                expect.objectContaining({ port: 465, secure: true })
+            );
+        });
+
+        it("sets secure:false for port 587 (STARTTLS)", () => {
+            process.env.SMTP_HOST = "mail.lacracmis.com";
+            process.env.SMTP_PORT = "587";
+            const { EmailService } = require("../EmailService");
+            new EmailService();
+
+            expect(createTransportMock).toHaveBeenCalledWith(
+                expect.objectContaining({ port: 587, secure: false })
+            );
+        });
+
+        it("defaults to port 587 / secure:false when SMTP_PORT is unset", () => {
+            process.env.SMTP_HOST = "mail.lacracmis.com";
+            delete process.env.SMTP_PORT;
+            const { EmailService } = require("../EmailService");
+            new EmailService();
+
+            expect(createTransportMock).toHaveBeenCalledWith(
+                expect.objectContaining({ port: 587, secure: false })
+            );
+        });
     });
 });
