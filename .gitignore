@@ -21,6 +21,7 @@ lerna-debug.log*
 .env
 .env.test
 .env.production
+.env.staging
 
 # IDE
 .idea/

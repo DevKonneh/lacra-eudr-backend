@@ -2,14 +2,21 @@ import { Router } from "express";
 import { AuthController } from "../controllers/AuthController";
 import { authMiddleware, optionalAuthMiddleware } from "../middleware/auth.middleware";
 import { UserRole } from "../entities/User";
+import { loginLimiter } from "../middleware/rateLimit.middleware";
 
 const router = Router();
 const authController = new AuthController();
 
-router.post("/login", (req, res) => authController.login(req, res));
+// Per-IP rate limit on top of (not instead of) the account-keyed lockout
+// inside AuthController.login() itself (LoginSecurityService) — see
+// rateLimit.middleware.ts's doc comment on why both layers are needed.
+router.post("/login", loginLimiter, (req, res) => authController.login(req, res));
 
-router.post("/forget-password", (req, res) => authController.forgotPassword(req, res));
-router.post("/reset-password", (req, res) => authController.resetPassword(req, res));
+// Password-reset entry points are also brute-forceable (guessing a 6-digit
+// verification code, or hammering forget-password to spam a target's
+// inbox) — reuse the same tight loginLimiter budget here.
+router.post("/forget-password", loginLimiter, (req, res) => authController.forgotPassword(req, res));
+router.post("/reset-password", loginLimiter, (req, res) => authController.resetPassword(req, res));
 // In-app password change for a logged-in user (requires their CURRENT
 // password, unlike forget/reset-password which is for locked-out users).
 router.post("/change-password", authMiddleware(), (req, res) => authController.changePassword(req, res));

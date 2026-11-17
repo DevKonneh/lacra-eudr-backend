@@ -26,6 +26,18 @@ export enum UserAuditAction {
     // "County / District" string).
     SUPERVISOR_CHANGED = "SUPERVISOR_CHANGED",
     TERRITORY_CHANGED = "TERRITORY_CHANGED",
+    // Added for the User Management security-hardening work (see
+    // migrations/2033_security_hardening). SESSIONS_REVOKED covers both an
+    // admin explicitly revoking a user's active sessions and the implicit
+    // revocation that now happens on password reset/change and on a
+    // SUSPENDED/REJECTED status transition (previousValue/newValue describe
+    // the trigger, e.g. "manual" / "status_change:SUSPENDED" /
+    // "password_reset"). PERMISSION_GROUP_CHANGED covers assigning,
+    // reassigning, or clearing a user's assignedRole ("Permission Group") —
+    // previously this was silently changed by UserController.update() with
+    // no audit entry at all.
+    SESSIONS_REVOKED = "SESSIONS_REVOKED",
+    PERMISSION_GROUP_CHANGED = "PERMISSION_GROUP_CHANGED",
 }
 
 @Entity()

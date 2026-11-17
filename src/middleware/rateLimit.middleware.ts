@@ -20,12 +20,23 @@
  *  generalPublicLimiter — catch-all for all other /api/public/* routes
  *                         (farmer profile, batch, etc.).
  *
+ *  loginLimiter — applied to POST /api/auth/login. Distinct, much tighter
+ *                 per-IP budget than the public endpoints above, since a
+ *                 login endpoint is a brute-force/credential-stuffing
+ *                 target rather than a legitimate-burst endpoint like QR
+ *                 scanning. Works alongside (not instead of)
+ *                 LoginSecurityService's account-keyed lockout — this
+ *                 limiter blocks a single IP hammering ANY account(s);
+ *                 LoginSecurityService blocks repeated attempts against
+ *                 ONE account regardless of source IP.
+ *
  * All limits are tunable via env vars so Render / production admins can adjust
  * without a code change:
  *
  *   RATE_LIMIT_FARM_SCAN_MAX        (default: 120)
  *   RATE_LIMIT_WHIMO_PAYLOAD_MAX    (default: 30)
  *   RATE_LIMIT_PUBLIC_MAX           (default: 60)
+ *   RATE_LIMIT_LOGIN_MAX            (default: 10)
  *   RATE_LIMIT_WINDOW_MS            (default: 60000 = 1 minute)
  *
  * Behaviour when the limit is exceeded:
@@ -99,6 +110,24 @@ export const whimoPayloadLimiter = rateLimit({
 export const generalPublicLimiter = rateLimit({
     windowMs,
     max: Number(process.env.RATE_LIMIT_PUBLIC_MAX ?? 60),
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    handler: jsonHandler,
+    keyGenerator: (req) => req.ip ?? "unknown",
+    skip: (req) => req.ip === "127.0.0.1" || req.ip === "::1",
+});
+
+// ── Login limiter (POST /api/auth/login) ─────────────────────────────────────
+/**
+ * 10 req / min per IP by default — intentionally tight. A legitimate user
+ * mistyping their password a handful of times in a minute is still well
+ * within budget; an automated brute-force/credential-stuffing script is
+ * not. Localhost/internal network is exempt, same as the other limiters
+ * (used for health checks / internal tooling, never a real login UI).
+ */
+export const loginLimiter = rateLimit({
+    windowMs,
+    max: Number(process.env.RATE_LIMIT_LOGIN_MAX ?? 10),
     standardHeaders: "draft-7",
     legacyHeaders: false,
     handler: jsonHandler,

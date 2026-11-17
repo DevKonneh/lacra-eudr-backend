@@ -5,11 +5,58 @@ import { Role } from "../entities/Role";
 import { UserAuditLog, UserAuditAction } from "../entities/UserAuditLog";
 import bcrypt from "bcryptjs";
 import { successResponse, errorResponse } from "../utils/response";
+import { validatePassword } from "../utils/passwordPolicy";
+import { getEffectivePermissions, isSubsetOfActorPermissions } from "../config/permissions";
 
 export class UserController {
     private userRepository = AppDataSource.getRepository(User);
     private roleRepository = AppDataSource.getRepository(Role);
     private auditLogRepository = AppDataSource.getRepository(UserAuditLog);
+
+    /**
+     * Privilege-escalation guard for any request that assigns/changes a
+     * target account's `roleId` (Permission Group). Loads the requesting
+     * actor's OWN effective permissions and confirms the candidate Role's
+     * permissions are a subset of them (or the actor already holds the
+     * 'all' wildcard, i.e. is ADMIN) — so nobody can grant another account
+     * (or, via UserController.update(), even their own account if an
+     * ADMIN's UI ever allowed self-edit) a wider permission set than they
+     * themselves hold. Returns an error string on failure, undefined on
+     * success.
+     */
+    private async checkRoleAssignmentEscalation(req: Request, roleId: string): Promise<string | undefined> {
+        const requester = (req as any).user;
+        if (!requester?.id) {
+            // Should never happen on an authMiddleware-protected route, but
+            // fail closed rather than open if it somehow does.
+            return "Unable to verify requester identity for this operation.";
+        }
+
+        const candidateRole = await this.roleRepository.findOneBy({ id: roleId });
+        if (!candidateRole) {
+            return "Selected permission group was not found.";
+        }
+
+        // ADMIN requesters always pass (they hold the 'all' wildcard by
+        // design — see config/permissions.ts), but we still resolve their
+        // actual effective permissions here rather than special-casing
+        // `requester.role === ADMIN` directly, so this stays correct if a
+        // future non-ADMIN role is ever granted ROLE_EDIT/USER_EDIT.
+        const actorUser = await this.userRepository.findOne({
+            where: { id: requester.id },
+            relations: ["assignedRole"],
+        });
+        if (!actorUser) {
+            return "Requesting account could not be verified.";
+        }
+        const actorPermissions = getEffectivePermissions(actorUser);
+        const candidatePermissions = candidateRole.permissions || [];
+
+        if (!isSubsetOfActorPermissions(candidatePermissions, actorPermissions)) {
+            return "You cannot assign a permission group that grants more access than your own account currently has.";
+        }
+        return undefined;
+    }
 
     /**
      * Validates a proposed `supervisorId` for the Monitoring feature's
@@ -43,9 +90,21 @@ export class UserController {
                 return errorResponse(res, "User with this email already exists", [], 400);
             }
 
+            const passwordCheck = validatePassword(password);
+            if (!passwordCheck.valid) {
+                return errorResponse(res, "Password does not meet security requirements", passwordCheck.errors, 400);
+            }
+
             if (supervisorId) {
                 const { error } = await this.validateSupervisor(supervisorId);
                 if (error) return errorResponse(res, error, [], 400);
+            }
+
+            // Privilege-escalation guard: an actor may only assign a
+            // permission group whose permissions are a subset of their own.
+            if (roleId) {
+                const escalationError = await this.checkRoleAssignmentEscalation(req, roleId);
+                if (escalationError) return errorResponse(res, escalationError, [], 403);
             }
 
             const hashedPassword = await bcrypt.hash(password, 10);
@@ -73,7 +132,7 @@ export class UserController {
             await this.userRepository.save(user);
 
             const requester = (req as any).user;
-            await this.auditLogRepository.save(
+            const createAuditRows: UserAuditLog[] = [
                 this.auditLogRepository.create({
                     userId: user.id,
                     action: UserAuditAction.CREATED,
@@ -82,8 +141,22 @@ export class UserController {
                     performedByUserId: requester?.id || null,
                     performedByName: requester?.name || null,
                     notes: `Account created with role "${user.role}" and status "${user.status}".`,
-                })
-            );
+                }),
+            ];
+            if (user.assignedRole) {
+                createAuditRows.push(
+                    this.auditLogRepository.create({
+                        userId: user.id,
+                        action: UserAuditAction.PERMISSION_GROUP_CHANGED,
+                        previousValue: null,
+                        newValue: user.assignedRole.name,
+                        performedByUserId: requester?.id || null,
+                        performedByName: requester?.name || null,
+                        notes: `Permission group "${user.assignedRole.name}" assigned at account creation.`,
+                    })
+                );
+            }
+            await this.auditLogRepository.save(createAuditRows);
 
             // Return user without password
             const { password: _, ...userWithoutPassword } = user;
@@ -177,7 +250,11 @@ export class UserController {
                 supervisorId, assignedCounty, assignedDistrict,
             } = req.body;
 
-            const user = await this.userRepository.findOneBy({ id });
+            // Load with the assignedRole relation populated so the
+            // "previous permission group" audit value below is accurate
+            // (a plain findOneBy() would leave user.assignedRole
+            // undefined, since it's a non-eager relation).
+            const user = await this.userRepository.findOne({ where: { id }, relations: ["assignedRole"] });
             if (!user) {
                 return errorResponse(res, "User not found", [], 404);
             }
@@ -196,6 +273,23 @@ export class UserController {
                 if (error) return errorResponse(res, error, [], 400);
             }
 
+            // Privilege-escalation guard, checked BEFORE any field is
+            // mutated (same reasoning as the supervisor check above): an
+            // actor may only assign a permission group whose permissions
+            // are a subset of their own effective permissions.
+            if (roleId) {
+                const escalationError = await this.checkRoleAssignmentEscalation(req, roleId);
+                if (escalationError) return errorResponse(res, escalationError, [], 403);
+            }
+
+            // Password policy, checked BEFORE mutation for the same reason.
+            if (password) {
+                const passwordCheck = validatePassword(password);
+                if (!passwordCheck.valid) {
+                    return errorResponse(res, "Password does not meet security requirements", passwordCheck.errors, 400);
+                }
+            }
+
             const requester = (req as any).user;
             const auditRows: UserAuditLog[] = [];
 
@@ -209,6 +303,12 @@ export class UserController {
 
             if (password) {
                 user.password = await bcrypt.hash(password, 10);
+                // An admin-initiated password reset must invalidate the
+                // account's existing sessions, same as a self-service
+                // reset/change (task #5) — the account holder's old
+                // password/token should not keep working after an admin
+                // deliberately resets it (e.g. because it was compromised).
+                user.tokenVersion = (user.tokenVersion ?? 0) + 1;
                 auditRows.push(
                     this.auditLogRepository.create({
                         userId: user.id,
@@ -218,6 +318,15 @@ export class UserController {
                         performedByUserId: requester?.id || null,
                         performedByName: requester?.name || null,
                         notes: "Password reset by an administrator.",
+                    }),
+                    this.auditLogRepository.create({
+                        userId: user.id,
+                        action: UserAuditAction.SESSIONS_REVOKED,
+                        previousValue: null,
+                        newValue: null,
+                        performedByUserId: requester?.id || null,
+                        performedByName: requester?.name || null,
+                        notes: "Sessions invalidated: password reset by an administrator.",
                     })
                 );
             }
@@ -230,6 +339,12 @@ export class UserController {
             const previousSupervisorId = user.supervisorId;
             const previousAssignedCounty = user.assignedCounty;
             const previousAssignedDistrict = user.assignedDistrict;
+            // Captured BEFORE any reassignment below (the "assignedRole"
+            // relation was loaded on the initial findOne() above), so the
+            // audit row below can show a reliable "before" permission
+            // group name.
+            const previousAssignedRole = user.assignedRole ?? null;
+            const previousAssignedRoleId: string | null = previousAssignedRole ? previousAssignedRole.id : null;
 
             user.name = name ?? user.name;
             user.phone = phone ?? user.phone;
@@ -248,19 +363,66 @@ export class UserController {
                 user.supervisorId = supervisorId || null;
             }
 
+            let newAssignedRole: Role | null = null;
+            let assignedRoleChanged = false;
             if (roleId) {
                 const assignedRole = await this.roleRepository.findOneBy({ id: roleId });
                 if (assignedRole) {
                     user.assignedRole = assignedRole;
+                    newAssignedRole = assignedRole;
+                    assignedRoleChanged = assignedRole.id !== previousAssignedRoleId;
                 }
             } else if (roleId === null) {
                 // If explicitly set to null, remove the role
                 // TypeORM might need different handling for nulling relation
                 // @ts-ignore
                 user.assignedRole = null;
+                assignedRoleChanged = previousAssignedRoleId !== null;
+            }
+
+            // Suspending/deactivating/rejecting an account (or any other
+            // status transition) must invalidate its existing sessions
+            // immediately — this is the core fix for task #1 ("suspension
+            // enforcement"). Without this, authMiddleware's live status
+            // check alone already blocks further requests once the DB row
+            // is SUSPENDED (see auth.middleware.ts), but bumping
+            // tokenVersion here too means that if the account is later
+            // REACTIVATED, any token issued before the suspend/reactivate
+            // cycle still cannot be replayed — only a fresh login works.
+            const statusChanging = status && status !== previousStatus;
+            if (statusChanging) {
+                user.tokenVersion = (user.tokenVersion ?? 0) + 1;
             }
 
             await this.userRepository.save(user);
+
+            if (statusChanging) {
+                auditRows.push(
+                    this.auditLogRepository.create({
+                        userId: user.id,
+                        action: UserAuditAction.SESSIONS_REVOKED,
+                        previousValue: null,
+                        newValue: null,
+                        performedByUserId: requester?.id || null,
+                        performedByName: requester?.name || null,
+                        notes: `Sessions invalidated: account status changed from "${previousStatus}" to "${status}".`,
+                    })
+                );
+            }
+
+            if (assignedRoleChanged) {
+                auditRows.push(
+                    this.auditLogRepository.create({
+                        userId: user.id,
+                        action: UserAuditAction.PERMISSION_GROUP_CHANGED,
+                        previousValue: previousAssignedRole?.name ?? null,
+                        newValue: newAssignedRole?.name ?? null,
+                        performedByUserId: requester?.id || null,
+                        performedByName: requester?.name || null,
+                        notes: null,
+                    })
+                );
+            }
 
             if (roleType && roleType !== previousRole) {
                 auditRows.push(
@@ -371,11 +533,22 @@ export class UserController {
             }
 
             const previousStatus = user.status;
+            const statusActuallyChanging = status !== previousStatus;
             user.status = status;
+            if (statusActuallyChanging) {
+                // Core fix for task #1 (suspension enforcement): bumping
+                // tokenVersion here means every token issued for this
+                // account BEFORE this moment is rejected by
+                // authMiddleware's live tokenVersion check on its very
+                // next request, regardless of the token's stated 24h
+                // expiry. See User.tokenVersion's doc comment for the full
+                // mechanism.
+                user.tokenVersion = (user.tokenVersion ?? 0) + 1;
+            }
             await this.userRepository.save(user);
 
             const requester = (req as any).user;
-            await this.auditLogRepository.save(
+            const auditRows: UserAuditLog[] = [
                 this.auditLogRepository.create({
                     userId: user.id,
                     action: UserAuditAction.STATUS_CHANGED,
@@ -384,14 +557,72 @@ export class UserController {
                     performedByUserId: requester?.id || null,
                     performedByName: requester?.name || null,
                     notes: null,
-                })
-            );
+                }),
+            ];
+            if (statusActuallyChanging) {
+                auditRows.push(
+                    this.auditLogRepository.create({
+                        userId: user.id,
+                        action: UserAuditAction.SESSIONS_REVOKED,
+                        previousValue: null,
+                        newValue: null,
+                        performedByUserId: requester?.id || null,
+                        performedByName: requester?.name || null,
+                        notes: `Sessions invalidated: account status changed from "${previousStatus}" to "${status}".`,
+                    })
+                );
+            }
+            await this.auditLogRepository.save(auditRows);
 
             const { password, ...rest } = user;
             return successResponse(res, rest, "User status updated successfully");
         } catch (error: any) {
             console.error("Set User Status Error", error);
             return errorResponse(res, "Error updating user status", [error.message], 500);
+        }
+    }
+
+    /**
+     * Explicit admin-triggered session revocation (task #5: "Allow
+     * administrators to revoke a user's active sessions"). Bumps
+     * tokenVersion so every token issued for this account before this
+     * moment is rejected by authMiddleware's live tokenVersion check on
+     * its very next request — the account itself is NOT suspended/
+     * modified in any other way, it is simply forced to log in again
+     * everywhere it is currently signed in. Distinct from setStatus()
+     * (which ALSO revokes sessions, but as a side effect of a status
+     * change) - this endpoint is for "this specific account's sessions
+     * look suspicious / the user reported a lost device" without
+     * otherwise touching the account.
+     */
+    async revokeSessions(req: Request, res: Response) {
+        try {
+            const { id } = req.params;
+            const user = await this.userRepository.findOneBy({ id });
+            if (!user) {
+                return errorResponse(res, "User not found", [], 404);
+            }
+
+            user.tokenVersion = (user.tokenVersion ?? 0) + 1;
+            await this.userRepository.save(user);
+
+            const requester = (req as any).user;
+            await this.auditLogRepository.save(
+                this.auditLogRepository.create({
+                    userId: user.id,
+                    action: UserAuditAction.SESSIONS_REVOKED,
+                    previousValue: null,
+                    newValue: null,
+                    performedByUserId: requester?.id || null,
+                    performedByName: requester?.name || null,
+                    notes: "Sessions explicitly revoked by an administrator.",
+                })
+            );
+
+            return successResponse(res, null, "All active sessions for this user have been revoked.");
+        } catch (error: any) {
+            console.error("Revoke Sessions Error", error);
+            return errorResponse(res, "Error revoking sessions", [error.message], 500);
         }
     }
 

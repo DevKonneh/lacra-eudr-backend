@@ -1,8 +1,10 @@
 import { Router } from "express";
 import { FarmController } from "../controllers/FarmController";
 import { authMiddleware } from "../middleware/auth.middleware";
+import { requirePermission } from "../middleware/permission.middleware";
 import { UserRole } from "../entities/User";
 import { upload } from "../middleware/upload.middleware";
+import { PERMISSIONS } from "../config/permissions";
 
 const router = Router();
 const controller = new FarmController();
@@ -13,35 +15,48 @@ const controller = new FarmController();
 // FarmController's Data Correction Queue methods for full rationale).
 // MUST be registered BEFORE "GET /:id" below — otherwise Express would
 // match "/geometry/data-correction-queue" as GET "/:id" with id="geometry".
-router.get("/geometry/data-correction-queue", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.getDataCorrectionQueue(req, res));
-router.post("/geometry/revalidate-all", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.revalidateAllGeometry(req, res));
+router.get("/geometry/data-correction-queue", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), requirePermission(PERMISSIONS.FARM_VIEW), (req, res) => controller.getDataCorrectionQueue(req, res));
+router.post("/geometry/revalidate-all", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), requirePermission(PERMISSIONS.FARM_EDIT), (req, res) => controller.revalidateAllGeometry(req, res));
 
 // Admin-only: attempt to auto-repair a self-intersecting ("bowtie")
 // polygon by reordering its existing points — dry-run by default, pass
 // ?apply=true to persist. See FarmController.repairGeometry() for the
 // full safety rationale (never invents/moves a coordinate, only fixes
 // connection order, and verifies the result before saving anything).
-router.post("/:id/geometry/repair", authMiddleware([UserRole.ADMIN]), (req, res) => controller.repairGeometry(req, res));
+router.post("/:id/geometry/repair", authMiddleware([UserRole.ADMIN]), requirePermission(PERMISSIONS.FARM_EDIT), (req, res) => controller.repairGeometry(req, res));
 
 // ── GeoID admin operations ───────────────────────────────────────────────────
 // POST /farms/backfill-geoids
 //   One-time maintenance: mint GeoIDs for all existing farms that don't have
 //   one yet. Safe to call repeatedly — already-minted farms are skipped.
 //   ADMIN only. MUST be registered BEFORE "GET /:id" for the same reason as
-//   the geometry routes above.
+//   the geometry routes above. No requirePermission(...) here - this is a
+//   one-time maintenance operation, not an ongoing CRUD action, and has no
+//   corresponding "farm.*" permission concept (consistent with the
+//   maintenance/* routes left alone on farmer.routes.ts).
 router.post("/backfill-geoids", authMiddleware([UserRole.ADMIN]), (req, res) => controller.backfillGeoIds(req, res));
 
 // ── Standard CRUD ────────────────────────────────────────────────────────────
+// NOTE: POST "/" (create), POST "/offline-sync", PUT "/:id/photos", PUT
+// "/:id/boundary-evidence", and the commodity sub-routes below are ALSO
+// reachable by the FARMER role for their OWN farm (self-service, mirroring
+// farmer.routes.ts's "/:id" PUT) — no requirePermission(...) is added to
+// these for the same reason as there: FARMER's DEFAULT_ROLE_PERMISSIONS is
+// deliberately empty (self-service is scoped by ownership/role, not by
+// this permission system), so adding a FARM_CREATE/FARM_EDIT requirement
+// here would incorrectly block a farmer registering/editing their own farm.
 router.get("/", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER, UserRole.BUYER]), (req, res) => controller.getAll(req, res));
 router.get("/:id", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER, UserRole.BUYER]), (req, res) => controller.getOne(req, res));
 router.post("/", authMiddleware([UserRole.FARMER, UserRole.ADMIN, UserRole.INSPECTOR]), upload.any(), (req, res) => controller.create(req, res));
 router.post("/offline-sync", authMiddleware([UserRole.FARMER, UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.offlineSync(req, res));
 router.put("/:id/photos", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), upload.any(), (req, res) => controller.addPhotos(req, res));
 router.put("/:id/boundary-evidence", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), upload.any(), (req, res) => controller.addBoundaryEvidence(req, res));
-router.post("/:id/geometry/revalidate", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => controller.revalidateGeometry(req, res));
+router.post("/:id/geometry/revalidate", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), requirePermission(PERMISSIONS.FARM_EDIT), (req, res) => controller.revalidateGeometry(req, res));
 
 // Multi-commodity management: add/update/deactivate a commodity on a farm
 // WITHOUT deleting the farm record itself (see FarmController for details).
+// Same self-service reasoning as the CRUD routes above - FARMER must stay
+// able to manage commodities on their own farm.
 router.post("/:id/commodities", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), (req, res) => controller.addCommodity(req, res));
 router.put("/:id/commodities/:commodityId", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), (req, res) => controller.updateCommodity(req, res));
 router.put("/:id/commodities/:commodityId/deactivate", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER]), (req, res) => controller.deactivateCommodity(req, res));

@@ -19,12 +19,17 @@ import { UserAuditLog, UserAuditAction } from "../entities/UserAuditLog";
 import { SignInAttempt, SignInOutcome } from "../entities/SignInAttempt";
 import { detectPlatform } from "../utils/platformDetector";
 import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
+import { getEffectivePermissions } from "../config/permissions";
+import { validatePassword } from "../utils/passwordPolicy";
+import { LoginSecurityService } from "../services/LoginSecurityService";
+import crypto from "crypto";
 
 export class AuthController {
     private userRepository = AppDataSource.getRepository(User);
     private emailService = new EmailService();
     private userAuditLogRepository = AppDataSource.getRepository(UserAuditLog);
     private signInAttemptRepository = AppDataSource.getRepository(SignInAttempt);
+    private loginSecurityService = new LoginSecurityService();
 
     // Best-effort: records one row to SignInAttempt. Never throws - a
     // logging failure must never block or fail an actual login/login
@@ -57,6 +62,11 @@ export class AuthController {
             const existingUser = await this.userRepository.findOneBy({ email });
             if (existingUser) {
                 return errorResponse(res, "User already exists", [], 400);
+            }
+
+            const passwordCheck = validatePassword(password);
+            if (!passwordCheck.valid) {
+                return errorResponse(res, "Password does not meet security requirements", passwordCheck.errors, 400);
             }
 
             const hashedPassword = await bcrypt.hash(password, 10);
@@ -111,6 +121,30 @@ export class AuthController {
                 return errorResponse(res, `Account is ${user.status}. Please contact support.`, [], 403);
             }
 
+            // Account-level lockout after repeated recent failed attempts
+            // (works alongside the IP-based loginLimiter mounted on this
+            // route — see rateLimit.middleware.ts's doc comment on why
+            // both are needed). Checked BEFORE the password comparison so
+            // a locked-out account can't be used to keep guessing even if
+            // the attacker somehow has the correct password already noted
+            // down for a later retry window.
+            const lockout = await this.loginSecurityService.checkLockout(user.id);
+            if (lockout.locked) {
+                await this.recordSignInAttempt({
+                    userId: user.id,
+                    outcome: SignInOutcome.BLOCKED,
+                    reason: "Account temporarily locked after repeated failed login attempts",
+                    platform,
+                });
+                res.setHeader("Retry-After", String(lockout.retryAfterSeconds ?? 900));
+                return errorResponse(
+                    res,
+                    `Too many failed login attempts. Please try again in ${Math.ceil((lockout.retryAfterSeconds ?? 900) / 60)} minute(s).`,
+                    [],
+                    429
+                );
+            }
+
             const isMatch = await bcrypt.compare(password, user.password);
             if (!isMatch) {
                 await this.recordSignInAttempt({
@@ -150,10 +184,19 @@ export class AuthController {
                 platform,
             });
 
-            const permissions = user.assignedRole?.permissions || [];
+            // Effective permissions resolved via the shared helper (ADMIN
+            // always gets the 'all' wildcard; an assignedRole narrows to
+            // exactly that Role's permissions; otherwise falls back to the
+            // DEFAULT_ROLE_PERMISSIONS for this account's coarse role —
+            // see config/permissions.ts for the full design rationale).
+            const permissions = getEffectivePermissions(user);
 
+            // tokenVersion is embedded so authMiddleware can detect when
+            // this specific token has been invalidated later (admin
+            // revoked sessions, account suspended, password reset/changed)
+            // without needing to track issued tokens anywhere server-side.
             const token = jwt.sign(
-                { id: user.id, email: user.email, role: user.role, name: user.name },
+                { id: user.id, email: user.email, role: user.role, name: user.name, tokenVersion: user.tokenVersion },
                 JWT_SECRET,
                 { expiresIn: "24h" }
             );
@@ -194,14 +237,29 @@ export class AuthController {
             const expires = new Date();
             expires.setMinutes(expires.getMinutes() + 15);
 
-            user.verificationCode = code;
+            // Store a HASH of the code, never the raw value, same reasoning
+            // as password hashing - a DB leak must not hand over usable
+            // reset codes for every account with a pending reset request.
+            // The raw `code` is only ever held in memory here, long enough
+            // to email it, and is compared via its hash in resetPassword().
+            user.verificationCode = crypto.createHash("sha256").update(code).digest("hex");
             user.verificationCodeExpires = expires;
             await this.userRepository.save(user);
 
-            // Send Email
-            await this.emailService.sendVerificationEmail(email, code);
+            // Send Email. Logged (not exposed to the caller - the response
+            // below is deliberately generic either way, to avoid account
+            // enumeration) so staging/production logs can directly confirm
+            // whether a real SMTP send happened for task #6's delivery
+            // verification, instead of just trusting the generic success
+            // response the user sees.
+            const emailResult = await this.emailService.sendVerificationEmail(email, code);
+            if (emailResult.mocked) {
+                console.warn(`[AuthController.forgotPassword] SMTP not configured — verification code for ${email} was NOT actually emailed, only logged.`);
+            } else if (!emailResult.delivered) {
+                console.error(`[AuthController.forgotPassword] SMTP send FAILED for ${email}.`);
+            }
 
-            return successResponse(res, null, "Verification code sent.");
+            return successResponse(res, null, "If account exists, code sent.");
         } catch (error: any) {
             console.error("Forgot Password Error", error);
             return errorResponse(res, "Error sending code", [error.message], 500);
@@ -223,8 +281,9 @@ export class AuthController {
             if (!currentPassword || !newPassword) {
                 return errorResponse(res, "Current and new password are required", [], 400);
             }
-            if (String(newPassword).length < 6) {
-                return errorResponse(res, "New password must be at least 6 characters", [], 400);
+            const passwordCheck = validatePassword(newPassword);
+            if (!passwordCheck.valid) {
+                return errorResponse(res, "New password does not meet security requirements", passwordCheck.errors, 400);
             }
 
             const user = await this.userRepository.findOneBy({ id: userId });
@@ -236,9 +295,29 @@ export class AuthController {
             }
 
             user.password = await bcrypt.hash(newPassword, 10);
+            // Invalidate every existing session for this account (task #5:
+            // "password resets/changes must invalidate existing sessions").
+            // The caller's OWN current request already completed its
+            // authMiddleware check before reaching here, so this does not
+            // affect this response, but any OTHER device/tab/stolen token
+            // using the old password will be rejected on its very next
+            // request.
+            user.tokenVersion = (user.tokenVersion ?? 0) + 1;
             await this.userRepository.save(user);
 
-            return successResponse(res, null, "Password updated successfully");
+            await this.userAuditLogRepository.save(
+                this.userAuditLogRepository.create({
+                    userId: user.id,
+                    action: UserAuditAction.SESSIONS_REVOKED,
+                    previousValue: null,
+                    newValue: null,
+                    performedByUserId: user.id,
+                    performedByName: user.name,
+                    notes: "Sessions invalidated: user changed their own password.",
+                })
+            );
+
+            return successResponse(res, null, "Password updated successfully. You have been logged out of other sessions.");
         } catch (error: any) {
             console.error("Change Password Error", error);
             return errorResponse(res, "Error updating password", [error.message], 500);
@@ -252,13 +331,29 @@ export class AuthController {
                 return errorResponse(res, "Missing fields", [], 400);
             }
 
+            const passwordCheck = validatePassword(newPassword);
+            if (!passwordCheck.valid) {
+                return errorResponse(res, "New password does not meet security requirements", passwordCheck.errors, 400);
+            }
+
             const user = await this.userRepository.findOneBy({ email });
             if (!user) {
                 return errorResponse(res, "Invalid request", [], 400);
             }
 
-            // Check Code
-            if (user.verificationCode !== verificationCode) {
+            // SINGLE-USE enforcement: a code that was already consumed (or
+            // never issued) has verificationCode === null, so this check
+            // alone guarantees a given code can never be successfully used
+            // twice — the first successful reset clears it below, and any
+            // replay attempt with the same code afterwards lands here.
+            if (!user.verificationCode) {
+                return errorResponse(res, "Invalid or already-used verification code", [], 400);
+            }
+
+            // Compare by HASH, never the raw code (see forgotPassword(),
+            // which stores only the sha256 hash).
+            const candidateHash = crypto.createHash("sha256").update(String(verificationCode)).digest("hex");
+            if (user.verificationCode !== candidateHash) {
                 return errorResponse(res, "Invalid verification code", [], 400);
             }
 
@@ -271,11 +366,31 @@ export class AuthController {
             const hashedPassword = await bcrypt.hash(newPassword, 10);
             user.password = hashedPassword;
 
-            // Clear Code
+            // Clear Code — this is what makes the code single-use (see
+            // the guard at the top of this method).
             user.verificationCode = null as any;
             user.verificationCodeExpires = null as any;
 
+            // Invalidate every existing session for this account (task #5:
+            // "password resets must invalidate existing sessions"). This
+            // matters especially here: a password reset via email code is
+            // typically used BECAUSE the account holder suspects/knows
+            // their old password/session may be compromised.
+            user.tokenVersion = (user.tokenVersion ?? 0) + 1;
+
             await this.userRepository.save(user);
+
+            await this.userAuditLogRepository.save(
+                this.userAuditLogRepository.create({
+                    userId: user.id,
+                    action: UserAuditAction.SESSIONS_REVOKED,
+                    previousValue: null,
+                    newValue: null,
+                    performedByUserId: user.id,
+                    performedByName: user.name,
+                    notes: "Sessions invalidated: password reset via emailed verification code.",
+                })
+            );
 
             return successResponse(res, null, "Password reset successfully. You can now login.");
         } catch (error: any) {

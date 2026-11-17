@@ -170,6 +170,28 @@ export class User {
     @Column({ type: "varchar", nullable: true })
     assignedDistrict!: string | null;
 
+    // --- Security hardening: session revocation / token invalidation -------
+    // Embedded into every newly-issued JWT at login time (see
+    // AuthController.login). authMiddleware compares the token's
+    // tokenVersion claim against this live DB value on every authenticated
+    // request and rejects the request if they differ. Incrementing this
+    // column therefore instantly invalidates every previously-issued token
+    // for this account, regardless of the token's stated expiry. This is
+    // the single mechanism behind three distinct requirements:
+    //   1. Suspending/deactivating an account (UserController.setStatus)
+    //      bumps this so the account's existing session(s) stop working
+    //      immediately instead of remaining valid until natural JWT expiry.
+    //   2. An admin can explicitly "revoke sessions" for a user
+    //      (UserController.revokeSessions) by bumping this directly.
+    //   3. A password reset or change (AuthController.resetPassword /
+    //      changePassword) bumps this so a stolen/old session cannot
+    //      continue to be used after the account holder changes their
+    //      password.
+    // See migrations/2033_security_hardening/up.sql. Defaulted to 0 so
+    // every existing row is immediately valid with no backfill needed.
+    @Column({ type: "int", default: 0 })
+    tokenVersion!: number;
+
     @CreateDateColumn()
     createdAt!: Date;
 
