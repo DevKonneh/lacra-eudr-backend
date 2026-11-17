@@ -4,6 +4,26 @@ import { Business, BusinessType, BusinessEligibility } from "../entities/Busines
 import { User } from "../entities/User";
 import { successResponse, errorResponse } from "../utils/response";
 
+// DEFECT FOUND AND FIXED during this task's integration-testing pass
+// (item #4: "resolve... any defects found during verification"): every
+// method below that returns a Business with its `owner` relation
+// (register/getMyBusiness/getAll) was serializing the FULL User entity —
+// including the bcrypt password HASH — directly into the JSON response.
+// Confirmed live via a real HTTP integration test against the running
+// staging server: POST /api/business/register's response body contained
+// `owner.password` = a real bcrypt hash string. Not a plaintext-password
+// leak (bcrypt, not reversible), but still an unnecessary sensitive-field
+// exposure that other controllers in this codebase (e.g.
+// UserController.getAll()) already deliberately strip. Mirrors that exact
+// pattern here.
+function stripOwnerPassword<T extends { owner?: any }>(business: T): T {
+    if (business && business.owner) {
+        const { password, ...ownerWithoutPassword } = business.owner;
+        return { ...business, owner: ownerWithoutPassword };
+    }
+    return business;
+}
+
 export class BusinessController {
     private businessRepository = AppDataSource.getRepository(Business);
     private userRepository = AppDataSource.getRepository(User);
@@ -38,7 +58,7 @@ export class BusinessController {
             });
 
             await this.businessRepository.save(business);
-            return successResponse(res, business, "Business registered successfully", 201);
+            return successResponse(res, stripOwnerPassword(business), "Business registered successfully", 201);
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error registering business", [error.message], 500);
@@ -53,7 +73,7 @@ export class BusinessController {
                 relations: ["owner", "licenses", "permits"]
             });
             if (!business) return errorResponse(res, "No business profile found", [], 404);
-            return successResponse(res, business);
+            return successResponse(res, stripOwnerPassword(business));
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error fetching business profile", [error.message], 500);
@@ -63,7 +83,7 @@ export class BusinessController {
     async getAll(req: Request, res: Response) {
         try {
             const businesses = await this.businessRepository.find({ relations: ["owner"] });
-            return successResponse(res, businesses);
+            return successResponse(res, businesses.map(stripOwnerPassword));
         } catch (error: any) {
             return errorResponse(res, "Error fetching businesses", [error.message], 500);
         }
