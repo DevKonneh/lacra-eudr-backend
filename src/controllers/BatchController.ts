@@ -6,6 +6,7 @@ import { Farmer } from "../entities/Farmer";
 import QRCode from 'qrcode';
 import { In } from "typeorm";
 import { successResponse, errorResponse } from "../utils/response";
+import { deepSanitizeUsers } from "../utils/sanitizeUser";
 
 export class BatchController {
     private batchRepository = AppDataSource.getRepository(Batch);
@@ -87,7 +88,13 @@ export class BatchController {
                 relations: ["farmers", "createdBy", "createdBy.user"]
             });
             if (!batch) return errorResponse(res, "Batch not found", [], 404);
-            return successResponse(res, batch);
+            // DEFECT FOUND AND FIXED (same class as BusinessController's
+            // owner leak): createdBy.user is the License holder's full
+            // User entity, including the bcrypt password hash. Confirmed
+            // via code review of the loaded relation path; fixed using the
+            // same shared deepSanitizeUsers() helper applied across every
+            // controller with this pattern in this pass.
+            return successResponse(res, deepSanitizeUsers(batch));
         } catch (error: any) {
             return errorResponse(res, "Error tracing batch", [error.message], 500);
         }

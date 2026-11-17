@@ -3,6 +3,7 @@ import { AppDataSource } from "../data-source";
 import { Permit, PermitStatus } from "../entities/Permit";
 import { Business, BusinessEligibility } from "../entities/Business";
 import { successResponse, errorResponse } from "../utils/response";
+import { deepSanitizeUsers } from "../utils/sanitizeUser";
 
 // Fields the applicant is allowed to set themselves, matching LACRA Form
 // No. 0050 Sections A-D. Kept as an explicit whitelist (rather than
@@ -123,7 +124,11 @@ export class PermitController {
                 relations: ["business", "business.owner"]
             });
             if (!permit) return errorResponse(res, "Permit not found", [], 404);
-            return successResponse(res, permit);
+            // DEFECT FOUND AND FIXED: business.owner is the applicant's
+            // full User entity (bcrypt password hash included) — this
+            // endpoint previously serialized it straight into the JSON
+            // response. See utils/sanitizeUser.ts for the full rationale.
+            return successResponse(res, deepSanitizeUsers(permit));
         } catch (error: any) {
             return errorResponse(res, "Error fetching permit", [error.message], 500);
         }

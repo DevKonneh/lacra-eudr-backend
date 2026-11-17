@@ -3,6 +3,7 @@ import { AppDataSource } from "../data-source";
 import { Business, BusinessType, BusinessEligibility } from "../entities/Business";
 import { User } from "../entities/User";
 import { successResponse, errorResponse } from "../utils/response";
+import { deepSanitizeUsers } from "../utils/sanitizeUser";
 
 // DEFECT FOUND AND FIXED during this task's integration-testing pass
 // (item #4: "resolve... any defects found during verification"): every
@@ -14,15 +15,11 @@ import { successResponse, errorResponse } from "../utils/response";
 // `owner.password` = a real bcrypt hash string. Not a plaintext-password
 // leak (bcrypt, not reversible), but still an unnecessary sensitive-field
 // exposure that other controllers in this codebase (e.g.
-// UserController.getAll()) already deliberately strip. Mirrors that exact
-// pattern here.
-function stripOwnerPassword<T extends { owner?: any }>(business: T): T {
-    if (business && business.owner) {
-        const { password, ...ownerWithoutPassword } = business.owner;
-        return { ...business, owner: ownerWithoutPassword };
-    }
-    return business;
-}
+// UserController.getAll()) already deliberately strip. Now uses the
+// shared deepSanitizeUsers() helper (see utils/sanitizeUser.ts) instead of
+// an ad-hoc one-off strip, since the same User-embedding pattern turned
+// out to exist in several other controllers too (License, Permit, Batch,
+// Enforcement, Inspection, QualityControl — all fixed in the same pass).
 
 export class BusinessController {
     private businessRepository = AppDataSource.getRepository(Business);
@@ -58,7 +55,7 @@ export class BusinessController {
             });
 
             await this.businessRepository.save(business);
-            return successResponse(res, stripOwnerPassword(business), "Business registered successfully", 201);
+            return successResponse(res, deepSanitizeUsers(business), "Business registered successfully", 201);
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error registering business", [error.message], 500);
@@ -73,7 +70,7 @@ export class BusinessController {
                 relations: ["owner", "licenses", "permits"]
             });
             if (!business) return errorResponse(res, "No business profile found", [], 404);
-            return successResponse(res, stripOwnerPassword(business));
+            return successResponse(res, deepSanitizeUsers(business));
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error fetching business profile", [error.message], 500);
@@ -83,7 +80,7 @@ export class BusinessController {
     async getAll(req: Request, res: Response) {
         try {
             const businesses = await this.businessRepository.find({ relations: ["owner"] });
-            return successResponse(res, businesses.map(stripOwnerPassword));
+            return successResponse(res, deepSanitizeUsers(businesses));
         } catch (error: any) {
             return errorResponse(res, "Error fetching businesses", [error.message], 500);
         }

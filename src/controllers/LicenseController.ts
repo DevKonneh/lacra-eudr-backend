@@ -4,6 +4,7 @@ import { License, LicenseStatus, LicenseType } from "../entities/License";
 import { User, UserRole } from "../entities/User";
 import { Business, BusinessEligibility } from "../entities/Business";
 import { successResponse, errorResponse } from "../utils/response";
+import { deepSanitizeUsers } from "../utils/sanitizeUser";
 
 export class LicenseController {
     private licenseRepository = AppDataSource.getRepository(License);
@@ -189,7 +190,12 @@ export class LicenseController {
     async getAll(req: Request, res: Response) {
         try {
             const licenses = await this.licenseRepository.find({ relations: ["user", "business"] });
-            return successResponse(res, licenses);
+            // DEFECT FOUND AND FIXED: `user` here is the License holder's
+            // full User entity (bcrypt password hash included) — this
+            // endpoint previously serialized it straight into the JSON
+            // response. Also covers business.owner (a second embedded
+            // User) via the same deep sanitizer.
+            return successResponse(res, deepSanitizeUsers(licenses));
         } catch (error: any) {
             return errorResponse(res, "Error fetching all licenses", [error.message], 500);
         }

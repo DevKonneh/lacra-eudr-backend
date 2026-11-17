@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { AppDataSource } from "../data-source";
 import { Inspection } from "../entities/Inspection";
 import { successResponse, errorResponse } from "../utils/response";
+import { deepSanitizeUsers } from "../utils/sanitizeUser";
 
 export class InspectionController {
     private repository = AppDataSource.getRepository(Inspection);
@@ -12,7 +13,11 @@ export class InspectionController {
                 relations: ["inspector", "farm", "shipment"],
                 order: { createdAt: "DESC" }
             });
-            return successResponse(res, items);
+            // DEFECT FOUND AND FIXED: `inspector` is the full User entity
+            // (bcrypt password hash included) — this endpoint previously
+            // serialized it straight into the JSON response. See
+            // utils/sanitizeUser.ts for the full rationale.
+            return successResponse(res, deepSanitizeUsers(items));
         } catch (error: any) {
             return errorResponse(res, "Error fetching inspections", [error.message], 500);
         }
