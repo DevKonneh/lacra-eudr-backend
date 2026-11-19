@@ -6,7 +6,8 @@ import { NotificationService } from "./NotificationService";
 import { FarmDocument, DocumentStatus } from "../entities/FarmDocument";
 import { Forest, RiskLevel as ForestRiskLevel } from "../entities/Forest";
 
-import { WhispService, WhispAnalysisResult, WhispRiskLabel } from "./WhispService";
+import { WhispService, WhispAnalysisResult, WhispRiskLabel, WhispUnavailableError } from "./WhispService";
+import { AssessmentAttempt } from "../entities/AssessmentAttempt";
 import { CropType } from "../entities/Farm";
 import { validateAndAnnotateFarm } from "./FarmGeometryHelper";
 import { GeometryStatus } from "./GeometryValidationService";
@@ -69,8 +70,34 @@ export class RiskService {
             throw err;
         }
 
-        // Call Open Foris Whisp for Deforestation Analysis
-        const whispResult = await this.whispService.analyzeFarm(farmId, farm.location);
+        // Call Open Foris Whisp for Deforestation Analysis.
+        //
+        // ASSESSMENT INTEGRITY: a Whisp failure is NOT an assessment.
+        //
+        // Previously a failed or unconfigured Whisp call fell through to a
+        // name-based fake ("farm name contains 'risk'"), and this method then
+        // wrote a normal-looking RiskAssessment row AND stamped farm.riskLevel
+        // plus farm.lastRiskAssessmentDate. The result was a permanent,
+        // official-looking verdict derived from nothing.
+        //
+        // Now: if no verified satellite result can be obtained we (a) record the
+        // failed attempt so it is visible to staff, (b) rethrow a typed error, and
+        // (c) never reach the save block below. The farm therefore keeps whatever
+        // was last VERIFIED, including its original timestamp.
+        let whispResult: WhispAnalysisResult;
+        try {
+            whispResult = await this.whispService.analyzeFarm(farmId, farm.location);
+        } catch (error) {
+            const failure = error instanceof WhispUnavailableError
+                ? error
+                : new WhispUnavailableError(
+                    'request_failed',
+                    `Satellite assessment failed unexpectedly. No assessment has been recorded.`,
+                    { detail: (error as Error)?.message }
+                );
+            await this.recordFailedAttempt(farm, failure);
+            throw failure;
+        }
 
         // 1. Deforestation Risk Check
         //
@@ -101,13 +128,16 @@ export class RiskService {
         // Fall back to CropType.OTHER's category bucket when a farm has no
         // commodities recorded yet, so Whisp categorization never crashes.
         const commodityRiskLabel = this.getCommodityRiskLabel(whispResult, (farm.cropType as CropType) || CropType.OTHER);
-        const postBaselineEvents = whispResult
-            ? whispResult.annualEvents.filter(e => e.year > 2020)
-            : [];
-        const deforestationRisk = whispResult
-            ? commodityRiskLabel === 'high'
-            : await this.checkDeforestation(farm); // Fallback to local logic (Whisp unavailable)
-        const deforestationNeedsReview = whispResult ? commodityRiskLabel === 'more_info_needed' : false;
+        const postBaselineEvents = whispResult.annualEvents.filter(e => e.year > 2020);
+
+        // No local fallback. Reaching here means Whisp returned a verified,
+        // completed result (the try/catch above guarantees it), so the
+        // deforestation verdict is ALWAYS Whisp's own - never a name heuristic.
+        // The previous `checkDeforestation()` helper returned true when a farm's
+        // name merely contained the word "risk", which could mark an innocent
+        // farm High Risk; it has been deleted rather than left reachable.
+        const deforestationRisk = commodityRiskLabel === 'high';
+        const deforestationNeedsReview = commodityRiskLabel === 'more_info_needed';
 
         // Build a plain-language, evidence-cited narrative explaining exactly WHY this
         // farm was classified the way it was - so an EU reviewer (or the farmer/inspector)
@@ -139,6 +169,10 @@ export class RiskService {
         );
 
         // Save Assessment
+        //
+        // Provenance is stamped on the row itself (source + whispVerified) so any
+        // future audit can tell a live satellite verdict from a legacy record of
+        // unknown origin WITHOUT trusting farm.riskLevel or the timestamp.
         const assessment = this.assessmentRepo.create({
             farm,
             farmId: farm.id,
@@ -147,13 +181,17 @@ export class RiskService {
             legalityRisk,
             traceabilityRisk,
             overallRisk,
-            whispAnalysisId: whispResult?.resultId,
+            whispAnalysisId: whispResult.resultId,
             whispData: whispResult,
+            source: whispResult.provenance,
+            whispVerified: whispResult.verified,
             details: {
                 assessedAt: new Date(),
                 notes: deforestationNarrative,
                 narrative: deforestationNarrative,
-                commodities: whispResult?.commodityOverlaps.map(c => c.commodity)
+                commodities: whispResult.commodityOverlaps.map(c => c.commodity),
+                whispProvenance: whispResult.provenance,
+                whispFailureCode: null,
             }
         });
 
@@ -311,13 +349,39 @@ export class RiskService {
         return 'risk_timber';
     }
 
-    private async checkDeforestation(farm: Farm): Promise<boolean> {
-        // Mock Logic: If farm name contains "risk", simulate deforestation found
-        // In reality, this would call Satellite API (Sentinel/GFW)
-        if (farm.name.toLowerCase().includes("risk")) {
-            return true;
+    /**
+     * Records a failed assessment attempt so it is VISIBLE to staff, without
+     * writing anything that could be read as a compliance verdict.
+     *
+     * Deliberately does not touch farm.riskLevel or farm.lastRiskAssessmentDate:
+     * whatever was last verified stays intact, including its original timestamp,
+     * which is what lets the UI say "last verified assessment was X, latest
+     * attempt failed". A failure must never erase prior verified evidence.
+     */
+    private async recordFailedAttempt(farm: Farm, failure: WhispUnavailableError): Promise<void> {
+        try {
+            const attemptRepo = AppDataSource.getRepository(AssessmentAttempt);
+            const attempt = attemptRepo.create({
+                farm,
+                farmId: farm.id,
+                farmNameSnapshot: farm.name,
+                outcome: "failed",
+                failureCode: failure.code,
+                message: failure.message,
+                httpStatus: failure.httpStatus,
+                retryable: failure.retryable,
+                detail: {
+                    code: failure.code,
+                    retryable: failure.retryable,
+                    detail: failure.detail ?? null,
+                    geometryStatus: farm.geometryStatus,
+                },
+            });
+            await attemptRepo.save(attempt);
+        } catch (logError) {
+            // Never let bookkeeping mask the real failure the caller must see.
+            console.error("Failed to record assessment attempt:", logError);
         }
-        return false;
     }
 
     /**
@@ -403,6 +467,38 @@ export class RiskService {
         return this.assessmentRepo.find({
             where: { farmId },
             order: { createdAt: "DESC" }
+        });
+    }
+
+    /**
+     * Failed assessment attempts for one farm, newest first.
+     *
+     * This is what makes a failure VISIBLE: staff can see that an assessment
+     * was attempted and why it did not produce a result, instead of the farm
+     * simply appearing stale with no explanation.
+     */
+    async getAttempts(farmId: string): Promise<AssessmentAttempt[]> {
+        const attemptRepo = AppDataSource.getRepository(AssessmentAttempt);
+        return attemptRepo.find({
+            where: { farmId },
+            order: { attemptedAt: "DESC" },
+            take: 50,
+        });
+    }
+
+    /**
+     * Assessment rows whose provenance could not be verified (legacy rows, or
+     * anything not produced by a completed live Whisp run). These are retained
+     * untouched for audit and listed here so staff can schedule reassessment.
+     */
+    async getFlaggedAssessments(limit = 200): Promise<RiskAssessment[]> {
+        return this.assessmentRepo.find({
+            where: [
+                { flaggedForReassessment: true },
+                { source: "mock" },
+            ],
+            order: { createdAt: "DESC" },
+            take: limit,
         });
     }
 

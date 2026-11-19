@@ -58,4 +58,38 @@ export class RiskAssessment {
 
     @Column("jsonb", { nullable: true })
     details!: any;
+
+    /**
+     * Provenance of this assessment, so no one has to GUESS whether a stored
+     * verdict came from the live satellite service:
+     *   'whisp_live' -> completed Open Foris Whisp response (audit-grade).
+     *   'mock'       -> fabricated result (should not exist post-fix; flagged).
+     *   NULL         -> legacy row predating provenance tracking = UNVERIFIED.
+     *
+     * The audit rule is deliberately blunt: a row is only trustworthy when
+     * source === 'whisp_live' AND whispVerified === true. Everything else
+     * (including every legacy row) is treated as unverified and must be
+     * reassessed before it can support a compliance statement.
+     */
+    @Column({ type: "varchar", nullable: true })
+    source?: string | null;
+
+    /**
+     * TRUE only when Whisp returned a completed analysis with usable result
+     * fields. Defaults to FALSE so pre-existing rows are conservatively treated
+     * as unverified rather than silently trusted.
+     */
+    @Column({ type: "boolean", default: false })
+    whispVerified!: boolean;
+
+    /**
+     * Set by the reassessment review job when this row's provenance cannot be
+     * established. The ORIGINAL row is never mutated or deleted - flagging only
+     * marks it for audit, preserving it for evidentiary purposes.
+     */
+    @Column({ type: "boolean", default: false })
+    flaggedForReassessment!: boolean;
+
+    @Column({ type: "varchar", nullable: true })
+    flagReason?: string | null;
 }

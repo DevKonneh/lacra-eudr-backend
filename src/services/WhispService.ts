@@ -59,7 +59,64 @@ export interface WhispIndicators {
 // all (e.g. cropType not mapped, or Whisp unavailable).
 export type WhispRiskLabel = 'high' | 'low' | 'more_info_needed' | 'unknown';
 
+/**
+ * Machine-readable reasons a Whisp assessment could not be obtained.
+ *
+ * Every one of these means "no verified satellite result exists for this
+ * farm". None of them may ever be persisted or displayed as a successful
+ * assessment - see RiskService.analyzeFarm().
+ */
+export type WhispFailureCode =
+    | 'not_configured'      // WHISP_API_KEY absent - integration switched off
+    | 'auth_failed'         // auth_* envelope code or HTTP 401/403 - bad/revoked key
+    | 'validation_failed'   // validation_* envelope code or HTTP 400/422 - bad geometry
+    | 'service_unavailable' // HTTP 5xx / network error / system_* code / rate limit
+    | 'timeout'             // async job never left queued/processing
+    | 'incomplete_result'   // analysis_completed but no usable result properties
+    | 'request_failed';     // anything else
+
+/**
+ * Thrown instead of returning a falsy or mocked result.
+ *
+ * Rationale for this class existing at all: the previous implementation
+ * returned `null` on every failure AND a randomised mock object when the API
+ * key was missing. RiskService could not tell those apart from a genuine
+ * result, so it wrote a RiskAssessment row and stamped farm.riskLevel +
+ * farm.lastRiskAssessmentDate - converting a failure (or pure randomness) into
+ * a permanent, official-looking compliance verdict.
+ */
+export class WhispUnavailableError extends Error {
+    readonly code: WhispFailureCode;
+    readonly httpStatus?: number;
+    readonly retryable: boolean;
+    /** Raw upstream detail, kept for server logs/audit - not shown to end users. */
+    readonly detail?: string;
+
+    constructor(
+        code: WhispFailureCode,
+        message: string,
+        opts: { httpStatus?: number; retryable?: boolean; detail?: string } = {}
+    ) {
+        super(message);
+        this.name = 'WhispUnavailableError';
+        this.code = code;
+        this.httpStatus = opts.httpStatus;
+        this.retryable = opts.retryable ?? (code === 'timeout' || code === 'service_unavailable');
+        this.detail = opts.detail;
+    }
+}
+
+/**
+ * Where a result actually came from. ONLY 'whisp_live' is audit-grade
+ * evidence; 'mock' must never be presented to staff as an assessment.
+ */
+export type WhispProvenance = 'whisp_live' | 'mock';
+
 export interface WhispAnalysisResult {
+    /** Provenance of this result. Stored on the RiskAssessment row for later audit. */
+    provenance: WhispProvenance;
+    /** True only for a completed response from the live Whisp/Earth Engine service. */
+    verified: boolean;
     resultId: string;           // Whisp job token (context.token) or plotId fallback
     plotId?: string;
     areaHa: number;              // Area (Whisp-computed, from satellite geometry)
@@ -127,10 +184,27 @@ export class WhispService {
     private baseUrl = process.env.WHISP_API_URL || 'http://localhost:8000/api';
     private apiKey = process.env.WHISP_API_KEY;
 
-    async analyzeFarm(farmId: string, geojson: any): Promise<WhispAnalysisResult | null> {
+    /**
+     * Submits a farm geometry to Whisp and returns a COMPLETED, verified result.
+     *
+     * Contract change (assessment-integrity fix): this method no longer returns
+     * `null` and no longer fabricates a mock result. Every condition where a
+     * real satellite verdict is unavailable throws a typed WhispUnavailableError,
+     * so callers are structurally unable to mistake a failure for a success.
+     * Callers MUST NOT persist an assessment when this throws.
+     *
+     * @throws {WhispUnavailableError} always, if no verified result could be obtained
+     */
+    async analyzeFarm(farmId: string, geojson: any): Promise<WhispAnalysisResult> {
         if (!this.apiKey) {
-            console.warn("Whisp API Key not configured. Using Mock Whisp Logic.");
-            return this.mockAnalysis();
+            // No mock fallback. A missing key means the integration is switched
+            // off, which is a configuration error the operator must see - not a
+            // reason to invent a random high/low verdict for a real farm.
+            throw new WhispUnavailableError(
+                'not_configured',
+                'Satellite assessment is unavailable: the Whisp integration is not configured on this server (WHISP_API_KEY is not set). No assessment has been recorded.',
+                { retryable: false }
+            );
         }
 
         try {
@@ -185,23 +259,99 @@ export class WhispService {
             }
 
             if (envelope?.code !== 'analysis_completed') {
-                console.error("Whisp API did not complete analysis:", envelope?.code, envelope?.message, envelope?.cause);
-                return null;
+                const code = String(envelope?.code || 'unknown');
+                const message = envelope?.message || 'no message';
+                console.error("Whisp API did not complete analysis:", code, message, envelope?.cause);
+
+                // Classify the failure so the API layer can return a precise,
+                // actionable error (and the right HTTP status) to staff.
+                if (code.startsWith('auth_')) {
+                    throw new WhispUnavailableError(
+                        'auth_failed',
+                        'Satellite assessment failed: the Whisp service rejected our credentials. No assessment has been recorded.',
+                        { httpStatus: 502, retryable: false, detail: `${code}: ${message}` }
+                    );
+                }
+                if (code.startsWith('validation_')) {
+                    throw new WhispUnavailableError(
+                        'validation_failed',
+                        `Satellite assessment failed: Whisp rejected this farm's geometry (${message}). Correct the boundary and retry. No assessment has been recorded.`,
+                        { httpStatus: 400, retryable: false, detail: `${code}: ${message}` }
+                    );
+                }
+                if (code === 'analysis_timeout') {
+                    throw new WhispUnavailableError(
+                        'timeout',
+                        'Satellite assessment timed out: Whisp did not finish processing this parcel in time. No assessment has been recorded - please retry.',
+                        { httpStatus: 504, retryable: true, detail: `${code}: ${message}` }
+                    );
+                }
+                throw new WhispUnavailableError(
+                    'service_unavailable',
+                    'Satellite assessment failed: the Whisp service returned an error. No assessment has been recorded - please retry later.',
+                    { httpStatus: 502, retryable: true, detail: `${code}: ${message}` }
+                );
             }
 
             const feature = envelope?.data?.features?.[0];
             const properties = feature?.properties;
             if (!properties) {
                 console.error("Whisp API response missing feature properties:", JSON.stringify(envelope).slice(0, 500));
-                return null;
+                // 'analysis_completed' with no properties is an INCOMPLETE result -
+                // explicitly NOT a success. Previously this returned null and the
+                // caller silently fell through to a name-based fake.
+                throw new WhispUnavailableError(
+                    'incomplete_result',
+                    'Satellite assessment incomplete: Whisp reported completion but returned no result fields for this parcel. No assessment has been recorded - please retry.',
+                    { httpStatus: 502, retryable: true }
+                );
             }
 
             return this.mapWhispProperties(properties, jobToken);
 
         } catch (error: any) {
+            // Re-throw our own typed failures untouched; classify transport errors.
+            if (error instanceof WhispUnavailableError) throw error;
+
+            const httpStatus = error.response?.status;
             const details = error.response?.data ? JSON.stringify(error.response.data) : error.message;
             console.error("Whisp API Error:", details);
-            return null; // Let caller handle fallback or error
+
+            // Never leak the API key or the raw upstream body to the client;
+            // the classified `detail` stays server-side for logs/audit.
+            if (httpStatus === 401 || httpStatus === 403) {
+                throw new WhispUnavailableError(
+                    'auth_failed',
+                    'Satellite assessment failed: the Whisp service rejected our credentials. No assessment has been recorded.',
+                    { httpStatus: 502, retryable: false, detail: details }
+                );
+            }
+            if (httpStatus === 400 || httpStatus === 422) {
+                throw new WhispUnavailableError(
+                    'validation_failed',
+                    'Satellite assessment failed: Whisp rejected this farm\'s geometry. Correct the boundary and retry. No assessment has been recorded.',
+                    { httpStatus: 400, retryable: false, detail: details }
+                );
+            }
+            if (httpStatus === 429) {
+                throw new WhispUnavailableError(
+                    'service_unavailable',
+                    'Satellite assessment not started: the Whisp service is rate limiting requests right now. No assessment has been recorded - please retry in a minute.',
+                    { httpStatus: 429, retryable: true, detail: details }
+                );
+            }
+            if (error.code === 'ECONNABORTED' || /timeout/i.test(String(error.message))) {
+                throw new WhispUnavailableError(
+                    'timeout',
+                    'Satellite assessment timed out before Whisp responded. No assessment has been recorded - please retry.',
+                    { httpStatus: 504, retryable: true, detail: details }
+                );
+            }
+            throw new WhispUnavailableError(
+                'service_unavailable',
+                'Satellite assessment failed: the Whisp service could not be reached. No assessment has been recorded - please retry later.',
+                { httpStatus: 502, retryable: true, detail: details }
+            );
         }
     }
 
@@ -279,6 +429,11 @@ export class WhispService {
         };
 
         return {
+            // Reaching this point means a live Whisp response carried a completed
+            // analysis WITH usable properties - the only path that may be persisted
+            // as audit-grade evidence.
+            provenance: 'whisp_live',
+            verified: true,
             resultId: token || props.plotId || `WHISP-${Date.now()}`,
             plotId: props.plotId,
             areaHa: num(props.Area),
@@ -309,24 +464,6 @@ export class WhispService {
             processedAt: props.whisp_processing_metadata?.processing_timestamp_utc,
 
             raw: props,
-        };
-    }
-
-    /** Used only when WHISP_API_KEY is not configured, so local dev/testing doesn't hard-fail. */
-    private mockAnalysis(): WhispAnalysisResult {
-        const isHighRisk = Math.random() > 0.8;
-        return {
-            resultId: `MOCK-WHISP-${Date.now()}`,
-            areaHa: 1,
-            unit: "ha",
-            eufo2020Ha: isHighRisk ? 1 : 0,
-            annualEvents: isHighRisk ? [{ year: 2024, gfcLossHa: 0.1 }] : [],
-            commodityOverlaps: [{ commodity: "Cocoa", datasetKey: "Cocoa_FDaP", overlapHa: 1 }],
-            indicators: {},
-            riskPerennialCrop: isHighRisk ? 'high' : 'low',
-            riskAnnualCrop: 'unknown',
-            riskTimber: 'unknown',
-            raw: { mock: true },
         };
     }
 }

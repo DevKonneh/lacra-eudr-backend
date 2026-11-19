@@ -12,6 +12,14 @@ router.post("/assess/:farmId", authMiddleware([UserRole.ADMIN, UserRole.INSPECTO
 // Get risk assessment history for a farm
 router.get("/history/:farmId", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR, UserRole.FARMER, UserRole.BUYER, UserRole.EXPORTER]), (req, res) => riskController.getHistory(req, res));
 
+// Failed assessment attempts for a farm - makes an unsuccessful run visible to
+// staff instead of the farm silently appearing merely "stale".
+router.get("/attempts/:farmId", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => riskController.getAttempts(req, res));
+
+// Review queue: assessments whose provenance cannot be verified (legacy/mock).
+// Originals are retained for audit; this only lists them for reassessment.
+router.get("/flagged", authMiddleware([UserRole.ADMIN, UserRole.INSPECTOR]), (req, res) => riskController.getFlaggedAssessments(req, res));
+
 // Seed/refresh the forest & protected-area reference dataset used for overlap checks (admin only)
 router.post("/seed", authMiddleware([UserRole.ADMIN]), (req, res) => riskController.seedForests(req, res));
 
