@@ -20,6 +20,7 @@ import { getGeoIdService, GeoIdService } from "../services/GeoIdService";
 import { buildPlotsForFarm, deriveLegacyCropType, CommodityInput } from "../services/CommodityService";
 import { CommodityRole, CroppingSystem, PlotCommodity } from "../entities/PlotCommodity";
 import { validateAndAnnotateFarm, assertGeometryNotBlocking } from "../services/FarmGeometryHelper";
+import { annotateGeometryProvenance } from "../services/GeometryProvenance";
 import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
 
 // Relations needed whenever a Farmer response should include each farm's
@@ -422,6 +423,8 @@ export class FarmerController {
                         const farm = new Farm();
                         farm.name = f.name;
                         farm.location = f.location;
+                        // Record HOW this boundary came to exist, at capture time.
+                        annotateGeometryProvenance(farm);
                         farm.riskLevel = f.riskLevel;
                         farm.totalAreaHa = f.totalAreaHa ? parseFloat(f.totalAreaHa) : 0;
                         farm.ownershipType = f.ownershipType;
@@ -1735,6 +1738,10 @@ export class FarmerController {
                 farm.name = f.name;
                 const parsedLocation = typeof f.location === "string" ? JSON.parse(f.location) : f.location;
                 farm.location = parsedLocation;
+                // Offline-queue replay path: same provenance rules as the live
+                // path, so a queued capture cannot arrive with different
+                // assumptions about what its geometry actually is.
+                annotateGeometryProvenance(farm);
                 if (f.totalAreaHa) farm.totalAreaHa = parseFloat(f.totalAreaHa);
                 if (f.numberOfTrees) farm.numberOfTrees = parseInt(f.numberOfTrees);
                 if (f.yearsInCultivation) farm.yearsInCultivation = parseInt(f.yearsInCultivation);

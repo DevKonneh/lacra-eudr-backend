@@ -236,6 +236,36 @@ export class Farm {
     @Column({ nullable: true })
     lastGeometryValidatedAt!: Date;
 
+    // ─── Geometry provenance (see migrations/2034_geometry_provenance) ──────
+    //
+    // HOW this farm's boundary came to exist. The distinction matters because a
+    // recorded GPS point, a surveyed polygon and a machine-generated square are
+    // very different evidence for a due-diligence file:
+    //
+    //   'surveyed'         -> a real boundary polygon captured in the field.
+    //   'recorded_point'   -> a single GPS coordinate. A location, NOT a boundary.
+    //   'generated_buffer' -> a synthetic ±0.001° square (≈222 m, ≈4.9 ha)
+    //                         invented around a single point. NOT a survey.
+    //   NULL               -> unknown / legacy row (created before provenance
+    //                         tracking). Must be treated as unverified.
+    //
+    // FarmController.create() previously turned every lat/lng-only submission
+    // into a Polygon square, so the record looked exactly like a surveyed
+    // boundary downstream (and was submitted to Whisp as one). Keeping the
+    // provenance explicit lets the geometry gate refuse to treat a generated
+    // square as survey evidence.
+    @Column({ type: "varchar", nullable: true })
+    geometrySource?: string | null;
+
+    // Set when a boundary cannot be trusted as survey evidence and needs a human
+    // to confirm or re-map it. The ORIGINAL geometry is never altered — this only
+    // marks the record so it shows up in the review queue.
+    @Column({ type: "boolean", default: false })
+    boundaryReviewFlag!: boolean;
+
+    @Column({ type: "varchar", nullable: true })
+    boundaryReviewReason?: string | null;
+
     @CreateDateColumn()
     createdAt!: Date;
 

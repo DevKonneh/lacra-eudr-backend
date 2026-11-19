@@ -274,3 +274,172 @@ describe("WhispService - no mock fallback exists", () => {
         }
     });
 });
+
+// ---------------------------------------------------------------------------
+// Geometry provenance gate
+//
+// The legacy ±0.001° square was a VALID polygon, so geometry validation alone
+// let it through to Whisp as though it were the farm's real parcel. These tests
+// lock in the second gate: a generated boundary must never reach Whisp, must
+// never overwrite a previously verified verdict, and must say why.
+// ---------------------------------------------------------------------------
+
+/** The exact synthetic square the old FarmController generated around a point. */
+const GENERATED_SQUARE = {
+    type: "Polygon",
+    coordinates: [[
+        [-9.501, 6.999],
+        [-9.499, 6.999],
+        [-9.499, 7.001],
+        [-9.501, 7.001],
+        [-9.501, 6.999],
+    ]],
+};
+
+describe("RiskService.analyzeFarm - generated boundaries must be blocked before Whisp", () => {
+    it("refuses to assess a legacy auto-generated square and NEVER calls Whisp", async () => {
+        const farm = makeFarm();
+        farm.location = GENERATED_SQUARE;
+        // Resolved from the geometry itself: this is the pre-2034 legacy state
+        // where geometrySource is still NULL.
+        farm.geometrySource = null;
+
+        const service = buildService();
+        (service as any).farmRepo.findOne.mockResolvedValue(farm);
+
+        await expect(service.analyzeFarm(farm.id)).rejects.toMatchObject({
+            isProvenanceBlock: true,
+            geometrySource: "generated_buffer",
+        });
+
+        // The decisive assertion: no paid/network call was made over invented geometry.
+        expect((service as any).whispService.analyzeFarm).not.toHaveBeenCalled();
+
+        // And nothing was saved as an assessment.
+        expect((service as any).assessmentRepo.save).not.toHaveBeenCalled();
+    });
+
+    it("leaves the previous verified verdict and timestamp intact when blocked", async () => {
+        const farm = makeFarm();
+        farm.location = GENERATED_SQUARE;
+        farm.geometrySource = null;
+        farm.riskLevel = "Medium";
+        farm.lastRiskAssessmentDate = PREVIOUS_ASSESSED_AT;
+
+        const service = buildService();
+        (service as any).farmRepo.findOne.mockResolvedValue(farm);
+
+        await expect(service.analyzeFarm(farm.id)).rejects.toBeInstanceOf(Error);
+
+        // The failure is not an assessment: the prior verified state survives.
+        expect(farm.riskLevel).toBe("Medium");
+        expect(farm.lastRiskAssessmentDate).toBe(PREVIOUS_ASSESSED_AT);
+        expect((service as any).assessmentRepo.save).not.toHaveBeenCalled();
+    });
+
+    it("blocks an explicitly labelled generated_buffer even if the shape looks ordinary", async () => {
+        // Provenance recorded at capture time wins over the geometry's appearance,
+        // so a stored label cannot be laundered by re-winding the polygon.
+        const farm = makeFarm();
+        farm.location = {
+            type: "Polygon",
+            coordinates: [[[-9.60, 7.10], [-9.59, 7.10], [-9.59, 7.11], [-9.60, 7.11], [-9.60, 7.10]]],
+        };
+        farm.geometrySource = "generated_buffer";
+
+        const service = buildService();
+        (service as any).farmRepo.findOne.mockResolvedValue(farm);
+
+        await expect(service.analyzeFarm(farm.id)).rejects.toMatchObject({
+            isProvenanceBlock: true,
+        });
+        expect((service as any).whispService.analyzeFarm).not.toHaveBeenCalled();
+    });
+
+    it("still allows a genuinely surveyed boundary through to Whisp", async () => {
+        const farm = makeFarm();
+        // Irregular quadrilateral - cannot match the synthetic signature.
+        farm.location = {
+            type: "Polygon",
+            coordinates: [[[-9.4801, 6.2103], [-9.4788, 6.2098], [-9.4790, 6.2109], [-9.4803, 6.2114], [-9.4801, 6.2103]]],
+        };
+        farm.geometrySource = "surveyed";
+
+        const service = buildService();
+        (service as any).farmRepo.findOne.mockResolvedValue(farm);
+        (service as any).documentRepo.find.mockResolvedValue([{ status: "Valid" }]);
+        (service as any).forestRepo.createQueryBuilder.mockReturnValue({
+            where: jest.fn().mockReturnThis(),
+            getOne: jest.fn().mockResolvedValue(null),
+        });
+        (service as any).whispService.analyzeFarm.mockResolvedValue({
+            provenance: "whisp_live",
+            verified: true,
+            resultId: "whisp-token-xyz",
+            areaHa: 0.9,
+            unit: "ha",
+            eufo2020Ha: 0,
+            annualEvents: [],
+            commodityOverlaps: [],
+            indicators: {},
+            riskPerennialCrop: "low",
+            riskAnnualCrop: "unknown",
+            riskTimber: "unknown",
+        });
+
+        await service.analyzeFarm(farm.id);
+
+        expect((service as any).whispService.analyzeFarm).toHaveBeenCalledTimes(1);
+        expect((service as any).assessmentRepo.save).toHaveBeenCalledTimes(1);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Geometry provenance helpers
+// ---------------------------------------------------------------------------
+
+describe("GeometryProvenance - classification is strict, never optimistic", () => {
+    const { isLegacyGeneratedSquare, classifySubmittedGeometry, resolveGeometrySource } =
+        require("../GeometryProvenance");
+
+    it("recognises the exact legacy square", () => {
+        expect(isLegacyGeneratedSquare(GENERATED_SQUARE)).toBe(true);
+    });
+
+    it("does NOT call a near-square real plot 'generated' (span 0.0021)", () => {
+        const nearSquare = {
+            type: "Polygon",
+            coordinates: [[
+                [-9.5000, 7.0000],
+                [-9.4979, 7.0000],
+                [-9.4979, 7.0021],
+                [-9.5000, 7.0021],
+                [-9.5000, 7.0000],
+            ]],
+        };
+        expect(isLegacyGeneratedSquare(nearSquare)).toBe(false);
+    });
+
+    it("does NOT call a rotated 5-point field 'generated'", () => {
+        const rotated = {
+            type: "Polygon",
+            coordinates: [[
+                [-9.6000, 6.6000],
+                [-9.5986, 6.6014],
+                [-9.6000, 6.6028],
+                [-9.6014, 6.6014],
+                [-9.6000, 6.6000],
+            ]],
+        };
+        expect(isLegacyGeneratedSquare(rotated)).toBe(false);
+    });
+
+    it("classifies a stored label as authoritative over the shape", () => {
+        expect(resolveGeometrySource(GENERATED_SQUARE, "surveyed")).toBe("surveyed");
+        expect(resolveGeometrySource(GENERATED_SQUARE, null)).toBe("generated_buffer");
+    });
+
+    it("treats a submitted Point as a recorded point, not a boundary", () => {
+        expect(classifySubmittedGeometry({ type: "Point", coordinates: [-10.8, 6.3] })).toBe("recorded_point");
+    });
+});

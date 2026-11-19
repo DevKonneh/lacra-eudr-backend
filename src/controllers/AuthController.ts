@@ -19,6 +19,7 @@ import { UserAuditLog, UserAuditAction } from "../entities/UserAuditLog";
 import { SignInAttempt, SignInOutcome } from "../entities/SignInAttempt";
 import { detectPlatform } from "../utils/platformDetector";
 import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
+import { GeometrySource, classifySubmittedGeometry, annotateGeometryProvenance } from "../services/GeometryProvenance";
 
 export class AuthController {
     private userRepository = AppDataSource.getRepository(User);
@@ -714,7 +715,11 @@ export class AuthController {
                     if (boundaryJson) {
                         try {
                             const boundary = JSON.parse(boundaryJson);
-                            farm.location = boundary.geometry || boundary;
+                            const geom = boundary.geometry || boundary;
+                            farm.location = geom;
+                            // Record provenance at capture time: surveyed polygon vs
+                            // a client that replayed the old synthetic-square shape.
+                            annotateGeometryProvenance(farm);
                         } catch (e) {
                             console.error("Invalid GeoJSON", e);
                         }
@@ -722,7 +727,14 @@ export class AuthController {
                         // Prefer the farm's own GPS point when it was
                         // explicitly captured - more correct than reusing
                         // the farmer's residential coordinate below.
+                        //
+                        // Stored as a Point (NOT a generated square): a single
+                        // coordinate is a location, not a boundary.
                         farm.location = { type: 'Point', coordinates: [parseFloat(farmLng), parseFloat(farmLat)] };
+                        farm.geometrySource = GeometrySource.RECORDED_POINT;
+                        farm.boundaryReviewFlag = true;
+                        farm.boundaryReviewReason =
+                            "Registered with a single GPS point and no surveyed boundary. A boundary must be surveyed before assessment.";
                     } else if (lat && lng) {
                         // Legacy fallback (preserved for backward
                         // compatibility): if no farm GPS was captured
@@ -730,6 +742,10 @@ export class AuthController {
                         // lat/lng as before.
                         const point = { type: 'Point', coordinates: [parseFloat(lng), parseFloat(lat)] };
                         farm.location = point;
+                        farm.geometrySource = GeometrySource.RECORDED_POINT;
+                        farm.boundaryReviewFlag = true;
+                        farm.boundaryReviewReason =
+                            "Registered with the farmer's residential coordinate only (no farm GPS, no surveyed boundary). Boundary must be surveyed before assessment.";
                     }
 
                     // Map farm photos to this single farm

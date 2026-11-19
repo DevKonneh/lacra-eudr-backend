@@ -17,6 +17,7 @@ import {
 } from "../services/CommodityService";
 import { CroppingSystem, CommodityRole, ProductionStatus } from "../entities/PlotCommodity";
 import { validateAndAnnotateFarm, assertGeometryNotBlocking, attemptBowtieRepair } from "../services/FarmGeometryHelper";
+import { GeometrySource, classifySubmittedGeometry, resolveGeometrySource, annotateGeometryProvenance } from "../services/GeometryProvenance";
 import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
 
 // Relations needed whenever a Farm response should include its full
@@ -207,24 +208,40 @@ export class FarmController {
             farm.farmer = farmer as any;
 
             // Prefer a real field-mapped polygon boundary (GeoJSON) if one was submitted.
-            // Only fall back to a synthetic square around a single point when no real
-            // boundary is available (e.g. legacy single-pin flow).
+            //
+            // CHANGED (geometry provenance fix): a lat/lng-only submission is now
+            // stored as the GeoJSON **Point** it actually is, and its provenance is
+            // recorded as `recorded_point`.
+            //
+            // This previously built a synthetic ±0.001° square (≈222 m, ≈4.9 ha)
+            // around the coordinate and stored it as a Polygon. Downstream nothing
+            // could tell that square from a real field survey, so it was drawn as a
+            // surveyed boundary and submitted to Whisp as the farm's actual parcel —
+            // a satellite verdict computed over a shape that does not exist on the
+            // ground. Preserving the point keeps the evidence honest; the existing
+            // point-only policy (assessment blocked, geometry MISSING) then applies
+            // unchanged.
             if (location) {
                 const parsedLocation = typeof location === "string" ? JSON.parse(location) : location;
                 farm.location = parsedLocation;
+                farm.geometrySource = classifySubmittedGeometry(parsedLocation) ?? null;
             } else if (lat !== undefined && lng !== undefined) {
                 const latNum = parseFloat(lat);
                 const lngNum = parseFloat(lng);
+                if (!Number.isFinite(latNum) || !Number.isFinite(lngNum)) {
+                    return errorResponse(res, "lat/lng must be numeric", [], 400);
+                }
                 farm.location = {
-                    type: "Polygon",
-                    coordinates: [[
-                        [lngNum - 0.001, latNum - 0.001],
-                        [lngNum + 0.001, latNum - 0.001],
-                        [lngNum + 0.001, latNum + 0.001],
-                        [lngNum - 0.001, latNum + 0.001],
-                        [lngNum - 0.001, latNum - 0.001]
-                    ]]
+                    type: "Point",
+                    coordinates: [lngNum, latNum]
                 };
+                farm.geometrySource = GeometrySource.RECORDED_POINT;
+                // Flagged so the record is visible in the boundary review queue:
+                // a GPS point is a location, not a surveyed boundary.
+                farm.boundaryReviewFlag = true;
+                farm.boundaryReviewReason =
+                    "Created from a single GPS point with no surveyed boundary polygon. " +
+                    "A boundary must be surveyed before this farm can be assessed.";
             } else {
                 return errorResponse(res, "Either a GeoJSON 'location' polygon or lat/lng is required", [], 400);
             }
@@ -467,6 +484,7 @@ export class FarmController {
             if (location) {
                 const parsedLocation = typeof location === "string" ? JSON.parse(location) : location;
                 farm.location = parsedLocation;
+                farm.geometrySource = classifySubmittedGeometry(parsedLocation) ?? null;
             }
             if (totalAreaHa) {
                 farm.totalAreaHa = parseFloat(totalAreaHa);
@@ -522,6 +540,7 @@ export class FarmController {
             const farm = new Farm();
             farm.name = name;
             farm.location = parsedLocation;
+            farm.geometrySource = classifySubmittedGeometry(parsedLocation) ?? null;
             farm.farmer = farmer as any;
 
             // Full farm-detail field set — same parity as create() and as
@@ -933,7 +952,19 @@ export class FarmController {
             // validation pipeline every other farm boundary goes through —
             // never trust our own repair blindly.
             const originalGeometry = farm.location;
+            // A bowtie repair only fixes ring winding; it is NOT a survey and it
+            // must never silently upgrade provenance. Resolve the source from the
+            // geometry we are about to replace, so an auto-generated square that
+            // happens to get rewound by the repair keeps its `generated_buffer`
+            // label (and its review flag) instead of being re-read as `surveyed`.
+            const priorSource = resolveGeometrySource(originalGeometry as any, (farm as any).geometrySource);
             farm.location = repair.geometry;
+            if (priorSource === GeometrySource.GENERATED_BUFFER || priorSource === GeometrySource.RECORDED_POINT) {
+                farm.geometrySource = priorSource;
+                farm.boundaryReviewFlag = true;
+            } else {
+                annotateGeometryProvenance(farm);
+            }
             const geometryResult = await validateAndAnnotateFarm(farm, { excludeFarmId: farm.id });
             await this.farmRepository.save(farm);
 
