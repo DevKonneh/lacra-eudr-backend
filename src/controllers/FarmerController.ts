@@ -21,6 +21,7 @@ import { buildPlotsForFarm, deriveLegacyCropType, CommodityInput } from "../serv
 import { CommodityRole, CroppingSystem, PlotCommodity } from "../entities/PlotCommodity";
 import { validateAndAnnotateFarm, assertGeometryNotBlocking } from "../services/FarmGeometryHelper";
 import { annotateGeometryProvenance } from "../services/GeometryProvenance";
+import { deriveAssessmentStatus } from "../services/AssessmentStatus";
 import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
 
 // Relations needed whenever a Farmer response should include each farm's
@@ -1473,6 +1474,33 @@ export class FarmerController {
                 UserRole.EXPORTER,
             ].includes(requester.role);
 
+            // ── Assessment status for every farm, in ONE query ────────────────
+            // A farm row's `riskLevel` column DB-defaults to 'Low', and historical
+            // rows may be unverified. Rather than let callers guess from that
+            // column, resolve an explicit status per farm (verified /
+            // unverified_historical / never_assessed). The legacy `riskLevel`
+            // field is still returned unchanged for backward compatibility; the
+            // new fields are additive.
+            const farmIds = (farmer.farms || []).map(f => f.id);
+            const latestAssessmentByFarm = new Map<string, RiskAssessment>();
+            if (farmIds.length) {
+                const assessmentRows = await AppDataSource.getRepository(RiskAssessment).find({
+                    where: { farmId: In(farmIds) },
+                    order: { createdAt: "DESC" },
+                });
+                for (const row of assessmentRows) {
+                    // First row wins: ordered DESC, so this is the newest.
+                    if (!latestAssessmentByFarm.has(row.farmId)) latestAssessmentByFarm.set(row.farmId, row);
+                }
+            }
+
+            // Explicit per-farm assessment status, so no caller has to infer a
+            // rating from the DB-defaulted `riskLevel` column.
+            const statusFor = (f: any) => deriveAssessmentStatus(
+                { riskLevel: f.riskLevel, lastRiskAssessmentDate: f.lastRiskAssessmentDate },
+                latestAssessmentByFarm.get(f.id) ?? null,
+            );
+
             if (!isAuthorizedStaff) {
                 // ── ANONYMOUS / GEO-ONLY VIEW (WHIMO / LACRA Trace / any
                 // external scanner) ───────────────────────────────────────────
@@ -1495,6 +1523,7 @@ export class FarmerController {
                     farms: farmer.farms.map(f => {
                         const geometry = GeoIdService.normaliseGeometry(f.location);
                         const centroid = geometry ? GeoIdService.centroidFromGeometry(geometry) : null;
+                        const assessment = statusFor(f);
                         return {
                             farmId: f.id,
                             geoId: f.geoId ?? null,
@@ -1522,7 +1551,16 @@ export class FarmerController {
                                 : null,
                             cropType: f.cropType,
                             totalAreaHa: f.totalAreaHa ?? null,
+                            // Backward-compatible raw column, unchanged for existing clients.
                             riskLevel: f.riskLevel,
+                            // Additive: explicit assessment status. `riskLevelVerified`
+                            // is null unless a live, verified assessment exists, so a
+                            // DB-defaulted 'Low' can never be read as a rating.
+                            assessmentStatus: assessment.status,
+                            riskLevelVerified: assessment.level,
+                            riskAssessedAt: assessment.assessedAt,
+                            riskAssessmentSource: assessment.source,
+                            riskAssessmentNote: assessment.reason,
                             farmRegistrationStatus: f.farmRegistrationStatus ?? null,
                         };
                     }),
@@ -1569,7 +1607,14 @@ export class FarmerController {
                     cropType: f.cropType,
                     totalAreaHa: f.totalAreaHa,
                     location: f.location,
+                    // Backward-compatible raw column, unchanged for existing clients.
                     riskLevel: f.riskLevel,
+                    // Additive: explicit assessment status (see AssessmentStatus.ts).
+                    assessmentStatus: statusFor(f).status,
+                    riskLevelVerified: statusFor(f).level,
+                    riskAssessedAt: statusFor(f).assessedAt,
+                    riskAssessmentSource: statusFor(f).source,
+                    riskAssessmentNote: statusFor(f).reason,
                     farmRegistrationStatus: f.farmRegistrationStatus,
                     ownershipType: f.ownershipType,
                     numberOfTrees: f.numberOfTrees,
