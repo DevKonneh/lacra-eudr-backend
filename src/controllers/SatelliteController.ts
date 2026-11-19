@@ -6,33 +6,46 @@ import { successResponse, errorResponse } from "../utils/response";
 
 export class SatelliteController {
 
+    /**
+     * National forest-cover trend.
+     *
+     * There is NO historical time-series store in this system, so a forest-cover
+     * trend cannot be derived. This endpoint previously returned a HARDCODED
+     * array (85%, 84%, 83.5%, 83%, 82.8%) presented to staff as measured national
+     * figures, plus a hardcoded "trend: STABLE (Monitored)" and "Deforestation
+     * rate has decreased to 0.2%". Those numbers were never computed from
+     * anything - they were typed into the source.
+     *
+     * Returning fabricated national statistics alongside real per-farm satellite
+     * results is actively misleading (staff would reasonably conclude LACRA
+     * monitors national forest cover, and that deforestation is falling). This
+     * now reports the figures as UNAVAILABLE and returns only the counts that
+     * genuinely exist in the database.
+     */
     async getTemporalAnalysis(req: Request, res: Response) {
         try {
-            // Real Data Analysis:
-            // 1. Get total area of protected forests
             const forestRepo = AppDataSource.getRepository(Forest);
 
-            // Note: ST_Area on 4326 returns degrees squared, which is not useful directly for "km2".
-            // We'll just return the COUNT of protected areas for now, or assume proper projection in a real app.
-            // For the demo, we show "Protected Areas Monitored"
+            // The only real, derivable numbers: how many reference forest /
+            // protected-area polygons are loaded, and how many are HIGH risk.
             const forestCount = await forestRepo.count();
             const highRiskCount = await forestRepo.count({ where: { riskLevel: "HIGH" as any } });
 
-            // Mock History Data for the Chart (hard to generate real historical data without a time-series DB)
-            const data = [
-                { year: '2020', forestCover: 85, deforestationRate: 0.5 },
-                { year: '2021', forestCover: 84, deforestationRate: 1.2 },
-                { year: '2022', forestCover: 83.5, deforestationRate: 0.8 },
-                { year: '2023', forestCover: 83, deforestationRate: 0.6 },
-                { year: '2024', forestCover: 82.8, deforestationRate: 0.2 },
-            ];
-
             return successResponse(res, {
                 region: "National Overview",
-                riskLevel: highRiskCount > 0 ? "HIGH - Forests Detected" : "LOW - Clear",
-                trend: "STABLE (Monitored)",
-                history: data,
+                // No national risk verdict exists; per-plot Whisp results are the
+                // only satellite evidence this system produces.
+                riskLevel: null,
+                trend: null,
+                // Explicitly unavailable rather than an empty array: an empty
+                // array renders as "no data yet", whereas these figures have
+                // never existed at all. The UI must show an unavailable state.
+                historyAvailable: false,
+                history: [],
+                unavailableReason:
+                    "No national forest-cover time series is stored in this system. Forest-cover trends and national deforestation rates are not computed here. Per-farm satellite assessment is available on demand from the farm's risk analysis page.",
                 stats: {
+                    // Real counts of the reference dataset, not national coverage.
                     totalForests: forestCount,
                     highRiskForests: highRiskCount
                 }
