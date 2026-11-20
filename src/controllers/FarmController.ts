@@ -1,10 +1,13 @@
 import { Request, Response } from "express";
+import { In } from "typeorm";
 import { AppDataSource } from "../data-source";
 import { Farm } from "../entities/Farm";
 import { Plot } from "../entities/Plot";
 import { PlotCommodity } from "../entities/PlotCommodity";
 import { UserRole } from "../entities/User";
 import { FarmerAuditLog, FarmerAuditAction } from "../entities/FarmerAuditLog";
+import { RiskAssessment } from "../entities/RiskAssessment";
+import { deriveAssessmentStatus } from "../services/AssessmentStatus";
 import { successResponse, errorResponse } from "../utils/response";
 import { uploadFilesToCloudinary, uploadFileToCloudinary } from "../utils/cloudUpload";
 import { getGeoIdService, GeoIdService } from "../services/GeoIdService";
@@ -87,6 +90,40 @@ export class FarmController {
     private plotRepository = AppDataSource.getRepository(Plot);
     private plotCommodityRepository = AppDataSource.getRepository(PlotCommodity);
     private auditLogRepository = AppDataSource.getRepository(FarmerAuditLog);
+    private riskAssessmentRepository = AppDataSource.getRepository(RiskAssessment);
+
+    /**
+     * Adds an explicit `assessmentStatus` to each farm response.
+     *
+     * WHY: staff screens (Farm Registry, Map, Farm Details, Farmer Profile)
+     * decide "is this assessed?" from `lastRiskAssessmentDate`. A legacy MOCK
+     * result also carried that date, so a fabricated verdict could still be
+     * painted green for staff. `deriveAssessmentStatus` distinguishes a
+     * verified live result from an unverifiable historical one, and the
+     * frontend's shared `isAssessed()` now respects it.
+     *
+     * ONE query for the whole page (not one per farm).
+     */
+    private async withAssessmentStatus<T extends Farm>(farms: T[]): Promise<any[]> {
+        if (!farms.length) return farms as any[];
+        const ids = farms.map(f => f.id);
+        const rows = await this.riskAssessmentRepository.find({
+            where: { farmId: In(ids) },
+            order: { createdAt: "DESC" },
+        });
+        // Ordered DESC, so the first row seen per farm is the newest.
+        const latestByFarm = new Map<string, RiskAssessment>();
+        for (const row of rows) {
+            if (!latestByFarm.has(row.farmId)) latestByFarm.set(row.farmId, row);
+        }
+        return farms.map(farm => ({
+            ...(farm as any),
+            assessmentStatus: deriveAssessmentStatus(
+                { riskLevel: farm.riskLevel, lastRiskAssessmentDate: farm.lastRiskAssessmentDate },
+                latestByFarm.get(farm.id) ?? null,
+            ).status,
+        }));
+    }
 
     async getAll(req: Request, res: Response) {
         try {
@@ -104,7 +141,7 @@ export class FarmController {
                     relations: FARM_COMMODITY_RELATIONS,
                     order: { name: "ASC" }
                 });
-                return successResponse(res, farms);
+                return successResponse(res, await this.withAssessmentStatus(farms));
             }
 
             // Access rule (same per-enumerator visibility scoping already
@@ -142,7 +179,7 @@ export class FarmController {
                 });
             }
 
-            return successResponse(res, farms);
+            return successResponse(res, await this.withAssessmentStatus(farms));
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error fetching farms", [error.message], 500);
@@ -157,7 +194,8 @@ export class FarmController {
                 relations: FARM_COMMODITY_RELATIONS
             });
             if (!farm) return errorResponse(res, "Farm not found", [], 404);
-            return successResponse(res, farm);
+            const [annotated] = await this.withAssessmentStatus([farm]);
+            return successResponse(res, annotated);
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error fetching farm", [error.message], 500);
