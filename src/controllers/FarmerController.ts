@@ -93,6 +93,53 @@ export class FarmerController {
     private plotRepository = AppDataSource.getRepository(Plot);
     private userRepository = AppDataSource.getRepository(User);
     private auditLogRepository = AppDataSource.getRepository(FarmerAuditLog);
+    private riskAssessmentRepository = AppDataSource.getRepository(RiskAssessment);
+
+    /**
+     * Attach an explicit `assessmentStatus` to every nested farm on every
+     * farmer in the list, resolving all farms in ONE query.
+     *
+     * WHY THIS EXISTS (staff surfaces): a farm row's `riskLevel` column
+     * DB-defaults to 'Low', and `lastRiskAssessmentDate` only proves that SOME
+     * assessment happened — not that it was verified (the now-retired mock path
+     * also stamped that date). Any staff screen that reads `riskLevel` directly
+     * therefore cannot tell a real 'Low' from an unverified default. This adds
+     * `assessmentStatus` ("verified" | "unverified_historical" |
+     * "never_assessed") alongside the untouched legacy fields, so consumers can
+     * gate on it without inferring a rating from a database default.
+     *
+     * This mirrors `getPublicFarmer`'s resolution exactly (same helper, same
+     * "newest row wins" ordering) so staff and public views can never disagree
+     * about a farm's status. Purely additive: no existing field is removed or
+     * rewritten.
+     */
+    private async withFarmAssessmentStatus<T extends Farmer>(farmers: T[]): Promise<any[]> {
+        if (!farmers.length) return farmers as any[];
+
+        const farmIds = farmers.flatMap(f => (f.farms || []).map(farm => farm.id));
+        const latestAssessmentByFarm = new Map<string, RiskAssessment>();
+        if (farmIds.length) {
+            const rows = await this.riskAssessmentRepository.find({
+                where: { farmId: In(farmIds) },
+                order: { createdAt: "DESC" },
+            });
+            for (const row of rows) {
+                // First row wins: ordered DESC, so this is the newest per farm.
+                if (!latestAssessmentByFarm.has(row.farmId)) latestAssessmentByFarm.set(row.farmId, row);
+            }
+        }
+
+        return farmers.map(farmer => ({
+            ...(farmer as any),
+            farms: (farmer.farms || []).map(farm => ({
+                ...(farm as any),
+                assessmentStatus: deriveAssessmentStatus(
+                    { riskLevel: farm.riskLevel, lastRiskAssessmentDate: farm.lastRiskAssessmentDate },
+                    latestAssessmentByFarm.get(farm.id) ?? null,
+                ).status,
+            })),
+        }));
+    }
 
     async getAll(req: Request, res: Response) {
         try {
@@ -119,7 +166,7 @@ export class FarmerController {
                 farmers = await this.farmerRepository.find({ relations: ["farms"] });
             }
 
-            return successResponse(res, farmers);
+            return successResponse(res, await this.withFarmAssessmentStatus(farmers));
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error fetching farmers", [error.message], 500);
@@ -137,7 +184,8 @@ export class FarmerController {
             });
 
             if (!farmer) return errorResponse(res, "Farmer profile not found for this user", [], 404);
-            return successResponse(res, farmer);
+            const [annotated] = await this.withFarmAssessmentStatus([farmer]);
+            return successResponse(res, annotated);
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error fetching profile", [error.message], 500);
@@ -152,7 +200,8 @@ export class FarmerController {
                 relations: FARMER_FARM_COMMODITY_RELATIONS
             });
             if (!farmer) return errorResponse(res, "Farmer not found", [], 404);
-            return successResponse(res, farmer);
+            const [annotated] = await this.withFarmAssessmentStatus([farmer]);
+            return successResponse(res, annotated);
         } catch (error: any) {
             console.error(error);
             return errorResponse(res, "Error fetching farmer", [error.message], 500);

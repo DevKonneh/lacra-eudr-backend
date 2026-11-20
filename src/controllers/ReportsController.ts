@@ -262,6 +262,54 @@ export class ReportsController {
                 .andWhere("farm.lastRiskAssessmentDate IS NOT NULL AND farm.riskLevel = :high", { high: "High" })
                 .getCount();
 
+            // ── ADDITIVE exposure metric: assessed but NOT verified ───────────
+            // The four compliance buckets above (and every figure already
+            // reported from them) key ONLY on `lastRiskAssessmentDate` +
+            // `riskLevel` + `geometryStatus`. They are deliberately left
+            // exactly as they are: reclassifying them now would silently move
+            // numbers LACRA may already have published.
+            //
+            // But `lastRiskAssessmentDate` only proves that *an* assessment was
+            // recorded — not that it was a VERIFIED one. 2033 marks every
+            // pre-provenance row unverified, and the retired mock path also
+            // stamped that date. So a farm can sit inside "Compliant" today on
+            // the strength of a result that cannot actually be verified.
+            //
+            // Rather than change the buckets, we report that exposure as its
+            // OWN number, so it is visible without moving any existing figure.
+            // `unverifiedAssessmentFarms` is therefore a SUBSET of
+            // `assessedFarms` (same `lastRiskAssessmentDate IS NOT NULL` gate),
+            // narrowed to farms whose newest assessment is not verified.
+            //
+            // The verification test is the SQL twin of
+            // `deriveAssessmentStatus()` — same helper the farm/farmer/public
+            // endpoints use — so this metric can never disagree with what the
+            // staff and public screens show. Like the helper, it inspects only
+            // the NEWEST row (`ORDER BY "createdAt" DESC LIMIT 1`); a newer
+            // flagged row correctly overrides an older verified one.
+            //
+            // Known, documented edge case: a farm with a RiskAssessment row but
+            // a NULL `lastRiskAssessmentDate` is counted by the existing buckets
+            // as "Assessment Pending", not "assessed" — so it is out of scope
+            // for this metric by construction. (Changing that would mean
+            // changing `assessmentPendingFarms`, which is exactly what we are
+            // not doing here.)
+            const unverifiedAssessmentFarms = await this.farmQuery(filters)
+                .andWhere("farm.lastRiskAssessmentDate IS NOT NULL")
+                .andWhere(
+                    `COALESCE((
+                        SELECT (ra.source = :uv_source
+                                AND ra."whispVerified" = true
+                                AND ra."flaggedForReassessment" = false)
+                        FROM risk_assessment ra
+                        WHERE ra."farmId" = farm.id
+                        ORDER BY ra."createdAt" DESC
+                        LIMIT 1
+                    ), false) = false`,
+                    { uv_source: "whisp_live" }
+                )
+                .getCount();
+
             // Avoid division by zero; compliance % is ALWAYS reported
             // separately from verification/geometry rates (never blended).
             // complianceRate's denominator is ALL REGISTERED FARMS (totalFarms)
@@ -457,6 +505,16 @@ export class ReportsController {
                 assessedFarms,
                 assessmentCoverageRate: parseFloat(assessmentCoverageRate.toFixed(1)),
 
+                // ADDITIVE exposure metric (does NOT alter any bucket above).
+                // Of the `assessedFarms` above, how many have NO verified
+                // assessment behind them — i.e. their newest RiskAssessment is
+                // legacy/mock-derived or flagged, so the recorded result cannot
+                // be trusted as a compliance rating. Reported alongside the
+                // existing figures rather than folded into them, so previously
+                // published compliance numbers keep their original meaning.
+                // Always <= assessedFarms.
+                unverifiedAssessmentFarms,
+
                 // Legacy aliases (kept so any not-yet-updated caller of this
                 // endpoint doesn't break): activeRisks === highRiskFarms,
                 // mediumRisks === mediumRiskFarms, geometryNeedsAttentionCount === farmsNeedingCorrection.
@@ -580,6 +638,26 @@ export class ReportsController {
             const complianceRate = totalFarms > 0 ? (compliantFarms / totalFarms) * 100 : 0;
             const assessmentCoverageRate = totalFarms > 0 ? (assessedFarms / totalFarms) * 100 : 0;
 
+            // ADDITIVE: same definition as the main indicator set - see the
+            // long comment there. Reported here so the drill-down that explains
+            // complianceRate also explains how much of `assessedFarms` cannot
+            // be verified. Does not change numerator/denominator/complianceRate.
+            const unverifiedAssessmentFarms = await this.farmQuery(filters)
+                .andWhere("farm.lastRiskAssessmentDate IS NOT NULL")
+                .andWhere(
+                    `COALESCE((
+                        SELECT (ra.source = :uv_source
+                                AND ra."whispVerified" = true
+                                AND ra."flaggedForReassessment" = false)
+                        FROM risk_assessment ra
+                        WHERE ra."farmId" = farm.id
+                        ORDER BY ra."createdAt" DESC
+                        LIMIT 1
+                    ), false) = false`,
+                    { uv_source: "whisp_live" }
+                )
+                .getCount();
+
             return successResponse(res, {
                 rule: "A farm is counted as 'Assessed Low Risk, Valid Geometry' only if it has (1) a COMPLETED risk assessment (lastRiskAssessmentDate is set), (2) a Low risk result, AND (3) a Valid GPS boundary (geometryStatus = 'Valid'). A farm with no completed assessment is counted separately as 'Assessment Pending' and is NEVER included in the compliant numerator, even if its (unassessed, database-defaulted) riskLevel happens to read 'Low'. Any assessed farm with Medium/High risk, or an Invalid/Needs Review/Missing GPS boundary, is also excluded from the numerator.",
                 numerator: compliantFarms,
@@ -593,6 +671,10 @@ export class ReportsController {
                 assessmentPendingFarms,
                 assessedFarms,
                 assessmentCoverageRate: parseFloat(assessmentCoverageRate.toFixed(1)),
+                // ADDITIVE: how much of `assessedFarms` has no verified
+                // assessment behind it. Reported, never subtracted from
+                // `numerator` — complianceRate keeps its published meaning.
+                unverifiedAssessmentFarms,
                 filtersApplied: filters,
             });
         } catch (error: any) {
