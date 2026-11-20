@@ -1545,14 +1545,20 @@ export class FarmerController {
                                         geoId: f.geoId ?? null,
                                         cropType: f.cropType,
                                         totalAreaHa: f.totalAreaHa ?? null,
-                                        riskLevel: f.riskLevel,
+                                        // Verified level only (null unless verified), so a
+                                        // DB-defaulted 'Low' cannot leak to a scanner.
+                                        riskLevel: assessment.level,
+                                        assessmentStatus: assessment.status,
                                     },
                                 }
                                 : null,
                             cropType: f.cropType,
                             totalAreaHa: f.totalAreaHa ?? null,
-                            // Backward-compatible raw column, unchanged for existing clients.
-                            riskLevel: f.riskLevel,
+                            // Null unless a verified assessment exists. This is a
+                            // PUBLIC path, so the raw column (DB default 'Low') is
+                            // never exposed here — an unassessed farm must not read
+                            // as Low risk. `assessmentStatus` says which state it is.
+                            riskLevel: assessment.level,
                             // Additive: explicit assessment status. `riskLevelVerified`
                             // is null unless a live, verified assessment exists, so a
                             // DB-defaulted 'Low' can never be read as a rating.
@@ -1602,45 +1608,51 @@ export class FarmerController {
                 longitude: farmer.longitude,
                 createdAt: farmer.createdAt,
                 updatedAt: farmer.updatedAt,
-                farms: farmer.farms.map(f => ({
-                    name: f.name,
-                    cropType: f.cropType,
-                    totalAreaHa: f.totalAreaHa,
-                    location: f.location,
-                    // Backward-compatible raw column, unchanged for existing clients.
-                    riskLevel: f.riskLevel,
-                    // Additive: explicit assessment status (see AssessmentStatus.ts).
-                    assessmentStatus: statusFor(f).status,
-                    riskLevelVerified: statusFor(f).level,
-                    riskAssessedAt: statusFor(f).assessedAt,
-                    riskAssessmentSource: statusFor(f).source,
-                    riskAssessmentNote: statusFor(f).reason,
-                    farmRegistrationStatus: f.farmRegistrationStatus,
-                    ownershipType: f.ownershipType,
-                    numberOfTrees: f.numberOfTrees,
-                    yearsInCultivation: f.yearsInCultivation,
-                    harvestSeason: f.harvestSeason,
-                    averageYield: f.averageYield,
-                    useChemicals: f.useChemicals,
-                    extensionServices: f.extensionServices,
-                    farmAddress: f.farmAddress,
-                    // Multi-commodity structure, so the public verification
-                    // profile also shows what's actually grown on this farm.
-                    plots: (f.plots || []).map(p => ({
-                        name: p.name,
-                        isDefault: p.isDefault,
-                        areaHa: p.areaHa,
-                        commodities: (p.plotCommodities || []).filter(pc => pc.isActive).map(pc => ({
-                            commodityName: pc.commodityName,
-                            role: pc.role,
-                            croppingSystem: pc.croppingSystem,
-                            plantedAreaHa: pc.plantedAreaHa,
-                            productionStatus: pc.productionStatus,
-                            estimatedAnnualProduction: pc.estimatedAnnualProduction,
-                            unitOfMeasurement: pc.unitOfMeasurement,
-                        }))
-                    })),
-                })),
+                farms: farmer.farms.map(f => {
+                    // Computed ONCE per farm (not once per exposed field).
+                    const assessment = statusFor(f);
+                    return {
+                        name: f.name,
+                        cropType: f.cropType,
+                        totalAreaHa: f.totalAreaHa,
+                        location: f.location,
+                        // Null unless a verified assessment exists — same semantics
+                        // as the geo shape, so one field name never means two
+                        // different things depending on the caller's auth level.
+                        riskLevel: assessment.level,
+                        // Additive: explicit assessment status (see AssessmentStatus.ts).
+                        assessmentStatus: assessment.status,
+                        riskLevelVerified: assessment.level,
+                        riskAssessedAt: assessment.assessedAt,
+                        riskAssessmentSource: assessment.source,
+                        riskAssessmentNote: assessment.reason,
+                        farmRegistrationStatus: f.farmRegistrationStatus,
+                        ownershipType: f.ownershipType,
+                        numberOfTrees: f.numberOfTrees,
+                        yearsInCultivation: f.yearsInCultivation,
+                        harvestSeason: f.harvestSeason,
+                        averageYield: f.averageYield,
+                        useChemicals: f.useChemicals,
+                        extensionServices: f.extensionServices,
+                        farmAddress: f.farmAddress,
+                        // Multi-commodity structure, so the public verification
+                        // profile also shows what's actually grown on this farm.
+                        plots: (f.plots || []).map(p => ({
+                            name: p.name,
+                            isDefault: p.isDefault,
+                            areaHa: p.areaHa,
+                            commodities: (p.plotCommodities || []).filter(pc => pc.isActive).map(pc => ({
+                                commodityName: pc.commodityName,
+                                role: pc.role,
+                                croppingSystem: pc.croppingSystem,
+                                plantedAreaHa: pc.plantedAreaHa,
+                                productionStatus: pc.productionStatus,
+                                estimatedAnnualProduction: pc.estimatedAnnualProduction,
+                                unitOfMeasurement: pc.unitOfMeasurement,
+                            }))
+                        })),
+                    };
+                }),
                 _access: "full",
             };
 

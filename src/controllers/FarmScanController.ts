@@ -24,12 +24,38 @@ import { Request, Response } from "express";
 import { AppDataSource } from "../data-source";
 import { Farm } from "../entities/Farm";
 import { Farmer } from "../entities/Farmer";
+import { RiskAssessment } from "../entities/RiskAssessment";
 import { GeoIdService } from "../services/GeoIdService";
 import { getWhimoService } from "../services/WhimoService";
+import { deriveAssessmentStatus, AssessmentStatusResult } from "../services/AssessmentStatus";
 
 export class FarmScanController {
     private farmRepository = AppDataSource.getRepository(Farm);
     private farmerRepository = AppDataSource.getRepository(Farmer);
+    private assessmentRepository = AppDataSource.getRepository(RiskAssessment);
+
+    /**
+     * Resolves the public assessment status for ONE farm, with ONE query.
+     *
+     * `Farm.riskLevel` DB-defaults to 'Low', so the raw column reports 'Low'
+     * for a farm that was never assessed. Every public scan path previously
+     * returned that column verbatim, so a QR scan could show a green "Low"
+     * for a farm with no assessment — and a legacy mock result as a real
+     * compliance rating.
+     *
+     * Callers must use `status.level` (null unless verified) rather than
+     * `farm.riskLevel`. Computed once per request, not once per field.
+     */
+    private async assessmentStatusFor(farm: Farm): Promise<AssessmentStatusResult> {
+        const latest = await this.assessmentRepository.findOne({
+            where: { farmId: farm.id },
+            order: { createdAt: "DESC" },
+        });
+        return deriveAssessmentStatus(
+            { riskLevel: farm.riskLevel, lastRiskAssessmentDate: farm.lastRiskAssessmentDate },
+            latest,
+        );
+    }
 
     /**
      * GET /api/public/farm-scan/:farmId
@@ -60,6 +86,14 @@ export class FarmScanController {
             const geometry = GeoIdService.normaliseGeometry(farm.location);
             const centroid = geometry ? GeoIdService.centroidFromGeometry(geometry) : null;
 
+            // Resolve the assessment status ONCE per request and reuse it for
+            // every field below. `riskLevel: farm.riskLevel` is deliberately no
+            // longer returned on public paths: that column DB-defaults to 'Low',
+            // so shipping it verbatim told an unassessed farm's QR scanner it was
+            // Low risk, and could present a legacy mock value as a real rating.
+            // Only `assessment.level` (null unless verified) carries a level.
+            const assessment = await this.assessmentStatusFor(farm);
+
             // ── GEO-ONLY payload (WHIMO / public) ─────────────────────────────
             // Contains NO farmer PII. Safe to return to any unauthenticated caller.
             // Fields are aligned to what WHIMO's Producer Transaction creation needs:
@@ -89,7 +123,10 @@ export class FarmScanController {
                             geoId: farm.geoId ?? null,
                             cropType: farm.cropType,
                             totalAreaHa: farm.totalAreaHa ?? null,
-                            riskLevel: farm.riskLevel,
+                            // Was: riskLevel (DB default 'Low'). Now the verified
+                            // level only, plus the status that qualifies it.
+                            riskLevel: assessment.level,
+                            assessmentStatus: assessment.status,
                         },
                     }
                     : null,
@@ -99,7 +136,15 @@ export class FarmScanController {
                 totalAreaHa: farm.totalAreaHa ?? null,
 
                 // ── EUDR compliance snapshot (safe to share, no PII) ──────────
-                riskLevel: farm.riskLevel,
+                // `riskLevel` is null unless a verified assessment exists.
+                riskLevel: assessment.level,
+                assessmentStatus: assessment.status,
+                riskAssessedAt: assessment.assessedAt,
+                riskAssessmentSource: assessment.source,
+                riskAssessmentNote: assessment.reason,
+                // Kept for backward compatibility: the DATE still records that an
+                // assessment happened, even when it was not verifiable. It was
+                // never a level, so it does not imply compliance on its own.
                 lastRiskAssessmentDate: farm.lastRiskAssessmentDate ?? null,
                 farmRegistrationStatus: farm.farmRegistrationStatus ?? null,
 
@@ -267,6 +312,15 @@ export class FarmScanController {
             const whimoSvc = getWhimoService();
             const commodityResolution = whimoSvc.resolveCommodity(farm.cropType);
 
+            // Resolve assessment status ONCE (same rule as scan()). The WHIMO
+            // transaction body itself carries NO risk field — verified against
+            // WhimoTransactionProducerCreateRequest, whose only farm attributes
+            // are farm_latitude/farm_longitude/location/location_file. So
+            // `risk_level` below is a LACRA-side display snapshot for the trader
+            // UI, never something WHIMO parses. Still, it must not assert a
+            // default 'Low' or a legacy mock as a rating.
+            const assessment = await this.assessmentStatusFor(farm);
+
             // ── Build full transaction payload via WhimoService ───────────────
             const transactionPayload = whimoSvc.buildTransactionPayload({
                 farmId: farm.id,
@@ -310,7 +364,13 @@ export class FarmScanController {
                     geoid_uri: farm.geoIdUri ?? null,
 
                     // ── EUDR compliance snapshot ──────────────────────────────
-                    risk_level: farm.riskLevel,
+                    // Was: farm.riskLevel (DB default 'Low'). Now null unless a
+                    // verified assessment exists, so this surface can never
+                    // assert a default/legacy value as a compliance rating.
+                    risk_level: assessment.level,
+                    assessment_status: assessment.status,
+                    risk_assessed_at: assessment.assessedAt,
+                    risk_assessment_note: assessment.reason,
                     last_risk_assessment: farm.lastRiskAssessmentDate ?? null,
 
                     // ── Integration guide (for developer reference) ───────────
