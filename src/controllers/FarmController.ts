@@ -22,6 +22,7 @@ import { CroppingSystem, CommodityRole, ProductionStatus } from "../entities/Plo
 import { validateAndAnnotateFarm, assertGeometryNotBlocking, attemptBowtieRepair } from "../services/FarmGeometryHelper";
 import { GeometrySource, classifySubmittedGeometry, resolveGeometrySource, annotateGeometryProvenance } from "../services/GeometryProvenance";
 import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
+import { enqueueAssessmentSafely } from "../services/AssessmentQueueService";
 
 // Relations needed whenever a Farm response should include its full
 // multi-commodity structure (Plot -> PlotCommodity -> Commodity).
@@ -423,7 +424,19 @@ export class FarmController {
             }
 
             const savedFarm = await this.farmRepository.findOne({ where: { id: farm.id }, relations: FARM_COMMODITY_RELATIONS });
-            return successResponse(res, { ...savedFarm, areaWarning, geometryValidation: geometryResult }, "Farm created successfully", 201);
+
+            // ── Queue automatic satellite assessment ────────────────────────
+            // Runs only AFTER the farm and its plots are committed. It writes a
+            // local job row and returns; the WhISP call itself happens in the
+            // background worker, so registration is never delayed by a slow or
+            // unavailable satellite service.
+            //
+            // Best-effort by design: a queueing problem must never fail a farm
+            // that has already been saved, because the field data is the
+            // irreplaceable part and the queue can be re-created later.
+            const assessment = await enqueueAssessmentSafely(farm.id, "farm created");
+
+            return successResponse(res, { ...savedFarm, areaWarning, geometryValidation: geometryResult, assessment }, "Farm created successfully", 201);
         } catch (error: any) {
             console.error("Error creating farm:", error);
             if (error.isGeometryValidationError) {
@@ -536,7 +549,22 @@ export class FarmController {
                 await mintGeoIdForFarm(this.farmRepository, farm, "boundary-evidence update");
             }
 
-            return successResponse(res, farm, "Boundary evidence saved successfully");
+            // ── Queue automatic assessment for the CORRECTED boundary ───────
+            // Only when the polygon actually changed: the queue hashes the
+            // geometry and dedupes on (plot, polygon), so re-saving an identical
+            // boundary reuses the existing job instead of creating a second one.
+            // A genuinely new polygon gets a new job at a bumped geometry
+            // version, while the previous verdict stays in history flagged
+            // superseded.
+            //
+            // Moving the FARM boundary also moves the geometry of any default
+            // plot that shares it, which is why enqueueing is done per-plot
+            // rather than once per farm.
+            const assessment = location
+                ? await enqueueAssessmentSafely(farm.id, "boundary corrected")
+                : undefined;
+
+            return successResponse(res, { ...farm, ...(assessment ? { assessment } : {}) }, "Boundary evidence saved successfully");
         } catch (error: any) {
             console.error("Error adding boundary evidence:", error);
             return errorResponse(res, error.message || "Error adding boundary evidence", [error.message], 400);

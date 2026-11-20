@@ -10,8 +10,10 @@ import { WhispService, WhispAnalysisResult, WhispRiskLabel, WhispUnavailableErro
 import { AssessmentAttempt } from "../entities/AssessmentAttempt";
 import { CropType } from "../entities/Farm";
 import { validateAndAnnotateFarm } from "./FarmGeometryHelper";
-import { GeometryStatus } from "./GeometryValidationService";
-import { GeometrySource, resolveGeometrySource } from "./GeometryProvenance";
+import { GeometryStatus, geometryValidationService } from "./GeometryValidationService";
+import { GeometrySource, resolveGeometrySource, isLegacyGeneratedSquare } from "./GeometryProvenance";
+import { Plot } from "../entities/Plot";
+import { geometryHashOf, nextGeometryVersion } from "./GeometryVersioning";
 
 /** Perennial tree crops map to Whisp's risk_pcrop label; annual crops map to risk_acrop. */
 const PERENNIAL_CROPS = new Set<CropType>([CropType.COCOA, CropType.COFFEE, CropType.PALM, CropType.RUBBER]);
@@ -19,6 +21,7 @@ const ANNUAL_CROPS = new Set<CropType>([CropType.CASSAVA, CropType.VEGETABLES]);
 
 export class RiskService {
     private farmRepo = AppDataSource.getRepository(Farm);
+    private plotRepo = AppDataSource.getRepository(Plot);
     private assessmentRepo = AppDataSource.getRepository(RiskAssessment);
     private documentRepo = AppDataSource.getRepository(FarmDocument);
     private forestRepo = AppDataSource.getRepository(Forest);
@@ -254,9 +257,235 @@ export class RiskService {
     }
 
     /**
-     * Maps the farm's crop type to Whisp's pre-computed commodity-category risk label
-     * (risk_pcrop for perennial tree crops, risk_acrop for annual crops, risk_timber otherwise).
+     * Assesses ONE plot's own polygon and stores the verdict against that plot.
+     *
+     * WHY A SEPARATE METHOD FROM analyzeFarm()
+     * ----------------------------------------
+     * `analyzeFarm()` assesses `farm.location` — the whole registered farm — and
+     * stamps the verdict on the farm. Automatic assessment is per PLOT: a single
+     * submission can carry several plots, each with its own polygon, and a
+     * satellite verdict describes ONE parcel. Attributing it to the farm would
+     * make two subplots indistinguishable and let a corrected subplot appear to
+     * invalidate its neighbour.
+     *
+     * The SCORING RULE IS SHARED, not duplicated: this method calls the same
+     * `calculateRiskScore()`, `getCommodityRiskLabel()`, `checkLegality()`,
+     * `checkTraceability()` and `buildDeforestationNarrative()` used by
+     * `analyzeFarm()`, so a plot and the farm can never be scored by different
+     * rules.
+     *
+     * `expectedGeometryHash` is the stale-run guard: the caller passes the hash
+     * the job was queued for. If the plot's polygon has changed since (staff
+     * corrected the boundary while WhISP was working), the verdict is STILL
+     * SAVED — it is real evidence about that shape — but it is flagged
+     * `supersededByGeometryChange` so it cannot become the plot's current rating.
      */
+    async assessPlot(
+        plotId: string,
+        opts: { geometryHash?: string | null; geometryVersion?: number | null } = {},
+    ): Promise<RiskAssessment> {
+        const plot = await this.plotRepo.findOne({
+            where: { id: plotId },
+            relations: ["farm", "farm.farmer", "plotCommodities"],
+        });
+        if (!plot) throw new Error("Plot not found");
+        if (!plot.farm) throw new Error("Plot has no parent farm");
+
+        const farm = plot.farm;
+
+        // Resolve the polygon. Mirrors AssessmentQueueService.resolvePlotGeometry:
+        // a plot's own boundary wins; only the auto-created default plot (which
+        // intentionally has no boundary of its own) falls back to the farm's.
+        const geometry = (plot as any).boundary ?? (plot.isDefault ? farm.location : null);
+        if (!geometry || !geometry.type) {
+            const err: any = new Error(
+                "Compliance analysis blocked: this plot has no boundary polygon of its own to assess."
+            );
+            err.isGeometryValidationError = true;
+            throw err;
+        }
+        if (geometry.type === "Point" || (geometry.type !== "Polygon" && geometry.type !== "MultiPolygon")) {
+            const err: any = new Error(
+                "Compliance analysis blocked: this plot's geometry is not a polygon. A point is a location, not a boundary — survey the plot before assessing."
+            );
+            err.isGeometryValidationError = true;
+            throw err;
+        }
+
+        // Provenance gate, same rule as analyzeFarm(): a generated square is not
+        // survey evidence and must never acquire a satellite verdict.
+        const provenance = resolveGeometrySource(
+            geometry,
+            plot.boundary ? null : (farm as any).geometrySource,
+        );
+        if (provenance === GeometrySource.GENERATED_BUFFER || isLegacyGeneratedSquare(geometry)) {
+            const err: any = new Error(
+                "Compliance analysis blocked: this boundary is the automatically generated square, not a surveyed polygon. Survey the real parcel before assessing."
+            );
+            err.isGeometryValidationError = true;
+            err.isProvenanceBlock = true;
+            throw err;
+        }
+
+        // Geometric validity of the plot's own polygon.
+        const geometryResult = await geometryValidationService.validate({
+            geometry,
+            declaredAreaHa: plot.areaHa ?? farm.totalAreaHa ?? null,
+            skipOverlapCheck: true,
+            excludeFarmId: farm.id,
+        });
+        if (geometryResult.status === GeometryStatus.INVALID) {
+            const err: any = new Error(
+                `Compliance analysis blocked: plot boundary failed geometry validation. ${geometryResult.errors.join(" ")}`
+            );
+            err.isGeometryValidationError = true;
+            err.geometryValidationResult = geometryResult;
+            throw err;
+        }
+
+        // --- The WhISP call. A failure is NOT an assessment. ---
+        let whispResult: WhispAnalysisResult;
+        try {
+            whispResult = await this.whispService.analyzeFarm(plotId, geometry);
+        } catch (error) {
+            const failure = error instanceof WhispUnavailableError
+                ? error
+                : new WhispUnavailableError(
+                    'request_failed',
+                    "Satellite assessment failed unexpectedly. No assessment has been recorded.",
+                    { detail: (error as Error)?.message },
+                );
+            // Recorded against the FARM for continuity with the existing staff
+            // "failed attempts" view, with the plot recorded in the detail blob.
+            await this.recordFailedAttempt(farm, failure, { plotId, plotName: plot.name });
+            throw failure;
+        }
+
+        // Crop category comes from THIS plot's commodities when it has any, so a
+        // cocoa subplot is judged on risk_pcrop even when the farm's legacy
+        // cropType says something else.
+        const plotCropType = this.resolvePlotCropType(plot, farm);
+        const commodityRiskLabel = this.getCommodityRiskLabel(whispResult, plotCropType);
+        const postBaselineEvents = whispResult.annualEvents.filter(e => e.year > 2020);
+
+        const deforestationRisk = commodityRiskLabel === 'high';
+        const deforestationNeedsReview = commodityRiskLabel === 'more_info_needed';
+
+        const deforestationNarrative = this.buildDeforestationNarrative(
+            whispResult, plotCropType, commodityRiskLabel, postBaselineEvents, deforestationRisk
+        );
+
+        // Overlap is tested against THIS plot's polygon, not the whole farm.
+        const overlapResult = await this.checkOverlap(farm, geometryResult.overlapsExistingFarm, geometry);
+
+        const legalityRisk = await this.checkLegality(farm.id);
+        const traceabilityRisk = await this.checkTraceability(farm);
+
+        const overallRisk = this.calculateRiskScore(
+            deforestationRisk, overlapResult, legalityRisk, traceabilityRisk,
+            deforestationNeedsReview, geometryResult.needsReview
+        );
+
+        // --- Stale-geometry guard -------------------------------------------
+        // Re-read the plot's hash NOW, immediately before writing. If staff
+        // corrected the boundary while WhISP was running, this verdict describes
+        // a polygon that is no longer current. It is still recorded (it is true
+        // evidence about that shape), but marked superseded so it cannot win.
+        const currentHash = geometryHashOf((plot as any).boundary ?? (plot.isDefault ? farm.location : null));
+        const expectedHash = opts.geometryHash ?? null;
+        const geometryChanged = !!expectedHash && !!currentHash && expectedHash !== currentHash;
+
+        const assessment = this.assessmentRepo.create({
+            farm,
+            farmId: farm.id,
+            plot,
+            plotId: plot.id,
+            geometryHash: expectedHash ?? currentHash,
+            geometryVersion: opts.geometryVersion ?? (plot as any).geometryVersion ?? null,
+            supersededByGeometryChange: geometryChanged,
+            deforestationRisk,
+            overlapResult,
+            legalityRisk,
+            traceabilityRisk,
+            overallRisk,
+            whispAnalysisId: whispResult.resultId,
+            whispData: whispResult,
+            source: whispResult.provenance,
+            whispVerified: whispResult.verified,
+            details: {
+                assessedAt: new Date(),
+                notes: deforestationNarrative,
+                narrative: deforestationNarrative,
+                commodities: whispResult.commodityOverlaps.map(c => c.commodity),
+                whispProvenance: whispResult.provenance,
+                whispFailureCode: null,
+                // Which parcel this verdict describes, for the due-diligence file.
+                plotId: plot.id,
+                plotName: plot.name,
+                geometryVersion: opts.geometryVersion ?? (plot as any).geometryVersion ?? null,
+                geometryHash: expectedHash ?? currentHash,
+                boundaryCorrectedDuringRun: geometryChanged ? true : false,
+            }
+        });
+
+        await this.assessmentRepo.save(assessment);
+
+        // The farm-level "current rating" is only moved by a verdict that is
+        // still current. A superseded run must not repaint the farm either.
+        if (!geometryChanged) {
+            const previousRisk = farm.riskLevel;
+            farm.riskLevel = overallRisk;
+            farm.lastRiskAssessmentDate = new Date();
+            await this.farmRepo.save(farm);
+
+            if (overallRisk === RiskLevel.HIGH) {
+                await this.raiseHighRiskAlert(farm, previousRisk, overlapResult, plot);
+            }
+        } else {
+            console.warn(
+                `[assessment] Plot ${plot.id}: boundary changed while the check was running. ` +
+                `Verdict ${assessment.id} recorded as superseded and NOT applied as the current rating.`
+            );
+        }
+
+        return assessment;
+    }
+
+    /** Crop category for a plot: its own primary commodity, else the farm's legacy value. */
+    private resolvePlotCropType(plot: Plot, farm: Farm): CropType {
+        const active = (plot.plotCommodities || []).filter((pc: any) => pc.isActive);
+        const primary = active.find((pc: any) => pc.role === "Primary") ?? active[0];
+        const name = (primary?.commodityName || farm.cropType || "").trim();
+        const match = Object.values(CropType).find(
+            v => String(v).toLowerCase() === name.toLowerCase()
+        );
+        return (match as CropType) || CropType.OTHER;
+    }
+
+    private async raiseHighRiskAlert(
+        farm: Farm,
+        previousRisk: string,
+        overlapResult: OverlapResult,
+        plot: Plot,
+    ): Promise<void> {
+        const alertRepo = AppDataSource.getRepository(SatelliteAlert);
+        const alert = alertRepo.create({
+            farm,
+            farmId: farm.id,
+            type: previousRisk !== RiskLevel.HIGH ? "RISK_CHANGE" : "DEFORESTATION",
+            detectedAt: new Date(),
+            status: "PENDING",
+            metadata: { previousRisk: previousRisk || "Unknown", overlapResult, plotId: plot.id, plotName: plot.name },
+        });
+        await alertRepo.save(alert);
+
+        await NotificationService.createForAdmins(
+            "RISK_CHANGE",
+            "High Risk Detected",
+            `Plot "${plot.name}" on farm "${farm.name}" has been assessed as HIGH risk. ${overlapResult === OverlapResult.FOREST ? "Overlap with forest detected." : ""}`
+        );
+    }
+
     private getCommodityRiskLabel(whispResult: WhispAnalysisResult | null, cropType: CropType): WhispRiskLabel {
         if (!whispResult) return 'unknown';
         if (PERENNIAL_CROPS.has(cropType)) return whispResult.riskPerennialCrop;
@@ -385,7 +614,11 @@ export class RiskService {
      * which is what lets the UI say "last verified assessment was X, latest
      * attempt failed". A failure must never erase prior verified evidence.
      */
-    private async recordFailedAttempt(farm: Farm, failure: WhispUnavailableError): Promise<void> {
+    private async recordFailedAttempt(
+        farm: Farm,
+        failure: WhispUnavailableError,
+        context: { plotId?: string; plotName?: string } = {},
+    ): Promise<void> {
         try {
             const attemptRepo = AppDataSource.getRepository(AssessmentAttempt);
             const attempt = attemptRepo.create({
@@ -402,6 +635,10 @@ export class RiskService {
                     retryable: failure.retryable,
                     detail: failure.detail ?? null,
                     geometryStatus: farm.geometryStatus,
+                    // Per-plot failures must name the plot: "the farm failed"
+                    // is not actionable when only one subplot's polygon is bad.
+                    plotId: context.plotId ?? null,
+                    plotName: context.plotName ?? null,
                 },
             });
             await attemptRepo.save(attempt);
@@ -420,13 +657,24 @@ export class RiskService {
      * farm-to-farm overlap was a genuine gap (OverlapResult.FARM existed in
      * the enum but was never actually produced anywhere).
      */
-    private async checkOverlap(farm: Farm, farmOverlapDetected: boolean = false): Promise<OverlapResult> {
+    private async checkOverlap(
+        farm: Farm,
+        farmOverlapDetected: boolean = false,
+        geometryOverride?: any,
+    ): Promise<OverlapResult> {
         try {
-            // Check against Forests (highest severity)
+            // Check against Forests (highest severity).
+            //
+            // `geometryOverride` lets a per-plot assessment test the PLOT's own
+            // polygon. Defaulting to farm.location would ask "does the whole
+            // farm overlap a forest?" and then attribute that answer to one
+            // subplot — which could flag a plot that does not touch the forest
+            // at all, or miss one that does.
+            const geometry = geometryOverride ?? farm.location;
             const forestOverlap = await this.forestRepo
                 .createQueryBuilder("forest")
                 .where("ST_Intersects(forest.geom, ST_GeomFromGeoJSON(:farmGeom))", {
-                    farmGeom: JSON.stringify(farm.location)
+                    farmGeom: JSON.stringify(geometry)
                 })
                 .getOne();
 

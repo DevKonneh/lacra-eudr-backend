@@ -50,6 +50,27 @@ export class Plot {
     @Column({ type: "geometry", spatialFeatureType: "Geometry", srid: 4326, nullable: true })
     boundary!: object | null;
 
+    // ─── Geometry versioning (see services/GeometryVersioning.ts) ───────────
+    //
+    // `geometryHash` is a sha256 of the canonicalised boundary (vertex order and
+    // winding normalised, coordinates rounded), so "has this polygon actually
+    // changed?" is a string comparison rather than a deep geometric diff.
+    //
+    // WHY IT EXISTS: automatic assessment is queued per (plot, polygon). A
+    // retried sync that re-sends an UNCHANGED boundary must collide with the
+    // existing job instead of creating a second one, and a result produced
+    // against an older boundary must not be allowed to become the current
+    // rating once the polygon is corrected. Both need a stable polygon identity,
+    // which is what these two columns provide.
+    //
+    // NULL = not yet computed (pre-existing rows; backfilled by migration 2035).
+    @Column({ type: "varchar", nullable: true })
+    geometryHash?: string | null;
+
+    // Human-facing counter, bumped ONLY when the canonical polygon changes.
+    @Column({ type: "int", default: 0 })
+    geometryVersion!: number;
+
     // Area of THIS plot specifically. For the default/shared plot this
     // mirrors farm.totalAreaHa; for a separately-drawn subplot this is its
     // own calculated/declared area, used by the "total subplot area must

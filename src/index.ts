@@ -161,6 +161,8 @@ app.get('/', (req, res) => {
 });
 
 import riskRoutes from "./routes/risk.routes";
+import assessmentRoutes from "./routes/assessment.routes";
+import { assessmentQueue } from "./services/AssessmentQueueService";
 import reportsRoutes from "./routes/reports.routes";
 import authRoutes from "./routes/auth.routes";
 import licenseRoutes from "./routes/license.routes";
@@ -211,6 +213,7 @@ app.use("/api/farmers", farmerRoutes);
 app.use("/api/farms", farmRoutes);
 app.use("/api/documents", documentRoutes);
 app.use("/api/risk", riskRoutes);
+app.use("/api/assessments", assessmentRoutes);
 app.use("/api/reports", reportsRoutes);
 app.use("/api/satellite", satelliteRoutes);
 app.use("/api/roles", roleRoutes);
@@ -250,6 +253,22 @@ app.use(errorHandler);
 AppDataSource.initialize()
     .then(() => {
         console.log("Database connected successfully.");
+
+        // ── Automatic assessment worker ─────────────────────────────────────
+        // Drains the AssessmentJob queue in the background so WhISP checks run
+        // after a sync has already been acknowledged. Started only once the DB
+        // is connected (the worker queries the queue immediately).
+        //
+        // Can be disabled with ASSESSMENT_WORKER=off, e.g. when a separate
+        // process drains the same table, or in integration tests.
+        if (process.env.ASSESSMENT_WORKER !== "off") {
+            const intervalMs = parseInt(process.env.ASSESSMENT_WORKER_INTERVAL_MS || "15000", 10);
+            assessmentQueue.startWorker(Number.isFinite(intervalMs) ? intervalMs : 15000);
+            console.log(`Automatic assessment worker started (interval ${intervalMs}ms).`);
+        } else {
+            console.log("Automatic assessment worker disabled (ASSESSMENT_WORKER=off).");
+        }
+
         app.listen(PORT, () => {
             console.log(`Server is running on port ${PORT}`);
         });

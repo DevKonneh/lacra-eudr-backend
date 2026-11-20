@@ -23,6 +23,7 @@ import { validateAndAnnotateFarm, assertGeometryNotBlocking } from "../services/
 import { annotateGeometryProvenance } from "../services/GeometryProvenance";
 import { deriveAssessmentStatus } from "../services/AssessmentStatus";
 import { recordFarmCaptureFieldEvent } from "../services/FieldEventService";
+import { enqueueAssessmentSafely } from "../services/AssessmentQueueService";
 
 // Relations needed whenever a Farmer response should include each farm's
 // full multi-commodity structure (Plot -> PlotCommodity -> Commodity), used
@@ -1836,6 +1837,11 @@ export class FarmerController {
             // chance to mint its GeoID via mintGeoIdForFarm().
             const createdFarms: Farm[] = [];
 
+            // Per-farm summary of what was queued for automatic assessment, so
+            // the sync response can tell the app (and staff) that checks were
+            // scheduled without the sync having waited for them.
+            const assessmentSummaries: Record<string, { queued: number; reused: number; boundaryReview: number; error?: string }> = {};
+
             for (const f of farmsData) {
                 // cropType (legacy) OR commodities (new) must identify at
                 // least one initial commodity; location is always required.
@@ -1916,6 +1922,20 @@ export class FarmerController {
                     savedFarm.cropType = deriveLegacyCropType(savedPlots);
                     await this.farmRepository.save(savedFarm);
                 }
+
+                // ── Queue automatic satellite assessment (mobile/offline sync) ──
+                // This is the path the Farm Mapping app's queued submissions
+                // replay through, so it is where the acceptance test's "sync
+                // triggers a check" lives. Runs AFTER the farm and its plots are
+                // committed; only a local job row is written, so the sync returns
+                // without waiting on WhISP.
+                //
+                // Best-effort: a queueing failure must not reject a sync batch
+                // whose field data is already committed.
+                assessmentSummaries[savedFarm.id] = await enqueueAssessmentSafely(
+                    savedFarm.id,
+                    "offline farmer sync",
+                );
             }
 
             // Generate the farmer's ID-card QR now that every farm in this batch
@@ -1943,7 +1963,7 @@ export class FarmerController {
 
             return successResponse(
                 res,
-                { ...savedFarmer, geometryValidation: geometryResultsByFarmName, rejectedFarms },
+                { ...savedFarmer, geometryValidation: geometryResultsByFarmName, rejectedFarms, assessmentQueued: assessmentSummaries },
                 rejectedFarms.length > 0
                     ? `Farmer synced successfully; ${rejectedFarms.length} farm(s) rejected for invalid geometry.`
                     : "Farmer synced successfully",
