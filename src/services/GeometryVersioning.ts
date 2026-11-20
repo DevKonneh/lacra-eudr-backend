@@ -59,15 +59,37 @@ export function canonicalizeGeometry(geometry: any): string {
             if (first[0] === last[0] && first[1] === last[1]) pts = pts.slice(0, -1);
         }
         if (pts.length === 0) return [];
-        // Rotate so the lexicographically smallest vertex comes first.
-        let minIdx = 0;
-        for (let i = 1; i < pts.length; i++) {
-            if (pts[i][0] < pts[minIdx][0]
-                || (pts[i][0] === pts[minIdx][0] && pts[i][1] < pts[minIdx][1])) {
-                minIdx = i;
+
+        // Rotate a ring so the lexicographically smallest vertex comes first.
+        // A ring is a CYCLE, so [a,b,c] / [b,c,a] / [c,a,b] are the same parcel.
+        const rotateToSmallest = (input: number[][]): number[][] => {
+            let minIdx = 0;
+            for (let i = 1; i < input.length; i++) {
+                if (input[i][0] < input[minIdx][0]
+                    || (input[i][0] === input[minIdx][0] && input[i][1] < input[minIdx][1])) {
+                    minIdx = i;
+                }
             }
-        }
-        return [...pts.slice(minIdx), ...pts.slice(0, minIdx)];
+            return [...input.slice(minIdx), ...input.slice(0, minIdx)];
+        };
+
+        const forward = rotateToSmallest(pts);
+
+        // WINDING: [a,b,c] and [c,b,a] describe the SAME polygon (they differ
+        // only in traversal direction), so the canonical form must not depend on
+        // it. Reverse (then re-rotate, since reversing moves the smallest vertex
+        // to the end) and keep whichever representation sorts first.
+        //
+        // This is not cosmetic: the mobile app may emit a boundary in either
+        // direction. Without this, re-syncing an UNCHANGED polygon clockwise
+        // would hash differently, look like a corrected boundary, and queue a
+        // duplicate assessment — the precise failure the dedupe key exists to
+        // prevent.
+        const backward = rotateToSmallest([...pts].reverse());
+
+        const fwdKey = JSON.stringify(forward);
+        const bwdKey = JSON.stringify(backward);
+        return fwdKey <= bwdKey ? forward : backward;
     };
 
     const canonicalPolygon = (rings: number[][][]): number[][][] =>
