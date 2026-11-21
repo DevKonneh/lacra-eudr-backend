@@ -279,11 +279,57 @@ export class RiskService {
      * corrected the boundary while WhISP was working), the verdict is STILL
      * SAVED — it is real evidence about that shape — but it is flagged
      * `supersededByGeometryChange` so it cannot become the plot's current rating.
+     *
+     * This is the BLOCKING entry point (submit + wait). The queue worker uses
+     * preparePlotGeometry() + submitAndReturnToken() + persistPlotVerdict()
+     * instead, so a slow analysis does not hold a worker or force a resubmit.
      */
     async assessPlot(
         plotId: string,
         opts: { geometryHash?: string | null; geometryVersion?: number | null } = {},
     ): Promise<RiskAssessment> {
+        const { plot, farm, geometry, geometryResult } = await this.preparePlotGeometry(plotId);
+
+        // --- The WhISP call. A failure is NOT an assessment. ---
+        let whispResult: WhispAnalysisResult;
+        try {
+            whispResult = await this.whispService.analyzeFarm(plotId, geometry);
+        } catch (error) {
+            const failure = error instanceof WhispUnavailableError
+                ? error
+                : new WhispUnavailableError(
+                    'request_failed',
+                    "Satellite assessment failed unexpectedly. No assessment has been recorded.",
+                    { detail: (error as Error)?.message },
+                );
+            // Recorded against the FARM for continuity with the existing staff
+            // "failed attempts" view, with the plot recorded in the detail blob.
+            await this.recordFailedAttempt(farm, failure, { plotId, plotName: plot.name });
+            throw failure;
+        }
+
+        return this.persistPlotVerdict(plot, farm, whispResult, geometry, geometryResult, opts);
+    }
+
+    /**
+     * Resolves and validates the polygon a plot would be assessed on, WITHOUT
+     * calling WhISP.
+     *
+     * Extracted so the queue worker can submit a polygon ONCE, store the
+     * analysis token, and later persist the result it resumes — without
+     * re-running these gates against a plot that may have changed in between,
+     * and without duplicating them. They are security-relevant, not incidental:
+     * a GPS point, a generated square, or an invalid ring must never reach
+     * WhISP as if it were survey evidence.
+     */
+    async preparePlotGeometry(
+        plotId: string,
+    ): Promise<{
+        plot: Plot;
+        farm: Farm;
+        geometry: any;
+        geometryResult: { overlapsExistingFarm: boolean; needsReview: boolean };
+    }> {
         const plot = await this.plotRepo.findOne({
             where: { id: plotId },
             relations: ["farm", "farm.farmer", "plotCommodities"],
@@ -343,24 +389,34 @@ export class RiskService {
             throw err;
         }
 
-        // --- The WhISP call. A failure is NOT an assessment. ---
-        let whispResult: WhispAnalysisResult;
-        try {
-            whispResult = await this.whispService.analyzeFarm(plotId, geometry);
-        } catch (error) {
-            const failure = error instanceof WhispUnavailableError
-                ? error
-                : new WhispUnavailableError(
-                    'request_failed',
-                    "Satellite assessment failed unexpectedly. No assessment has been recorded.",
-                    { detail: (error as Error)?.message },
-                );
-            // Recorded against the FARM for continuity with the existing staff
-            // "failed attempts" view, with the plot recorded in the detail blob.
-            await this.recordFailedAttempt(farm, failure, { plotId, plotName: plot.name });
-            throw failure;
-        }
+        // No WhISP call here, deliberately. The caller decides when (or whether)
+        // to spend an Earth Engine job: assessPlot() does it immediately, the
+        // queue worker submits once and resumes polling later.
+        return { plot, farm, geometry, geometryResult };
+    }
 
+    /**
+     * Scores and stores an ALREADY-OBTAINED WhISP result for a plot.
+     *
+     * Split out of `assessPlot` so the queue worker can record a RESULT IT
+     * RESUMED rather than re-obtained. The worker submits a polygon once, stores
+     * the analysis token, and later reads the finished analysis via
+     * `checkStatus`. Without this method that resumed result would have to be
+     * thrown away and the polygon re-submitted — a second Earth Engine job for
+     * data we already hold.
+     *
+     * The scoring rule is IDENTICAL to the fresh path, because both go through
+     * this same method. That is deliberate: a resumed verdict and a fresh
+     * verdict must never be able to disagree about the same evidence.
+     */
+    async persistPlotVerdict(
+        plot: Plot,
+        farm: Farm,
+        whispResult: WhispAnalysisResult,
+        geometry: any,
+        geometryResult: { overlapsExistingFarm: boolean; needsReview: boolean },
+        opts: { geometryHash?: string | null; geometryVersion?: number | null } = {},
+    ): Promise<RiskAssessment> {
         // Crop category comes from THIS plot's commodities when it has any, so a
         // cocoa subplot is judged on risk_pcrop even when the farm's legacy
         // cropType says something else.

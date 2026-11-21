@@ -117,6 +117,56 @@ export class AssessmentJob {
     @Column({ type: "varchar", nullable: true })
     assessmentId?: string | null;
 
+    /**
+     * WHISP's analysis token for this attempt, persisted so polling can RESUME.
+     *
+     * WHY THIS COLUMN EXISTS
+     * ----------------------
+     * Submitting a polygon creates a real Earth Engine job. If the worker then
+     * waited inside the request for that job (the old behaviour: a 90s blocking
+     * poll), a slow parcel would either (a) occupy a worker for the whole window,
+     * or (b) be declared failed by our client and RE-SUBMITTED on retry —
+     * paying for a second analysis of the same parcel.
+     *
+     * With the token stored, a retry, a worker restart, or a deploy simply calls
+     * `checkStatus(token)` in a later tick. No second submission, no held worker.
+     */
+    @Column({ type: "varchar", nullable: true })
+    whispToken?: string | null;
+
+    /**
+     * Absolute epoch-ms deadline for the current analysis.
+     *
+     * Derived from the server's own `analysisTimeoutAsyncSeconds` (not a
+     * hard-coded guess), so a legitimately slow parcel is not failed early.
+     * Null means "no analysis outstanding".
+     */
+    @Column({ type: "bigint", nullable: true })
+    pollDeadlineAt?: number | null;
+
+    /** When we last asked WHISP for this token's status. */
+    @Column({ type: "timestamp", nullable: true })
+    lastPolledAt?: Date | null;
+
+    /**
+     * TRUE when the token was issued but the analysis had not yet terminated.
+     *
+     * Distinguishes "submitted, waiting on WhISP" (resume by polling) from
+     * "never submitted" (a fresh submit is required). Without this flag the
+     * worker cannot tell a resumed job from a new one after a restart.
+     */
+    @Column({ type: "boolean", default: false })
+    analysisInFlight!: boolean;
+
+    /**
+     * Count of status PROBES made for the current token.
+     *
+     * Deliberately separate from `attempts`: polling a token that is still
+     * running is not a failed attempt, and must never consume the retry budget.
+     */
+    @Column({ type: "int", default: 0 })
+    pollCount!: number;
+
     @Column({ type: "timestamp", nullable: true })
     startedAt?: Date | null;
 

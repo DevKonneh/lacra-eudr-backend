@@ -12,6 +12,7 @@ import {
 } from "./GeometryProvenance";
 import { geometryHashOf, nextGeometryVersion, assessmentDedupeKey } from "./GeometryVersioning";
 import { RiskService } from "./RiskService";
+import { WhispService, WhispUnavailableError } from "./WhispService";
 
 /**
  * Automatic per-plot satellite (Open Foris WhISP) assessment queue.
@@ -62,6 +63,17 @@ const BACKOFF_MS = [
     2 * 3_600_000, // 2h
 ];
 const MAX_ATTEMPTS = BACKOFF_MS.length;
+
+/**
+ * How long to wait between status probes for an analysis already in flight.
+ *
+ * This is NOT a retry delay and must never be treated as one: probing a token
+ * that is still running is our own impatience, not a WhISP failure. It is kept
+ * short so a normally fast parcel (WhISP completed a 60 ha parcel in ~6s in the
+ * live check) still feels automatic, while a slow one costs one cheap HTTP GET
+ * per interval instead of a blocked worker.
+ */
+const POLL_INTERVAL_MS = 15_000;
 
 export const AssessmentJobStatus = {
     QUEUED: "queued",
@@ -550,8 +562,32 @@ export class AssessmentQueueService {
     /**
      * Executes one job. Every outcome is written to the job row; nothing is
      * thrown at the caller, because the worker has no caller to inform.
+     *
+     * TWO PATHS, AND WHY
+     * ------------------
+     * A submission creates a real Earth Engine job on WhISP's side. The old code
+     * waited for it inside the worker (a 90s blocking poll). That had two bad
+     * outcomes: a slow parcel held a worker for the entire window, and when our
+     * client gave up first the retry RE-SUBMITTED the same polygon — paying for
+     * a second analysis of data we already had.
+     *
+     * So the worker now submits, stores the token it was issued, and returns. A
+     * later tick polls that token with a single cheap GET. A restart, a deploy,
+     * or a retry resumes the SAME analysis because the token is in the row.
      */
     private async runJob(job: AssessmentJob): Promise<void> {
+        const riskService = new RiskService();
+        const whispService = new WhispService();
+
+        // --- RESUMED ANALYSIS: we already hold a token. Poll it. -------------
+        // Never submit again here: a second submission would be a second Earth
+        // Engine job for the same parcel.
+        if (job.whispToken && job.analysisInFlight) {
+            await this.resumeJob(job, riskService, whispService);
+            return;
+        }
+
+        // --- FIRST RUN: reserve the attempt, submit once, keep the token. ---
         job.status = AssessmentJobStatus.ASSESSING;
         job.attempts = (job.attempts ?? 0) + 1;
         job.startedAt = job.startedAt ?? new Date();
@@ -559,23 +595,178 @@ export class AssessmentQueueService {
         await this.jobRepo.save(job);
 
         try {
-            const riskService = new RiskService();
-            const assessment = await riskService.assessPlot(job.plotId!, {
-                geometryHash: job.geometryHash ?? null,
-                geometryVersion: job.geometryVersion,
-            });
+            // Geometry gates run here, before anything leaves the server, and
+            // are not repeated on the resume path — a plot must not become
+            // ineligible because staff edited it while WhISP was working.
+            const prepared = await riskService.preparePlotGeometry(job.plotId!);
 
-            job.status = AssessmentJobStatus.COMPLETED;
-            job.assessmentId = assessment.id;
-            job.failureCode = null;
-            job.lastError = null;
-            job.retryable = false;
-            job.boundaryReviewReason = null;
-            job.finishedAt = new Date();
+            const submitted = await whispService.submitAndReturnToken(
+                job.plotId!,
+                prepared.geometry,
+            );
+
+            // Fast parcels come back already finished; do not invent a poll.
+            if (submitted.completed) {
+                const whispResult = whispService.mapCompletedEnvelope(
+                    submitted.envelope,
+                    submitted.token ?? undefined,
+                );
+                await this.completeJob(job, riskService, prepared, whispResult);
+                return;
+            }
+
+            if (!submitted.token) {
+                // Queued/processing with no token means we can never find this
+                // analysis again. Treat as a retryable gap rather than waiting
+                // for a result we cannot address.
+                throw new WhispUnavailableError(
+                    "incomplete_result",
+                    "Whisp accepted this parcel for analysis but did not return a reference to poll. No assessment has been recorded - please retry.",
+                    { retryable: true },
+                );
+            }
+
+            // Park it. The token survives restarts; the deadline is WhISP's own
+            // async window (server-reported), not a guess.
+            job.whispToken = submitted.token;
+            job.pollDeadlineAt = submitted.deadline;
+            job.analysisInFlight = true;
+            job.pollCount = 0;
+            job.status = AssessmentJobStatus.QUEUED;
+            job.nextAttemptAt = new Date(Date.now() + POLL_INTERVAL_MS);
             await this.jobRepo.save(job);
         } catch (err: any) {
             await this.recordFailure(job, err);
         }
+    }
+
+    /**
+     * ONE probe of an analysis already in flight, then return.
+     *
+     * A `queued`/`processing` answer is NOT a failure: it re-queues the job
+     * without touching `attempts`, because waiting on WhISP must never consume
+     * the retry budget (`pollCount` records it instead).
+     */
+    private async resumeJob(
+        job: AssessmentJob,
+        riskService: RiskService,
+        whispService: WhispService,
+    ): Promise<void> {
+        job.status = AssessmentJobStatus.ASSESSING;
+        job.lastPolledAt = new Date();
+        job.pollCount = (job.pollCount ?? 0) + 1;
+        await this.jobRepo.save(job);
+
+        const token = job.whispToken as string;
+
+        try {
+            const probe = await whispService.checkStatus(token);
+
+            if (probe.code === "analysis_completed") {
+                const whispResult = whispService.mapCompletedEnvelope(probe.envelope, token);
+                // Re-resolve the plot only to pick up its CURRENT entities; the
+                // submitted polygon is whatever WhISP analysed, and the verdict
+                // is flagged superseded if the boundary has since changed.
+                const prepared = await riskService.preparePlotGeometry(job.plotId!);
+                await this.completeJob(job, riskService, prepared, whispResult);
+                return;
+            }
+
+            if (probe.code === "analysis_queued" || probe.code === "analysis_processing") {
+                const deadline = job.pollDeadlineAt == null ? null : Number(job.pollDeadlineAt);
+                if (deadline != null && Date.now() > deadline) {
+                    // The server's own window has elapsed. Do NOT resubmit: the
+                    // analysis may still be recoverable, and a resubmission
+                    // would be a second Earth Engine job. Record an honest
+                    // timeout that staff can retry.
+                    this.recordPollTimeout(job);
+                    await this.jobRepo.save(job);
+                    return;
+                }
+                job.status = AssessmentJobStatus.QUEUED;
+                job.nextAttemptAt = new Date(Date.now() + POLL_INTERVAL_MS);
+                await this.jobRepo.save(job);
+                return;
+            }
+
+            // Any other terminal code (analysis_error / analysis_timeout /
+            // analysis_cancelled / auth_* / validation_*). Reuse the ONE
+            // classifier so a resumed failure is typed exactly like a fresh one.
+            whispService.mapCompletedEnvelope(probe.envelope, token);
+            // If it somehow returned without throwing, we still have no result.
+            throw new WhispUnavailableError(
+                "incomplete_result",
+                "The satellite analysis finished without a usable result. No assessment has been recorded - please retry.",
+                { retryable: true },
+            );
+        } catch (err: any) {
+            // A transient status-probe failure must not throw away the token:
+            // the analysis is still running and we simply could not ask.
+            if ((err as any)?.transientStatusProbe) {
+                job.failureCode = err?.code ?? "service_unavailable";
+                job.lastError = err?.message ?? "Could not reach Whisp to check status.";
+                job.retryable = true;
+                job.status = AssessmentJobStatus.QUEUED;
+                job.nextAttemptAt = new Date(Date.now() + BACKOFF_MS[0]);
+                await this.jobRepo.save(job);
+                return;
+            }
+            await this.recordFailure(job, err);
+        }
+    }
+
+    /** Scores and stores a WhISP result obtained by either path. */
+    private async completeJob(
+        job: AssessmentJob,
+        riskService: RiskService,
+        prepared: Awaited<ReturnType<RiskService["preparePlotGeometry"]>>,
+        whispResult: any,
+    ): Promise<void> {
+        const assessment = await riskService.persistPlotVerdict(
+            prepared.plot,
+            prepared.farm,
+            whispResult,
+            prepared.geometry,
+            prepared.geometryResult,
+            {
+                geometryHash: job.geometryHash ?? null,
+                geometryVersion: job.geometryVersion,
+            },
+        );
+
+        job.status = AssessmentJobStatus.COMPLETED;
+        job.assessmentId = assessment.id;
+        job.failureCode = null;
+        job.lastError = null;
+        job.retryable = false;
+        job.boundaryReviewReason = null;
+        job.analysisInFlight = false;
+        job.pollDeadlineAt = null;
+        job.nextAttemptAt = null;
+        job.finishedAt = new Date();
+        // The token is deliberately KEPT: it is the audit link from this job to
+        // the exact WhISP analysis behind the verdict.
+        await this.jobRepo.save(job);
+    }
+
+    /**
+     * The analysis outlived WhISP's own window while still reporting progress.
+     *
+     * Terminal for AUTOMATION — the worker stops polling — but not a
+     * resubmission. `whispToken` is kept so the reason is auditable, and a
+     * manual retry starts a fresh attempt deliberately (a human decision, not a
+     * timer deciding to spend a second Earth Engine job).
+     */
+    private recordPollTimeout(job: AssessmentJob): void {
+        job.status = AssessmentJobStatus.FAILED;
+        job.failureCode = "timeout";
+        job.lastError =
+            "The satellite analysis did not finish inside Whisp's processing window. No assessment has been recorded - retry when the service is less busy.";
+        job.retryable = true;
+        job.analysisInFlight = false;
+        job.pollDeadlineAt = null;
+        job.nextAttemptAt = null;
+        job.finishedAt = new Date();
     }
 
     /** Applies the terminal-vs-retry decision and schedules the next attempt. */

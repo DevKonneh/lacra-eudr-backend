@@ -43,13 +43,58 @@ jest.mock("../../data-source", () => {
     return { AppDataSource: { getRepository: jest.fn(getRepository) } };
 });
 
-// The worker calls `new RiskService().assessPlot(...)`. Mocking the class lets
-// each test dictate the outcome while the queue's handling stays real.
+// The worker now submits ONCE via WhispService and persists the token, then
+// polls it in later ticks. Both collaborators are mocked so each test can
+// dictate the outcome while the queue's own lifecycle handling stays real.
 jest.mock("../RiskService", () => {
+    // `preparePlotGeometry` is where geometry gates now live; failures the old
+    // tests drove through `assessPlot` are driven through it instead. Kept under
+    // the `__assessPlot` export name so existing failure cases read unchanged.
+    const preparePlotGeometry = jest.fn();
+    const persistPlotVerdict = jest.fn(async () => ({ id: "ra-new" }));
     const assessPlot = jest.fn();
     return {
-        RiskService: jest.fn().mockImplementation(() => ({ assessPlot })),
-        __assessPlot: assessPlot,
+        RiskService: jest.fn().mockImplementation(() => ({
+            preparePlotGeometry,
+            persistPlotVerdict,
+            assessPlot,
+        })),
+        __assessPlot: preparePlotGeometry,
+        __persistPlotVerdict: persistPlotVerdict,
+    };
+});
+
+jest.mock("../WhispService", () => {
+    const actual = jest.requireActual("../WhispService");
+    // Default: WhISP finishes inside the submit call, so worker tests exercise
+    // the normal path. Resume-specific cases override these per test.
+    const submitAndReturnToken = jest.fn(async () => ({
+        completed: true,
+        envelope: { code: "analysis_completed", data: { features: [{ properties: {} }] } },
+        token: "whisp-token-1",
+        deadline: Date.now() + 1_830_000,
+    }));
+    const checkStatus = jest.fn(async () => ({
+        code: "analysis_completed",
+        envelope: { code: "analysis_completed", data: { features: [{ properties: {} }] } },
+    }));
+    const mapCompletedEnvelope = jest.fn((envelope: any, token?: string) => ({
+        resultId: token ? `analysis:${token}` : "whisp-analysis-1",
+        verified: true,
+        provenance: "whisp_live",
+        commodityOverlaps: [],
+        annualEvents: [],
+    }));
+    return {
+        ...actual,
+        WhispService: jest.fn().mockImplementation(() => ({
+            submitAndReturnToken,
+            checkStatus,
+            mapCompletedEnvelope,
+        })),
+        __submit: submitAndReturnToken,
+        __checkStatus: checkStatus,
+        __mapCompletedEnvelope: mapCompletedEnvelope,
     };
 });
 
