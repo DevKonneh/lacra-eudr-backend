@@ -10,6 +10,7 @@ import { Shipment } from "./entities/Shipment";
 import { RiskAssessment } from "./entities/RiskAssessment";
 import { AssessmentAttempt } from "./entities/AssessmentAttempt";
 import { AssessmentJob } from "./entities/AssessmentJob";
+import { PlotEudrReview } from "./entities/PlotEudrReview";
 import { FarmDocument } from "./entities/FarmDocument";
 import { Role } from "./entities/Role";
 import { Business } from "./entities/Business";
@@ -82,7 +83,7 @@ export const AppDataSource = new DataSource({
     ssl: useSsl ? { rejectUnauthorized: false } : false,
     synchronize: synchronizeSchema,
     logging: false,
-    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, AssessmentAttempt, AssessmentJob, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission, Application, ApplicationStatusHistory, WarehouseAssessment, Invoice, PaymentSubmission, Certificate, FarmerAuditLog, Plot, Commodity, PlotCommodity, Inspection, QualityControl, EnforcementAction, Cooperative, CooperativeFlag, CooperativeChangeLog, CooperativeImportRun, UserAuditLog, UserSession, SignInAttempt, FieldEvent, MobileSyncStatus, LocalProduceBuyerSequence, LocalProduceBuyerImportRun, AgentPersonnel, AgencyImportRun, ComplianceAction, ExporterImportRun],
+    entities: [Farmer, Farm, Forest, User, License, Batch, Shipment, RiskAssessment, AssessmentAttempt, AssessmentJob, FarmDocument, Role, Business, Permit, Transfer, SatelliteAlert, Notification, OfflineSubmission, Application, ApplicationStatusHistory, WarehouseAssessment, Invoice, PaymentSubmission, Certificate, FarmerAuditLog, Plot, Commodity, PlotCommodity, Inspection, QualityControl, EnforcementAction, Cooperative, CooperativeFlag, CooperativeChangeLog, CooperativeImportRun, UserAuditLog, UserSession, SignInAttempt, FieldEvent, MobileSyncStatus, LocalProduceBuyerSequence, LocalProduceBuyerImportRun, AgentPersonnel, AgencyImportRun, ComplianceAction, ExporterImportRun, PlotEudrReview],
     subscribers: [],
     migrations: [],
 });

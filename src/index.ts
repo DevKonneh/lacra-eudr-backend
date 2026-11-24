@@ -162,6 +162,7 @@ app.get('/', (req, res) => {
 
 import riskRoutes from "./routes/risk.routes";
 import assessmentRoutes from "./routes/assessment.routes";
+import eudrReviewRoutes from "./routes/eudrReview.routes";
 import { assessmentQueue } from "./services/AssessmentQueueService";
 import reportsRoutes from "./routes/reports.routes";
 import authRoutes from "./routes/auth.routes";
@@ -214,6 +215,7 @@ app.use("/api/farms", farmRoutes);
 app.use("/api/documents", documentRoutes);
 app.use("/api/risk", riskRoutes);
 app.use("/api/assessments", assessmentRoutes);
+app.use("/api/eudr", eudrReviewRoutes);
 app.use("/api/reports", reportsRoutes);
 app.use("/api/satellite", satelliteRoutes);
 app.use("/api/roles", roleRoutes);
